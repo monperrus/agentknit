@@ -83,11 +83,13 @@ import dataclasses
 import datetime
 import json
 import os
+import queue
 import re
 import readline  # noqa: F401 — enables arrow keys / history in input()
 import select
 import signal
 import sys
+import threading
 import urllib.request
 import uuid
 from pathlib import Path
@@ -1002,6 +1004,68 @@ class CancelToken:
         self._cancelled = True
 
 
+class _InputCollector:
+    """Collect stdin lines typed while run_turn() is executing.
+
+    Call start() before a turn and stop() after. drain() returns any lines that
+    arrived while the agent was busy; they are processed as follow-on turns.
+    """
+
+    def __init__(self) -> None:
+        self._q: queue.Queue[str] = queue.Queue()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+            self._thread = None
+
+    def drain(self) -> list[str]:
+        items: list[str] = []
+        while True:
+            try:
+                items.append(self._q.get_nowait())
+            except queue.Empty:
+                break
+        return items
+
+    def _reader(self) -> None:
+        # Show a dim prompt after 0.5 s of idle stdin (5 × 0.1 s poll ticks),
+        # giving the agent's initial output time to appear first.
+        # No leading \n: agent output already ends with \n so the cursor is at
+        # col 0; adding another \n would produce a blank line.
+        _IDLE_TICKS = 5
+        _idle = 0
+        _shown = False
+        while not self._stop.is_set():
+            if not select.select([sys.stdin], [], [], 0.1)[0]:
+                _idle += 1
+                if not _shown and _idle >= _IDLE_TICKS:
+                    sys.stdout.write(f"{DIM}> {RESET}")
+                    sys.stdout.flush()
+                    _shown = True
+                continue
+            line = sys.stdin.readline()
+            if not line:  # EOF
+                break
+            text = line.rstrip("\n")
+            _idle = 0
+            _shown = False
+            if text.strip():
+                self._q.put(text)
+                # \r ensures we land at col 0 (cursor may be after the dim ">").
+                # No trailing "> " — the idle mechanism will re-show it after 0.5 s.
+                sys.stdout.write(f"\r{DIM}[queued — will run after current turn]{RESET}\n")
+                sys.stdout.flush()
+
+
 def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dict, task: str,
              *, cancel: CancelToken | None = None) -> SessionResult:
     """Run one agent turn and return a :class:`SessionResult`.
@@ -1430,16 +1494,24 @@ def create_client(schema: dict) -> "openai.OpenAI | SubprocessOpenAI":
     Handles subprocess (run://), OpenCode GitHub-Copilot, and standard
     OpenAI-compatible endpoints.  Call :func:`load_or_probe` first to obtain
     a schema.
+
+    If the schema contains a ``max_rpm`` key, it is passed to the OpenAI
+    client constructor to enforce a client-side rate limit (e.g. 40 RPM
+    for NVIDIA NIM free-tier endpoints).
     """
     endpoint    = schema.get("endpoint") or DEFAULT_ENDPOINT
     binary_path = _parse_run_uri(endpoint) or _parse_run_uri(schema.get("model", ""))
     auth        = schema.get("auth")
+    max_rpm     = schema.get("max_rpm")
+    kwargs: dict = {}
+    if max_rpm is not None:
+        kwargs["max_rpm"] = max_rpm
     if binary_path is not None:
         return SubprocessOpenAI(binary_path)
     if auth == "opencode-github-copilot":
         return openai.OpenAI(api_key=_get_opencode_token(), base_url=endpoint,
-                             auth_header="X-API-Key")
-    return openai.OpenAI(api_key=_get_key_for_schema(schema), base_url=endpoint)
+                             auth_header="X-API-Key", **kwargs)
+    return openai.OpenAI(api_key=_get_key_for_schema(schema), base_url=endpoint, **kwargs)
 
 
 def run_task(
@@ -1562,17 +1634,36 @@ def run_repl(
                 if _slash_registry.dispatch(cmd, session, client, current_model):
                     _save_messages_snapshot(session)
                     continue
-                # ── regular turn ─────────────────────────────────────────────
-                try:
-                    run_turn(client, current_model, session, t)
-                except KeyboardInterrupt:
-                    print(f"\n{DIM}[interrupted]{RESET}")
-                except Exception as exc:
-                    _emit(session, "error", text=str(exc),
-                          fmt=f"\n{RED}Error: {exc}{RESET}")
-                    _log(session, {"type": "error", "error": str(exc),
-                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-                _save_messages_snapshot(session)
+                # ── regular turn (with async input queue) ────────────────────
+                _collector = _InputCollector()
+                _pending = [t]
+                while _pending:
+                    _task = _pending.pop(0)
+                    _collector.start()
+                    _interrupted = False
+                    try:
+                        run_turn(client, current_model, session, _task)
+                    except KeyboardInterrupt:
+                        print(f"\n{DIM}[interrupted]{RESET}")
+                        _interrupted = True
+                    except Exception as exc:
+                        _emit(session, "error", text=str(exc),
+                              fmt=f"\n{RED}Error: {exc}{RESET}")
+                        _log(session, {"type": "error", "error": str(exc),
+                               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                    finally:
+                        _collector.stop()
+                    _save_messages_snapshot(session)
+                    if _interrupted:
+                        break
+                    for _qi in _collector.drain():
+                        _qs = _qi.strip()
+                        if not _qs or _qs.lower() in ("exit", "quit", "q"):
+                            continue
+                        if not _slash_registry.dispatch(_qs, session, client, current_model):
+                            _pending.append(_qi)
+                        else:
+                            _save_messages_snapshot(session)
     finally:
         try:
             readline.write_history_file(_hist_file)
@@ -1707,17 +1798,36 @@ def main() -> None:
                 if _slash_registry.dispatch(cmd, session, client, current_model):
                     _save_messages_snapshot(session)
                     continue
-                # ── regular turn ─────────────────────────────────────────────
-                try:
-                    run_turn(client, current_model, session, t)
-                except KeyboardInterrupt:
-                    print(f"\n{DIM}[interrupted]{RESET}")
-                except Exception as exc:
-                    _emit(session, "error", text=str(exc),
-                          fmt=f"\n{RED}Error: {exc}{RESET}")
-                    _log(session, {"type": "error", "error": str(exc),
-                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-                _save_messages_snapshot(session)
+                # ── regular turn (with async input queue) ────────────────────
+                _collector = _InputCollector()
+                _pending = [t]
+                while _pending:
+                    _task = _pending.pop(0)
+                    _collector.start()
+                    _interrupted = False
+                    try:
+                        run_turn(client, current_model, session, _task)
+                    except KeyboardInterrupt:
+                        print(f"\n{DIM}[interrupted]{RESET}")
+                        _interrupted = True
+                    except Exception as exc:
+                        _emit(session, "error", text=str(exc),
+                              fmt=f"\n{RED}Error: {exc}{RESET}")
+                        _log(session, {"type": "error", "error": str(exc),
+                               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                    finally:
+                        _collector.stop()
+                    _save_messages_snapshot(session)
+                    if _interrupted:
+                        break
+                    for _qi in _collector.drain():
+                        _qs = _qi.strip()
+                        if not _qs or _qs.lower() in ("exit", "quit", "q"):
+                            continue
+                        if not _slash_registry.dispatch(_qs, session, client, current_model):
+                            _pending.append(_qi)
+                        else:
+                            _save_messages_snapshot(session)
     finally:
         try:
             readline.write_history_file(_hist_file)

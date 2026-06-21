@@ -19,6 +19,43 @@ import subprocess
 import time
 import urllib.parse
 import requests
+import threading
+import collections
+
+
+# ── rate limiter (token-bucket) ───────────────────────────────────────────────
+
+class RateLimiter:
+    """Token-bucket rate limiter for API requests.
+
+    Ensures no more than *max_rpm* requests per minute are made.
+    Uses a sliding-window approach with per-second granularity.
+    """
+
+    def __init__(self, max_rpm: int = 40) -> None:
+        self._max_rpm = max_rpm
+        self._lock = threading.Lock()
+        # ring buffer of timestamps for the last *max_rpm* requests
+        self._timestamps: collections.deque[float] = collections.deque(maxlen=max_rpm)
+
+    def acquire(self) -> None:
+        """Block until a request slot is available."""
+        with self._lock:
+            now = time.monotonic()
+            # If the ring buffer is full, the oldest entry is at index 0.
+            if len(self._timestamps) == self._max_rpm:
+                oldest = self._timestamps[0]
+                elapsed = now - oldest
+                if elapsed < 60.0:
+                    wait = 60.0 - elapsed
+                    print(
+                        f"  [rate-limit] {self._max_rpm} RPM limit reached — "
+                        f"waiting {wait:.1f}s …",
+                        flush=True,
+                    )
+                    time.sleep(wait)
+                    now = time.monotonic()
+            self._timestamps.append(now)
 
 
 class _Function:
@@ -105,6 +142,7 @@ class _Completions:
     def _retry_post(self, url: str, headers: dict, payload: dict,
                     stream: bool = False) -> requests.Response:
         while True:
+            self._client._rate_limiter.acquire()
             resp = requests.post(url, headers=headers, json=payload,
                                  stream=stream, timeout=300)
             if resp.status_code == 429:
@@ -292,12 +330,28 @@ class _BaseURL:
 
 
 class OpenAI:
-    def __init__(self, *, api_key: str, base_url: str, auth_header: str = "Authorization") -> None:
+    # Class-level rate limiter shared across all instances targeting the same
+    # base URL.  NVIDIA NIM free-tier endpoints are limited to 40 RPM.
+    _rate_limiters: dict[str, RateLimiter] = {}
+    _rate_limiters_lock = threading.Lock()
+
+    @classmethod
+    def _get_rate_limiter(cls, base_url: str, max_rpm: int = 40) -> RateLimiter:
+        """Return a per-base-url RateLimiter (shared across instances)."""
+        with cls._rate_limiters_lock:
+            if base_url not in cls._rate_limiters:
+                cls._rate_limiters[base_url] = RateLimiter(max_rpm)
+            return cls._rate_limiters[base_url]
+
+    def __init__(self, *, api_key: str, base_url: str, auth_header: str = "Authorization",
+                 max_rpm: int = 40) -> None:
         self._api_key = api_key
         self._base_url = base_url
         self._auth_header = auth_header
         self.base_url = _BaseURL(base_url)
         self.chat = _Chat(self)
+        # Acquire a per-base-url rate limiter (default 40 RPM for NVIDIA NIM).
+        self._rate_limiter = self._get_rate_limiter(base_url, max_rpm)
 
 
 # ── subprocess backend ────────────────────────────────────────────────────────

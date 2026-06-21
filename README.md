@@ -134,3 +134,95 @@ under those names.
 Register each tool's `fn` in `tool_library.TOOL_LIBRARY` keyed by
 `fn.__name__`.  Required for the dispatch loop to resolve string-based
 `python_function` entries.
+
+---
+
+## Event System
+
+agentknit emits events during agent execution so you can build logging
+frameworks, GUI/TUI integrations, streaming dashboards, or custom monitoring
+on top of the framework.
+
+### Subscribing to events
+
+Use `subscribe(session, event_type, handler)` to register a handler for a
+specific event type:
+
+```python
+from agentknit import subscribe, init_session, run_turn, create_client
+
+schema = load_or_probe("qwen/qwen3-8b", "https://openrouter.ai/api/v1", False)
+client = create_client(schema)
+session = init_session(schema)
+
+# Log every tool call
+subscribe(session, "tool_call", lambda event_type, data: print(f"[tool] {data['name']}"))
+
+# Stream content deltas in real-time
+subscribe(session, "content_delta", lambda event_type, data: print(data.get("text", ""), end=""))
+
+# Track token usage
+subscribe(session, "usage", lambda event_type, data: print(f"[tokens] {data}"))
+
+# React to errors
+subscribe(session, "error", lambda event_type, data: print(f"[error] {data['text']}"))
+```
+
+The `on` function is a convenience alias for `subscribe`:
+
+```python
+from agentknit import on
+
+on(session, "tool_call", my_handler)
+```
+
+Multiple handlers can be registered for the same event type; they are called
+in registration order.
+
+### Unsubscribing
+
+```python
+from agentknit import unsubscribe
+
+unsubscribe(session, "tool_call", my_handler)
+```
+
+### Generic handler
+
+The lower-level `EventCallback` can be passed to `init_session()` via the
+`on_event` keyword and receives *all* events:
+
+```python
+from agentknit import EventCallback
+
+def my_handler(event_type: str, data: dict) -> None:
+    print(f"[{event_type}] {data.get('fmt', data)}")
+
+session = init_session(schema, on_event=my_handler)
+```
+
+Per-event-type handlers registered via `subscribe` are called *before* the
+generic `on_event` handler.
+
+### Full list of event types
+
+| Event type | When it fires | Data keys |
+|---|---|---|
+| `tool_call` | Before dispatching a tool | `name`, `args`, `fmt` |
+| `tool_result` | After receiving tool result | `name`, `result`, `streamed`, `fmt` |
+| `content_delta` | Streaming text chunk from the model | `text`, `first`, `no_newline`, `fmt` |
+| `reasoning_delta` | Streaming reasoning trace | `text`, `first`, `no_newline`, `fmt` |
+| `content_stream_end` | End of a streaming content sequence | `no_newline`, `fmt` |
+| `reasoning_stream_end` | End of a streaming reasoning sequence | `no_newline`, `fmt` |
+| `usage` | Per-turn token usage report | `prompt`, `completion`, `total`, `cached`, `cache_write`, `fmt` |
+| `session_usage` | Cumulative session usage at final answer | `prompt`, `completion`, `total`, `cached`, `cache_write`, `fmt` |
+| `error` | API or dispatch error | `text`, `fmt` |
+| `final_answer` | Agent produces its final reply | `text`, `fmt` |
+| `token_limit` | Token budget exceeded | `used`, `limit`, `fmt` |
+| `session_resumed` | Session history was loaded from disk | `session_id`, `messages_loaded`, `fmt` |
+| `provider_pinned` | OpenRouter provider was locked for the session | `provider`, `fmt` |
+
+Every event data dict includes a `"fmt"` key containing a pre-formatted ANSI
+string suitable for direct printing to a terminal — this is what the default
+handler uses.  Custom handlers may ignore `"fmt"` and use the other keys
+instead.

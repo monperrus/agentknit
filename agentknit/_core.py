@@ -31,6 +31,48 @@ that modify agent behaviour. Currently supported options:
 
 No hardcoded provider URLs should be added to the framework code; use the
 options mechanism in the agent spec JSON instead.
+
+Events
+──────
+The framework emits typed events that consumers can subscribe to via the
+:func:`subscribe` function (or its alias :func:`on`).  The full list of event
+types is documented in the README and in :func:`subscribe`'s docstring.
+
+Event types
+~~~~~~~~~~~
+
+``tool_call``
+    Before dispatching a tool.  Data: ``name``, ``args``, ``fmt``.
+``tool_result``
+    After receiving tool result.  Data: ``name``, ``result``, ``streamed``, ``fmt``.
+``content_delta``
+    Streaming text chunk from the model.  Data: ``text``, ``first``, ``no_newline``, ``fmt``.
+``reasoning_delta``
+    Streaming reasoning trace from the model.  Data: ``text``, ``first``, ``no_newline``, ``fmt``.
+``content_stream_end``
+    End of a streaming content sequence.  Data: ``no_newline``, ``fmt``.
+``reasoning_stream_end``
+    End of a streaming reasoning sequence.  Data: ``no_newline``, ``fmt``.
+``usage``
+    Per-turn token usage report.  Data: ``prompt``, ``completion``, ``total``,
+    ``cached``, ``cache_write``, ``fmt``.
+``session_usage``
+    Cumulative session usage emitted alongside the final answer.  Data:
+    ``prompt``, ``completion``, ``total``, ``cached``, ``cache_write``, ``fmt``.
+``error``
+    API or dispatch error.  Data: ``text``, ``fmt``.
+``final_answer``
+    The agent produced its final reply.  Data: ``text``, ``fmt``.
+``token_limit``
+    The token budget was exceeded.  Data: ``used``, ``limit``, ``fmt``.
+``session_resumed``
+    Session history was loaded from disk (or not found).  Data: ``session_id``,
+    ``messages_loaded``, ``source_model`` (optional), ``fmt``.
+``provider_pinned``
+    OpenRouter provider was locked for the remainder of the session.  Data:
+    ``provider``, ``fmt``.
+
+Every data dict contains a ``\"fmt\"`` key with a pre-formatted ANSI string.
 """
 
 from __future__ import annotations
@@ -136,9 +178,59 @@ def _default_event_handler(event_type: str, data: dict) -> None:
 
 
 def _emit(session: dict, event_type: str, **data) -> None:
-    """Fire *event_type* through the session's registered event handler."""
+    """Fire *event_type* through the session's registered event handlers.
+
+    First calls any per-event-type handlers registered via :func:`subscribe`,
+    then calls the generic ``on_event`` handler (or the default).
+
+    .. seealso::
+
+        :ref:`event-types` — full list of event types with descriptions.
+    """
+    # Call per-event-type handlers first
+    handlers = session.get("_event_handlers", {}).get(event_type, [])
+    for handler in handlers:
+        handler(event_type, data)
+    # Then call the generic handler
     handler: EventCallback = session.get("on_event") or _default_event_handler
     handler(event_type, data)
+
+
+def subscribe(session: dict, event_type: str, handler: EventCallback) -> None:
+    """Register an event handler for a specific event type.
+
+    The *handler* will be called with ``(event_type, data)`` whenever an event
+    of that type is emitted.  Multiple handlers can be registered for the same
+    type; they are called in registration order, before the generic
+    ``on_event`` handler passed to :func:`init_session`.
+
+    Example::
+
+        session = init_session(schema)
+        subscribe(session, "tool_call", lambda et, d: print(d["fmt"]))
+        subscribe(session, "content_delta", lambda et, d: print(d["text"], end=""))
+
+    .. seealso::
+
+        :ref:`event-types` — full list of event types with descriptions.
+    """
+    if "_event_handlers" not in session:
+        session["_event_handlers"] = {}
+    session["_event_handlers"].setdefault(event_type, []).append(handler)
+
+
+def unsubscribe(session: dict, event_type: str, handler: EventCallback) -> None:
+    """Unregister a previously registered event handler.
+
+    Does nothing if the *handler* was not registered for *event_type*.
+    """
+    handlers = session.get("_event_handlers", {}).get(event_type, [])
+    if handler in handlers:
+        handlers.remove(handler)
+
+
+# Convenience alias
+on = subscribe
 
 
 # ── api key ──────────────────────────────────────────────────────────────────

@@ -1484,6 +1484,15 @@ def run_task(
                        "reason": "run_task_complete"})
 
 
+def _build_resume_cmd(model: str, session_id: str, default_program: str | None = None) -> str:
+    program = os.environ.get("AGENTKNIT_RESUME_COMMAND")
+    if program:
+        return f"{program} --session {session_id}"
+    if default_program is None:
+        default_program = sys.argv[0]
+    return f"{default_program} {model} --session {session_id}"
+
+
 def run_repl(
     schema: dict,
     *,
@@ -1515,7 +1524,7 @@ def run_repl(
         on_event=on_event,
     )
     model      = schema["model"]
-    resume_cmd = f"agent-probe {model} --session {session['session_id']}"
+    resume_cmd = _build_resume_cmd(model, session["session_id"], "agent-probe")
 
     if session_id:
         print_session_history(session)
@@ -1640,7 +1649,7 @@ def main() -> None:
     if args.session:
         print_session_history(session)
 
-    resume_cmd = f"{sys.argv[0]} {model} --session {session['session_id']}"
+    resume_cmd = _build_resume_cmd(model, session["session_id"])
 
     if args.task:
         try:

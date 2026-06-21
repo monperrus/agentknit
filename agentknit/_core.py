@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 """
-Generic CLI coding agent for any OpenRouter model.
+Generic CLI coding agent for any Completions API endpoint.
 
 Run with --help for usage information.
-
-
-If a tool has no entry (or its python_function is absent from TOOL_LIBRARY),
-dispatch() returns an error string and the agent is told to stop.
 
 Aliases
 ───────

@@ -103,6 +103,7 @@ from .exceptions import (
     AgentSpecDisabledError, AgentSpecInvalidError,
     PricingLimitExceededError, AuthenticationError,
 )
+from .slash_commands import REGISTRY as _slash_registry
 
 
 DEFAULT_ENDPOINT = "https://openrouter.ai/api/v1"
@@ -821,6 +822,7 @@ def init_session(schema: dict, non_interactive: bool = False,
         "session_id":      session_id,
         "cache_key":       cache_key or session_id,
         "model":           model,
+        "endpoint":        schema.get("endpoint", ""),
         "log_path":        _open_log(model, session_id),
         "non_interactive": non_interactive,
         "usage_totals":    {"prompt": 0, "completion": 0, "total": 0,
@@ -1518,6 +1520,9 @@ def run_repl(
     Reads tasks line-by-line from stdin and runs :func:`run_turn` for each.
     The session snapshot is saved after every turn so it can be resumed with
     ``--session <session_id>``.
+
+    Slash commands (``/clear``, ``/model``, ``/usage``, ``/help``) are
+    intercepted before sending input to the model.
     """
     validate_schema(schema)
     client  = create_client(schema)
@@ -1563,8 +1568,15 @@ def run_repl(
             if cmd.lower() in ("exit", "quit", "q"):
                 break
             if cmd:
+                # ── slash command interception ───────────────────────────────
+                # Use the potentially updated model from session (e.g. after /model switch).
+                current_model = session.get("model", model)
+                if _slash_registry.dispatch(cmd, session, client, current_model):
+                    _save_messages_snapshot(session)
+                    continue
+                # ── regular turn ─────────────────────────────────────────────
                 try:
-                    run_turn(client, model, session, t)
+                    run_turn(client, current_model, session, t)
                 except KeyboardInterrupt:
                     print(f"\n{DIM}[interrupted]{RESET}")
                 except Exception as exc:
@@ -1701,8 +1713,15 @@ def main() -> None:
             if cmd.lower() in ("exit", "quit", "q"):
                 break
             if cmd:
+                # ── slash command interception ───────────────────────────────
+                # Use the potentially updated model from session (e.g. after /model switch).
+                current_model = session.get("model", model)
+                if _slash_registry.dispatch(cmd, session, client, current_model):
+                    _save_messages_snapshot(session)
+                    continue
+                # ── regular turn ─────────────────────────────────────────────
                 try:
-                    run_turn(client, model, session, t)
+                    run_turn(client, current_model, session, t)
                 except KeyboardInterrupt:
                     print(f"\n{DIM}[interrupted]{RESET}")
                 except Exception as exc:

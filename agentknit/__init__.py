@@ -55,6 +55,12 @@ from .tool import (
     register_tools_in_library,
 )
 
+from .slash_commands import (
+    SlashCommand,
+    SlashCommandRegistry,
+    REGISTRY as slash_registry,
+)
+
 __all__ = [
     "AgentProbeError", "AgentSpecDisabledError", "AgentSpecInvalidError",
     "PricingLimitExceededError", "AuthenticationError",
@@ -72,4 +78,7 @@ __all__ = [
     "Tool",
     "build_tool_spec",
     "register_tools_in_library",
+    "SlashCommand",
+    "SlashCommandRegistry",
+    "slash_registry",
 ]

@@ -943,7 +943,15 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
         if structured:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        resp  = _complete(client, session, **kwargs)
+        try:
+            resp  = _complete(client, session, **kwargs)
+        except Exception as exc:
+            err = f"API error: {exc}"
+            _emit(session, "error", text=err,
+                  fmt=f"\n{RED}Error: {err}{RESET}")
+            _log(session, {"type": "error", "error": err,
+                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+            return _session_result(session)
         msg   = resp.choices[0].message
 
         # Accumulate token usage from the response and surface it to the user.
@@ -1443,6 +1451,11 @@ def run_repl(
                     run_turn(client, model, session, t)
                 except KeyboardInterrupt:
                     print(f"\n{DIM}[interrupted]{RESET}")
+                except Exception as exc:
+                    _emit(session, "error", text=str(exc),
+                          fmt=f"\n{RED}Error: {exc}{RESET}")
+                    _log(session, {"type": "error", "error": str(exc),
+                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
                 _save_messages_snapshot(session)
     finally:
         try:
@@ -1576,6 +1589,11 @@ def main() -> None:
                     run_turn(client, model, session, t)
                 except KeyboardInterrupt:
                     print(f"\n{DIM}[interrupted]{RESET}")
+                except Exception as exc:
+                    _emit(session, "error", text=str(exc),
+                          fmt=f"\n{RED}Error: {exc}{RESET}")
+                    _log(session, {"type": "error", "error": str(exc),
+                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
                 _save_messages_snapshot(session)
     finally:
         try:

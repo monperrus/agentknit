@@ -133,6 +133,7 @@ def t_run(command: str) -> tuple[str, dict]:
         proc = subprocess.Popen(
             command,
             shell=True,
+            executable="/bin/bash",
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

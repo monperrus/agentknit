@@ -46,6 +46,12 @@ from ._core import (
     _complete,
 )
 
+from .tool import (
+    Tool,
+    build_tool_spec,
+    register_tools_in_library,
+)
+
 __all__ = [
     "AgentProbeError", "AgentSpecDisabledError", "AgentSpecInvalidError",
     "PricingLimitExceededError", "AuthenticationError",
@@ -59,4 +65,7 @@ __all__ = [
     "_parse_run_uri", "_expand_aliases", "_open_log",
     "_save_messages_snapshot", "_load_messages_snapshot",
     "_find_snapshot_in_other_models", "_handle_tool_call", "_complete",
+    "Tool",
+    "build_tool_spec",
+    "register_tools_in_library",
 ]

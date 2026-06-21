@@ -329,12 +329,33 @@ class FatalToolDispatchError(RuntimeError):
     """Raised when the agent requests a tool that cannot be dispatched."""
 
 
+def _resolve_fn(entry: dict) -> Callable | None:
+    """Return the callable from a dispatch entry.
+
+    Supports two shapes:
+
+    * ``{"python_function": "t_read", …}`` — name looked up in
+      :data:`~agentknit.tool_library.TOOL_LIBRARY`.
+    * ``{"python_function": <callable>, …}`` — used directly.
+
+    Returns ``None`` when the string name is not found.
+    """
+    pf = entry.get("python_function")
+    if pf is None:
+        return None
+    if callable(pf):
+        return pf
+    # string name → look up in TOOL_LIBRARY
+    return TOOL_LIBRARY.get(pf)
+
+
 def dispatch(tool_name: str, args: dict, tool_dispatch: dict) -> tuple[str, dict]:
     """Call the Python function mapped to *tool_name* via *tool_dispatch*.
 
     tool_dispatch entry shape:
       {
-        "python_function": "t_update",
+        "python_function": "t_update",        # name string (looked up in TOOL_LIBRARY)
+        "python_function": <callable>,         # or a direct callable
         "param_map": {"path": "path", "old_str": "old", "new_str": "new"}
       }
 
@@ -345,16 +366,19 @@ def dispatch(tool_name: str, args: dict, tool_dispatch: dict) -> tuple[str, dict
     if not entry:
         raise FatalToolDispatchError(f"ERROR: no dispatch entry for tool '{tool_name}'")
 
-    fn_name = entry.get("python_function", "")
-    fn = TOOL_LIBRARY.get(fn_name)
+    fn = _resolve_fn(entry)
 
     if fn is None:
-        r = f"ERROR: python_function '{fn_name}' not found in TOOL_LIBRARY"
+        pf = entry.get("python_function", "")
+        r = f"ERROR: python_function '{pf}' not found in TOOL_LIBRARY"
         return r, {"result": r}
 
     param_map = entry.get("param_map") or {}
     # Translate model param names → Python kwarg names.
     kwargs = {param_map.get(k, k): v for k, v in args.items()}
+
+    # Derive a human-readable name for error messages
+    fn_name = getattr(fn, "__name__", str(fn))
 
     try:
         result = fn(**kwargs)

@@ -1,6 +1,6 @@
 __pycache__/
 *.egg-info/
-/agentknit.egg-info/
 dist/
 build/
 *.pyc
+agent_spec_*.json

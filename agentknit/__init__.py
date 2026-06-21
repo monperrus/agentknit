@@ -3,12 +3,12 @@
 __version__ = "0.1.0"
 
 from .exceptions import (
+    AgentProbeError,
     AgentSpecDisabledError,
     AgentSpecInvalidError,
     PricingLimitExceededError,
     AuthenticationError,
 )
-from llmprobe.exceptions import AgentProbeError
 
 from ._core import (
     main,

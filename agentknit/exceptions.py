@@ -1,9 +1,12 @@
-"""Typed exceptions for agentknit.
+"""Typed exceptions for agentknit."""
 
-Re-exports the base exceptions from llmprobe and adds agent-level ones.
-"""
 
-from llmprobe.exceptions import AgentProbeError, AuthenticationError  # noqa: F401
+class AgentProbeError(Exception):
+    """Base class for all agentknit exceptions."""
+
+
+class AuthenticationError(AgentProbeError):
+    """Raised when an API key or auth token cannot be obtained."""
 
 
 class AgentSpecDisabledError(AgentProbeError):

@@ -96,7 +96,6 @@ from typing import Callable
 from . import openai_compat as openai
 from .openai_compat import SubprocessOpenAI
 
-from llmprobe import probe as probe
 from . import tool_library as _tool_module
 from .tool_library import TOOL_LIBRARY, _ASK_USER_FNS
 from .exceptions import (
@@ -388,32 +387,12 @@ def load_or_probe(model: str, endpoint: str, force: bool) -> dict:
         with path.open() as f:
             return json.load(f)
 
-    print(f"{YEL}Probing {model} … this may take ~30 s{RESET}")
-    probe.ENDPOINT = endpoint
-    probe.MODEL    = model
-    client = probe.make_client(get_api_key())
-
-    elicited      = probe.elicit_round(client)
-    initial_tools = probe.build_tool_schema(elicited)
-    probe.probe_round(client, initial_tools)
-    final_probes  = probe.probe_round(client, initial_tools, label="Final probe")
-    behaviour     = probe.behavioural_summary(final_probes)
-    _tool_lib_path = Path(__file__).resolve().parent / "tool_library.py"
-    tool_dispatch = probe.build_tool_dispatch(elicited, final_probes, client,
-                                              tool_library_path=_tool_lib_path)
-
-    data = {
-        "model":                model,
-        "endpoint":             endpoint,
-        "status":               "ok",
-        "elicited_names":       {op: v["function_name"] for op, v in elicited.items()},
-        "inferred_tool_schema": initial_tools,
-        "behaviour":            behaviour,
-        "tool_dispatch":        tool_dispatch,
-    }
-    with path.open("w") as f:
-        json.dump(data, f, indent=2)
-    return data
+    raise AgentSpecInvalidError(
+        f"No agent spec found for '{model}'. "
+        f"Run `llmprobe {model}` (with --endpoint {endpoint} if needed) "
+        f"to probe the model and generate a spec file.",
+        model=model,
+    )
 
 
 # ── dispatch ──────────────────────────────────────────────────────────────────

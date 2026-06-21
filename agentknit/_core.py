@@ -240,7 +240,7 @@ _DEFAULT_TOOL_SCHEMA = [
 _DEFAULT_TOOL_DISPATCH = {
     "read_file":            {"python_function": "t_read",        "param_map": {}},
     "write_file":           {"python_function": "t_write",       "param_map": {}},
-    "str_replace":          {"python_function": "t_update",  "param_map": {}},
+    "str_replace":          {"python_function": "t_update",      "param_map": {"old_str": "old", "new_str": "new"}},
     "execute_shell_command":{"python_function": "t_run",         "param_map": {}},
 }
 

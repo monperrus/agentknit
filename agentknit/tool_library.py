@@ -29,7 +29,7 @@ _active_proc: "subprocess.Popen | None" = None
 
 def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tuple[str, dict]:
     try:
-        content = Path(path).read_text()
+        content = Path(os.path.expanduser(path)).read_text()
         if offset is not None or limit is not None:
             lines = content.splitlines(keepends=True)
             start = offset if offset is not None else 0
@@ -47,7 +47,7 @@ def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tu
 
 def t_write(path: str, content: str) -> tuple[str, dict]:
     try:
-        p = Path(path)
+        p = Path(os.path.expanduser(path))
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
         r = f"OK: wrote {len(content)} bytes to {path}"
@@ -108,7 +108,7 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "") -> t
     if patch:
         return _apply_patch_format(patch)
     try:
-        p = Path(path)
+        p = Path(os.path.expanduser(path))
         text = p.read_text()
         if old not in text:
             r = (f"ERROR: old string not found in {path} "
@@ -271,7 +271,7 @@ def t_ask_user_question(question: str = '', options: str = '') -> tuple[str, dic
 
 def t_list_dir(path: str) -> tuple[str, dict]:
     try:
-        entries = sorted(Path(path).iterdir(), key=lambda p: (p.is_file(), p.name))
+        entries = sorted(Path(os.path.expanduser(path)).iterdir(), key=lambda p: (p.is_file(), p.name))
         lines = [("d  " if e.is_dir() else "f  ") + e.name for e in entries]
         result = "\n".join(lines) or "(empty)"
         return result, {"result": result}
@@ -391,10 +391,10 @@ def t_update_file(new_str: str = '', file_path: str = '', old_str: str = '') -> 
     if not file_path:
         return ("ERROR: File path is required.", {'result': 'error'})
     try:
-        with Path(file_path).open('r') as f:
+        with Path(os.path.expanduser(file_path)).open('r') as f:
             content = f.read()
         new_content = content.replace(old_str, new_str)
-        with Path(file_path).open('w') as f:
+        with Path(os.path.expanduser(file_path)).open('w') as f:
             f.write(new_content)
         return ("File updated successfully.", result_dict)
     except Exception as e:
@@ -406,7 +406,7 @@ TOOL_LIBRARY['t_update_file'] = t_update_file
 # --- generated: t_list_directory ---
 def t_list_directory(path: str = '') -> tuple[str, dict]:
     try:
-        p = Path(path)
+        p = Path(os.path.expanduser(path))
         if not p.exists() or not p.is_dir():
             return ("ERROR: Path does not exist or is not a directory", {'result': 'error'})
         items = [str(item.name) for item in p.iterdir()]
@@ -431,7 +431,7 @@ def t_search_files(command: str = '') -> tuple[str, dict]:
         has_glob = any(c in command for c in glob_chars)
         
         if not has_glob:
-            p = Path(command)
+            p = Path(os.path.expanduser(command))
             if p.is_dir():
                 matches = sorted([str(x) for x in p.iterdir()])
                 if matches:

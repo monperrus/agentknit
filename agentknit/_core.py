@@ -784,6 +784,10 @@ def init_session(schema: dict, non_interactive: bool = False,
     if system_prompt_supplement:
         sys_msg += "\n\n" + system_prompt_supplement
 
+    claude_md = Path.home() / ".claude" / "CLAUDE.md"
+    if claude_md.exists():
+        sys_msg += "\n\n" + claude_md.read_text()
+
     agents_md = Path.cwd() / "AGENTS.md"
     if agents_md.exists():
         sys_msg += "\n\n" + agents_md.read_text()

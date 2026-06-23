@@ -17,24 +17,19 @@ from agentknit import Tool, build_tool_spec, register_tools_in_library
 from agentknit import (
     t_execute_async, t_query_exec, t_plan_delay,
     ASYNC_FAST_THRESHOLD_S, ASYNC_INLINE_MAX_BYTES,
+    run_task, run_repl,
 )
 from agentknit.tool_library import t_read, t_write
-from agentknit._core import (
-    init_session, run_turn, run_repl,
-    _save_messages_snapshot,
-    create_client,
-    DEFAULT_ENDPOINT,
-    DIM, RESET,
-)
+from agentknit._core import DEFAULT_ENDPOINT
 
 _TOOLS = [
     Tool(
         "execute_shell_command",
-        f"Start a shell command asynchronously. If it finishes within "
-        f"{int(ASYNC_FAST_THRESHOLD_S * 1000)} ms and both stdout and stderr "
-        f"are under {ASYNC_INLINE_MAX_BYTES} bytes, the output is inlined "
-        f"(fields: stdout, stderr, completed, returncode, duration_time). "
-        f"Otherwise returns tool_exec_id and local file paths only.",
+        f"Start a shell command asynchronously. Returns tool_exec_id and local "
+        f"file paths for stdin (FIFO), stdout, and stderr. Write to stdin_localfile "
+        f"to send input to the running process. If the command finishes within "
+        f"{int(ASYNC_FAST_THRESHOLD_S * 1000)} ms and both outputs are under "
+        f"{ASYNC_INLINE_MAX_BYTES} bytes, stdout/stderr are inlined immediately.",
         t_execute_async,
         parameters={
             "type": "object",
@@ -140,26 +135,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     schema = _build_schema(args.model, args.endpoint)
-
-    client = create_client(schema)
-    session = init_session(
-        schema,
-        system_prompt_supplement=_SYSTEM_SUPPLEMENT,
-        resumed_from=args.session,
-    )
-
-    tool_names = [t["function"]["name"] for t in _TOOL_SCHEMA]
-    print(f"{DIM}Model: {args.model}  |  tools: {', '.join(tool_names)}{RESET}\n")
-    print(f"{DIM}Session: {session['session_id']}{RESET}\n")
-
+    opts = dict(session_id=args.session, system_prompt_supplement=_SYSTEM_SUPPLEMENT)
     if args.task:
-        try:
-            run_turn(client, args.model, session, " ".join(args.task))
-        finally:
-            _save_messages_snapshot(session)
-        return
-
-    run_repl(schema, session_id=args.session, system_prompt_supplement=_SYSTEM_SUPPLEMENT)
+        run_task(schema, " ".join(args.task), **opts)
+    else:
+        run_repl(schema, **opts)
 
 
 if __name__ == "__main__":

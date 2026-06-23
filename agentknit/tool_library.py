@@ -57,6 +57,9 @@ def _async_add_inline(result: dict, stdout_path: str, stderr_path: str) -> None:
 def t_execute_async(command: str) -> tuple[str, dict]:
     """Start a shell command asynchronously, capturing stdout/stderr to files.
 
+    A named FIFO is created at stdin_localfile; write text to it to send input
+    to the running process (e.g. via write_file or a shell redirect).
+
     If the command finishes within ASYNC_FAST_THRESHOLD_S *and* both output
     files are small, the content is inlined so the caller needs no follow-up
     t_query_exec call.
@@ -64,18 +67,35 @@ def t_execute_async(command: str) -> tuple[str, dict]:
     exec_id = uuid.uuid4().hex[:12]
     stdout_path = str(ASYNC_EXEC_DIR / f"{exec_id}.stdout")
     stderr_path = str(ASYNC_EXEC_DIR / f"{exec_id}.stderr")
+    stdin_path  = str(ASYNC_EXEC_DIR / f"{exec_id}.stdin")
 
+    os.mkfifo(stdin_path)
     stdout_fh = open(stdout_path, "wb")
     stderr_fh = open(stderr_path, "wb")
+
+    # Open the FIFO write-end in a background thread (open() on a FIFO blocks
+    # until a reader appears). The read-end is handed to the process.
+    stdin_write_fh: list = []   # populated by the thread once the process opens it
+
+    def _open_fifo_write() -> None:
+        fh = open(stdin_path, "wb", buffering=0)
+        stdin_write_fh.append(fh)
+
+    fifo_thread = threading.Thread(target=_open_fifo_write, daemon=True)
+    fifo_thread.start()
+
+    stdin_read_fh = open(stdin_path, "rb")   # unblocks the writer thread
 
     t0 = time.monotonic()
     proc = subprocess.Popen(
         command,
         shell=True,
+        stdin=stdin_read_fh,
         stdout=stdout_fh,
         stderr=stderr_fh,
         preexec_fn=os.setsid,
     )
+    stdin_read_fh.close()   # process has inherited the fd; we don't need it
 
     try:
         proc.wait(timeout=ASYNC_FAST_THRESHOLD_S)
@@ -87,14 +107,20 @@ def t_execute_async(command: str) -> tuple[str, dict]:
     returncode = proc.poll()
     fast_done = returncode is not None
 
-    if fast_done:
+    def _close_on_exit() -> None:
+        proc.wait()
         stdout_fh.close()
         stderr_fh.close()
+        fifo_thread.join(timeout=1)
+        for fh in stdin_write_fh:
+            try:
+                fh.close()
+            except OSError:
+                pass
+
+    if fast_done:
+        _close_on_exit()
     else:
-        def _close_on_exit() -> None:
-            proc.wait()
-            stdout_fh.close()
-            stderr_fh.close()
         threading.Thread(target=_close_on_exit, daemon=True).start()
 
     duration = round(time.monotonic() - t0, 3)
@@ -104,11 +130,14 @@ def t_execute_async(command: str) -> tuple[str, dict]:
             "proc": proc,
             "stdout_file": stdout_path,
             "stderr_file": stderr_path,
+            "stdin_file":  stdin_path,
+            "stdin_write_fh": stdin_write_fh,
             "start": t0,
         }
 
     result: dict = {
         "tool_exec_id": exec_id,
+        "stdin_localfile":  stdin_path,
         "stdout_localfile": stdout_path,
         "stderr_localfile": stderr_path,
     }
@@ -153,6 +182,7 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict]:
     result: dict = {
         "completed": completed,
         "duration_time": duration,
+        "stdin_localfile": entry["stdin_file"],
         "stdout_localfile_size": stdout_size,
         "stderr_localfile_localsize": stderr_size,
     }

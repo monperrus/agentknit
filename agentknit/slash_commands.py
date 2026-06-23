@@ -227,8 +227,10 @@ def _handle_usage(session: dict, client: Any, model: str, args: str) -> None:
     cached = t.get("cached", 0)
     cache_write = t.get("cache_write", 0)
 
+    session_id = session.get("session_id", "unknown")
     parts = [
         f"{BOLD}Session token usage:{RESET}",
+        f"  trajectory: {session_id}",
         f"  prompt:     {prompt:>10,} tokens",
     ]
     if cached:

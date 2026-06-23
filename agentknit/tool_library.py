@@ -12,7 +12,163 @@ import signal
 import subprocess
 import sys
 import threading
+import time
+import uuid
 from pathlib import Path
+
+
+# ── async shell execution ─────────────────────────────────────────────────────
+
+# Persistent directory for stdout/stderr capture files (never deleted).
+ASYNC_EXEC_DIR = Path.home() / ".cache" / "async_agent_execs"
+ASYNC_EXEC_DIR.mkdir(parents=True, exist_ok=True)
+
+# Inline output in the tool response when the command finishes this quickly …
+ASYNC_FAST_THRESHOLD_S = 0.100
+# … and both stdout and stderr are under this many bytes.
+ASYNC_INLINE_MAX_BYTES = 4096
+
+# exec_id → {"proc": Popen, "stdout_file": str, "stderr_file": str, "start": float}
+_async_executions: dict[str, dict] = {}
+_async_exec_lock = threading.Lock()
+
+
+def _async_try_inline(path: str) -> str | None:
+    """Return file text if it fits within ASYNC_INLINE_MAX_BYTES, else None."""
+    try:
+        p = Path(path)
+        if p.stat().st_size > ASYNC_INLINE_MAX_BYTES:
+            return None
+        return p.read_text(errors="replace")
+    except OSError:
+        return None
+
+
+def _async_add_inline(result: dict, stdout_path: str, stderr_path: str) -> None:
+    """Append stdout/stderr content to *result* when both files are small enough."""
+    out = _async_try_inline(stdout_path)
+    err = _async_try_inline(stderr_path)
+    if out is not None:
+        result["stdout"] = out
+    if err is not None:
+        result["stderr"] = err
+
+
+def t_execute_async(command: str) -> tuple[str, dict]:
+    """Start a shell command asynchronously, capturing stdout/stderr to files.
+
+    If the command finishes within ASYNC_FAST_THRESHOLD_S *and* both output
+    files are small, the content is inlined so the caller needs no follow-up
+    t_query_exec call.
+    """
+    exec_id = uuid.uuid4().hex[:12]
+    stdout_path = str(ASYNC_EXEC_DIR / f"{exec_id}.stdout")
+    stderr_path = str(ASYNC_EXEC_DIR / f"{exec_id}.stderr")
+
+    stdout_fh = open(stdout_path, "wb")
+    stderr_fh = open(stderr_path, "wb")
+
+    t0 = time.monotonic()
+    proc = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=stdout_fh,
+        stderr=stderr_fh,
+        preexec_fn=os.setsid,
+    )
+
+    try:
+        proc.wait(timeout=ASYNC_FAST_THRESHOLD_S)
+    except subprocess.TimeoutExpired:
+        pass
+
+    stdout_fh.flush()
+    stderr_fh.flush()
+    returncode = proc.poll()
+    fast_done = returncode is not None
+
+    if fast_done:
+        stdout_fh.close()
+        stderr_fh.close()
+    else:
+        def _close_on_exit() -> None:
+            proc.wait()
+            stdout_fh.close()
+            stderr_fh.close()
+        threading.Thread(target=_close_on_exit, daemon=True).start()
+
+    duration = round(time.monotonic() - t0, 3)
+
+    with _async_exec_lock:
+        _async_executions[exec_id] = {
+            "proc": proc,
+            "stdout_file": stdout_path,
+            "stderr_file": stderr_path,
+            "start": t0,
+        }
+
+    result: dict = {
+        "tool_exec_id": exec_id,
+        "stdout_localfile": stdout_path,
+        "stderr_localfile": stderr_path,
+    }
+    if fast_done:
+        result["completed"] = True
+        result["returncode"] = returncode
+        result["duration_time"] = duration
+        _async_add_inline(result, stdout_path, stderr_path)
+
+    r = json.dumps(result)
+    return r, {"result": r}
+
+
+def t_query_exec(tool_exec_id: str) -> tuple[str, dict]:
+    """Poll the status of a command started with t_execute_async.
+
+    When completed, returncode is included and stdout/stderr are inlined if
+    both are under ASYNC_INLINE_MAX_BYTES.
+    """
+    with _async_exec_lock:
+        entry = _async_executions.get(tool_exec_id)
+
+    if entry is None:
+        r = json.dumps({"error": f"unknown tool_exec_id: {tool_exec_id}"})
+        return r, {"result": r}
+
+    proc: subprocess.Popen = entry["proc"]
+    returncode = proc.poll()
+    completed = returncode is not None
+    duration = round(time.monotonic() - entry["start"], 3)
+
+    stdout_size = stderr_size = 0
+    try:
+        stdout_size = Path(entry["stdout_file"]).stat().st_size
+    except OSError:
+        pass
+    try:
+        stderr_size = Path(entry["stderr_file"]).stat().st_size
+    except OSError:
+        pass
+
+    result: dict = {
+        "completed": completed,
+        "duration_time": duration,
+        "stdout_localfile_size": stdout_size,
+        "stderr_localfile_localsize": stderr_size,
+    }
+    if completed:
+        result["returncode"] = returncode
+        _async_add_inline(result, entry["stdout_file"], entry["stderr_file"])
+
+    r = json.dumps(result)
+    return r, {"result": r}
+
+
+def t_plan_delay(when: int) -> tuple[str, dict]:
+    """Sleep *when* minutes, then return so the LLM can re-plan."""
+    time.sleep(when * 60)
+    r = f"Planned wait of {when} minute(s) elapsed. Ready to re-plan."
+    return r, {"result": r}
 
 # Colour escapes needed for interactive user-facing prompts in t_ask_user*.
 _BOLD = "\033[1m"
@@ -365,6 +521,9 @@ TOOL_LIBRARY: dict[str, callable] = {
     "t_list_dir":           t_list_dir,
     "t_search":             t_search,
     "t_glob":               t_glob,
+    "t_execute_async":      t_execute_async,
+    "t_query_exec":         t_query_exec,
+    "t_plan_delay":         t_plan_delay,
 }
 
 def _register_generated(fn_name: str, source: str) -> bool:

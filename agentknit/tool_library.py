@@ -104,6 +104,7 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict]:
     stdin_read_fh = open(stdin_path, "rb")   # unblocks the writer thread
 
     t0 = time.monotonic()
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
     proc = subprocess.Popen(
         command,
         shell=True,
@@ -165,10 +166,12 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict]:
             "stdin_file":  stdin_path,
             "stdin_write_fh": stdin_write_fh,
             "start": t0,
+            "started_at": started_at,
         }
 
     result: dict = {
         "tool_exec_id": exec_id,
+        "started_at":       started_at,
         "stdin_localfile":  stdin_path,
         "stdout_localfile": stdout_path,
         "stderr_localfile": stderr_path,
@@ -213,6 +216,7 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict]:
 
     result: dict = {
         "completed": completed,
+        "started_at": entry["started_at"],
         "duration_time": duration,
         "stdin_localfile": entry["stdin_file"],
         "stdout_localfile_size": stdout_size,

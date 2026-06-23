@@ -54,8 +54,11 @@ def _async_add_inline(result: dict, stdout_path: str, stderr_path: str) -> None:
         result["stderr"] = err
 
 
-def t_execute_async(command: str) -> tuple[str, dict]:
+def t_execute_async(command: str, when: int = 0) -> tuple[str, dict]:
     """Start a shell command asynchronously, capturing stdout/stderr to files.
+
+    *when* (minutes, default 0) delays the start; use it to schedule a command
+    for later without a separate planning tool.
 
     A named FIFO is created at stdin_localfile; write text to it to send input
     to the running process (e.g. via write_file or a shell redirect).
@@ -64,6 +67,8 @@ def t_execute_async(command: str) -> tuple[str, dict]:
     files are small, the content is inlined so the caller needs no follow-up
     t_query_exec call.
     """
+    if when:
+        time.sleep(when * 60)
     exec_id = uuid.uuid4().hex[:12]
     stdout_path = str(ASYNC_EXEC_DIR / f"{exec_id}.stdout")
     stderr_path = str(ASYNC_EXEC_DIR / f"{exec_id}.stderr")
@@ -193,15 +198,6 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict]:
     r = json.dumps(result)
     return r, {"result": r}
 
-
-def t_plan_delay(command: str, when: int) -> tuple[str, dict]:
-    """Schedule *command* to run after *when* minutes, then return the result.
-
-    Sleeps for *when* minutes, executes *command* synchronously, and returns
-    its stdout/stderr so the LLM can re-plan based on the outcome.
-    """
-    time.sleep(when * 60)
-    return t_execute_async(command)
 
 # Colour escapes needed for interactive user-facing prompts in t_ask_user*.
 _BOLD = "\033[1m"
@@ -556,7 +552,6 @@ TOOL_LIBRARY: dict[str, callable] = {
     "t_glob":               t_glob,
     "t_execute_async":      t_execute_async,
     "t_query_exec":         t_query_exec,
-    "t_plan_delay":         t_plan_delay,
 }
 
 def _register_generated(fn_name: str, source: str) -> bool:

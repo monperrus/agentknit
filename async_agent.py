@@ -5,7 +5,6 @@ Async coding agent with non-blocking shell execution.
 Tools exposed to the LLM:
   execute_shell_command  — t_execute_async from agentknit.tool_library
   query_tool_exec        — t_query_exec    from agentknit.tool_library
-  plan_shell_command     — t_plan_delay    from agentknit.tool_library
   read_file              — t_read          from agentknit.tool_library
   write_file             — t_write         from agentknit.tool_library
 """
@@ -15,7 +14,7 @@ import argparse
 
 from agentknit import Tool, build_tool_spec, register_tools_in_library
 from agentknit import (
-    t_execute_async, t_query_exec, t_plan_delay,
+    t_execute_async, t_query_exec,
     ASYNC_FAST_THRESHOLD_S, ASYNC_INLINE_MAX_BYTES,
     run_task, run_repl,
 )
@@ -27,7 +26,8 @@ _TOOLS = [
         "execute_shell_command",
         f"Start a shell command asynchronously. Returns tool_exec_id and local "
         f"file paths for stdin (FIFO), stdout, and stderr. Write to stdin_localfile "
-        f"to send input to the running process. If the command finishes within "
+        f"to send input to the running process. Optional `when` (integer minutes, "
+        f"default 0) delays the start. If the command finishes within "
         f"{int(ASYNC_FAST_THRESHOLD_S * 1000)} ms and both outputs are under "
         f"{ASYNC_INLINE_MAX_BYTES} bytes, stdout/stderr are inlined immediately.",
         t_execute_async,
@@ -35,6 +35,10 @@ _TOOLS = [
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Shell command to run."},
+                "when": {
+                    "type": "integer",
+                    "description": "Minutes to wait before starting the command (default 0).",
+                },
             },
             "required": ["command"],
         },
@@ -54,24 +58,6 @@ _TOOLS = [
                 },
             },
             "required": ["tool_exec_id"],
-        },
-    ),
-    Tool(
-        "plan_shell_command",
-        "Wait `when` minutes, then run `command` and return its result so the "
-        "LLM can re-plan. Use this to schedule a check on a long-running task "
-        "without busy-polling.",
-        t_plan_delay,
-        parameters={
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "Shell command to run after the wait."},
-                "when": {
-                    "type": "integer",
-                    "description": "Number of minutes to wait before running the command.",
-                },
-            },
-            "required": ["command", "when"],
         },
     ),
     Tool(
@@ -105,10 +91,9 @@ _TOOL_SCHEMA, _TOOL_DISPATCH = build_tool_spec(_TOOLS)
 register_tools_in_library(_TOOLS)
 
 _SYSTEM_SUPPLEMENT = (
-    "You are a coding agent. Start shell commands with "
-    "execute_shell_command — they run in the background. Use query_tool_exec "
-    "to poll status. Use plan_shell_command(when) to wait N minutes before "
-    "re-checking long-running commands."
+    "You are a coding agent. Start shell commands with execute_shell_command — "
+    "they run in the background. Use query_tool_exec to poll status. Pass `when` "
+    "to execute_shell_command to delay a command by N minutes instead of polling."
 )
 
 

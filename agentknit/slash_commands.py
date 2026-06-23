@@ -8,10 +8,17 @@ Provides a registry and built-in commands:
 * ``/usage``  – show token usage for the current session
 
 Commands are intercepted in the REPL loop before the input is sent to the model.
+
+Also provides :func:`t_slash_command`, a tool function that exposes all slash
+commands to the LLM as a single structured tool call, and
+:data:`SLASH_COMMAND_TOOL`, a ready-made :class:`~agentknit.tool.Tool` object
+that agents can include in their tool list.
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import urllib.request
 from dataclasses import dataclass
@@ -279,3 +286,67 @@ REGISTRY.register(SlashCommand(
     description="Show this help message.",
     handler=_handle_help,
 ))
+
+# ── LLM-callable tool ─────────────────────────────────────────────────────────
+
+# Shared context populated by the agent at startup so t_slash_command can
+# forward calls to handlers that need session + client.
+slash_tool_ctx: dict = {"session": None, "client": None, "model": None}
+
+_HANDLERS: dict[str, Callable] = {
+    "clear": _handle_clear,
+    "model": _handle_model,
+    "usage": _handle_usage,
+    "help":  _handle_help,
+}
+
+
+def t_slash_command(command: str, args: str = "") -> tuple[str, dict]:
+    """Run a slash command and return its output as a tool result.
+
+    command must be one of: clear, model, usage, help.
+    For 'model', pass a model-id in args to switch; omit to list.
+
+    Populate :data:`slash_tool_ctx` with the live session, client, and model
+    name before registering this tool in an agent.
+    """
+    handler = _HANDLERS.get(command)
+    if handler is None:
+        r = f"ERROR: unknown command '{command}'. Valid: {', '.join(_HANDLERS)}"
+        return r, {"result": r}
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        handler(slash_tool_ctx["session"], slash_tool_ctx["client"],
+                slash_tool_ctx["model"], args)
+    out = buf.getvalue().strip()
+    return out, {"result": out}
+
+
+# Register in TOOL_LIBRARY so the dispatch mechanism can find it by name.
+from .tool_library import TOOL_LIBRARY as _TOOL_LIBRARY  # noqa: E402
+_TOOL_LIBRARY["t_slash_command"] = t_slash_command
+
+# Ready-made Tool object: import and add to your _TOOLS list.
+from .tool import Tool as _Tool  # noqa: E402
+
+SLASH_COMMAND_TOOL = _Tool(
+    "slash_command",
+    "Run a slash command. command: one of clear, model, usage, help. "
+    "For 'model', pass a model-id in args to switch; omit args to list.",
+    t_slash_command,
+    parameters={
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "enum": ["clear", "model", "usage", "help"],
+                "description": "Slash command to run.",
+            },
+            "args": {
+                "type": "string",
+                "description": "Optional argument (e.g. model-id for 'model').",
+            },
+        },
+        "required": ["command"],
+    },
+)

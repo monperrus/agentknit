@@ -226,7 +226,7 @@ def _repl(schema: dict, session_id: str | None, system_prompt_supplement: str) -
                     else:
                         for msg in _drain_completion_queue():
                             pending.append(msg)
-                        if pending:
+                        if pending and not readline.get_line_buffer():
                             sys.stdout.write("\n")
                             sys.stdout.flush()
                             break   # leave user_task = None, loop will handle pending

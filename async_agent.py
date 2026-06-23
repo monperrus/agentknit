@@ -22,7 +22,7 @@ from agentknit import (
     async_completion_queue,
     run_task,
 )
-from agentknit.tool_library import t_read, t_write, _async_try_inline
+from agentknit.tool_library import t_read, t_write, _async_try_inline, _async_last_lines
 from agentknit._core import (
     create_client, init_session, run_turn, _save_messages_snapshot,
     DEFAULT_ENDPOINT,
@@ -124,13 +124,25 @@ def _completion_message(event: dict) -> str:
     exec_id  = event["tool_exec_id"]
     rc       = event["returncode"]
     duration = event["duration"]
-    stdout   = _async_try_inline(event["stdout_file"]) or f"(see {event['stdout_file']})"
-    stderr   = _async_try_inline(event["stderr_file"]) or f"(see {event['stderr_file']})"
+    stdout_path = event["stdout_file"]
+    stderr_path = event["stderr_file"]
+    stdout = _async_try_inline(stdout_path)
+    if stdout is None:
+        tail = _async_last_lines(stdout_path, 3)
+        stdout_text = f"(see {stdout_path})" + (f"\nlast 3 lines:\n{tail}" if tail else "")
+    else:
+        stdout_text = stdout.rstrip() or "(empty)"
+    stderr = _async_try_inline(stderr_path)
+    if stderr is None:
+        tail = _async_last_lines(stderr_path, 3)
+        stderr_text = f"(see {stderr_path})" + (f"\nlast 3 lines:\n{tail}" if tail else "")
+    else:
+        stderr_text = stderr.rstrip()
     parts = [f"Background command {exec_id} finished after {duration:.1f}s "
              f"(returncode={rc})."]
-    parts.append(f"stdout: {stdout.rstrip() or '(empty)'}")
-    if stderr.strip():
-        parts.append(f"stderr: {stderr.rstrip()}")
+    parts.append(f"stdout: {stdout_text}")
+    if stderr_text.strip():
+        parts.append(f"stderr: {stderr_text}")
     return "\n".join(parts)
 
 

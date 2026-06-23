@@ -53,6 +53,15 @@ def _async_try_inline(path: str) -> str | None:
         return None
 
 
+def _async_last_lines(path: str, n: int = 3) -> str:
+    """Return the last *n* lines of *path*, or empty string if unreadable."""
+    try:
+        lines = Path(path).read_text(errors="replace").splitlines()
+        return "\n".join(lines[-n:]) if lines else ""
+    except OSError:
+        return ""
+
+
 def _async_add_inline(result: dict, stdout_path: str, stderr_path: str) -> None:
     """Append stdout/stderr content to *result* when both files are small enough."""
     out = _async_try_inline(stdout_path)

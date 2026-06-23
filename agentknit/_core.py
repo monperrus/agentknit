@@ -954,6 +954,8 @@ def _handle_tool_call(
                    "ts": datetime.datetime.now().isoformat(timespec="seconds")})
     _emit(session, "tool_call", name=name, args=args, fmt=fmt_call(name, args))
 
+    _tool_module._tool_context.session_id = session.get("session_id")
+
     if is_ask and non_interactive:
         result = "ERROR: user interaction is disabled (--non-interactive)"
         log_data: dict = {"result": result}

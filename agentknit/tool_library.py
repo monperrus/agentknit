@@ -32,6 +32,10 @@ ASYNC_INLINE_MAX_BYTES = 4096
 _async_executions: dict[str, dict] = {}
 _async_exec_lock = threading.Lock()
 
+# Thread-local set by _core._handle_tool_call before each dispatch so tools
+# can access the current session without being passed the session dict.
+_tool_context = threading.local()
+
 
 def _async_try_inline(path: str) -> str | None:
     """Return file text if it fits within ASYNC_INLINE_MAX_BYTES, else None."""
@@ -69,10 +73,13 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict]:
     """
     if when:
         time.sleep(when * 60)
+    session_id = getattr(_tool_context, "session_id", None)
+    exec_dir = (ASYNC_EXEC_DIR / session_id) if session_id else ASYNC_EXEC_DIR
+    exec_dir.mkdir(parents=True, exist_ok=True)
     exec_id = uuid.uuid4().hex[:12]
-    stdout_path = str(ASYNC_EXEC_DIR / f"{exec_id}.stdout")
-    stderr_path = str(ASYNC_EXEC_DIR / f"{exec_id}.stderr")
-    stdin_path  = str(ASYNC_EXEC_DIR / f"{exec_id}.stdin")
+    stdout_path = str(exec_dir / f"{exec_id}.stdout")
+    stderr_path = str(exec_dir / f"{exec_id}.stderr")
+    stdin_path  = str(exec_dir / f"{exec_id}.stdin")
 
     os.mkfifo(stdin_path)
     stdout_fh = open(stdout_path, "wb")

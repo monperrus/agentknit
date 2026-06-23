@@ -164,11 +164,14 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict]:
     return r, {"result": r}
 
 
-def t_plan_delay(when: int) -> tuple[str, dict]:
-    """Sleep *when* minutes, then return so the LLM can re-plan."""
+def t_plan_delay(command: str, when: int) -> tuple[str, dict]:
+    """Schedule *command* to run after *when* minutes, then return the result.
+
+    Sleeps for *when* minutes, executes *command* synchronously, and returns
+    its stdout/stderr so the LLM can re-plan based on the outcome.
+    """
     time.sleep(when * 60)
-    r = f"Planned wait of {when} minute(s) elapsed. Ready to re-plan."
-    return r, {"result": r}
+    return t_execute_async(command)
 
 # Colour escapes needed for interactive user-facing prompts in t_ask_user*.
 _BOLD = "\033[1m"

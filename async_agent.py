@@ -63,18 +63,20 @@ _TOOLS = [
     ),
     Tool(
         "plan_shell_command",
-        "Wait `when` minutes, then return control to the LLM so it can re-plan "
-        "and check on running commands. Use this to avoid busy-polling.",
+        "Wait `when` minutes, then run `command` and return its result so the "
+        "LLM can re-plan. Use this to schedule a check on a long-running task "
+        "without busy-polling.",
         t_plan_delay,
         parameters={
             "type": "object",
             "properties": {
+                "command": {"type": "string", "description": "Shell command to run after the wait."},
                 "when": {
                     "type": "integer",
-                    "description": "Number of minutes to wait before re-planning.",
+                    "description": "Number of minutes to wait before running the command.",
                 },
             },
-            "required": ["when"],
+            "required": ["command", "when"],
         },
     ),
     Tool(
@@ -108,7 +110,7 @@ _TOOL_SCHEMA, _TOOL_DISPATCH = build_tool_spec(_TOOLS)
 register_tools_in_library(_TOOLS)
 
 _SYSTEM_SUPPLEMENT = (
-    "You are an async coding agent. Start shell commands with "
+    "You are a coding agent. Start shell commands with "
     "execute_shell_command — they run in the background. Use query_tool_exec "
     "to poll status. Use plan_shell_command(when) to wait N minutes before "
     "re-checking long-running commands."

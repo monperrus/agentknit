@@ -61,12 +61,16 @@ from .tool_library import (
     ASYNC_EXEC_DIR,
     ASYNC_FAST_THRESHOLD_S,
     ASYNC_INLINE_MAX_BYTES,
+    async_completion_queue,
 )
 
 from .slash_commands import (
     SlashCommand,
     SlashCommandRegistry,
     REGISTRY as slash_registry,
+    t_slash_command,
+    slash_tool_ctx,
+    SLASH_COMMAND_TOOL,
 )
 
 __all__ = [
@@ -90,6 +94,6 @@ __all__ = [
     "SlashCommandRegistry",
     "slash_registry",
     # async shell tools
-    "t_execute_async", "t_query_exec",
+    "t_execute_async", "t_query_exec", "async_completion_queue",
     "ASYNC_EXEC_DIR", "ASYNC_FAST_THRESHOLD_S", "ASYNC_INLINE_MAX_BYTES",
 ]

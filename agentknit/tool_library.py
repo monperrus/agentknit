@@ -32,6 +32,11 @@ ASYNC_INLINE_MAX_BYTES = 4096
 _async_executions: dict[str, dict] = {}
 _async_exec_lock = threading.Lock()
 
+# Completed processes push here so the REPL can trigger a new LLM turn.
+# Each entry: {"tool_exec_id", "returncode", "stdout_file", "stderr_file", "duration"}
+import queue as _queue
+async_completion_queue: _queue.Queue = _queue.Queue()
+
 # Thread-local set by _core._handle_tool_call before each dispatch so tools
 # can access the current session without being passed the session dict.
 _tool_context = threading.local()
@@ -129,9 +134,24 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict]:
                 fh.close()
             except OSError:
                 pass
+        async_completion_queue.put({
+            "tool_exec_id": exec_id,
+            "returncode":   proc.returncode,
+            "stdout_file":  stdout_path,
+            "stderr_file":  stderr_path,
+            "duration":     round(time.monotonic() - t0, 3),
+        })
 
     if fast_done:
-        _close_on_exit()
+        # Result already inlined; close handles but skip the completion queue push.
+        stdout_fh.close()
+        stderr_fh.close()
+        fifo_thread.join(timeout=1)
+        for fh in stdin_write_fh:
+            try:
+                fh.close()
+            except OSError:
+                pass
     else:
         threading.Thread(target=_close_on_exit, daemon=True).start()
 

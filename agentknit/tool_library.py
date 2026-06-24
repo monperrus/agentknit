@@ -94,10 +94,11 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict]:
     stdout_path = str(exec_dir / f"{exec_id}.stdout")
     stderr_path = str(exec_dir / f"{exec_id}.stderr")
     stdin_path  = str(exec_dir / f"{exec_id}.stdin")
+    cwd = os.getcwd()
 
     os.mkfifo(stdin_path)
-    stdout_fh = open(stdout_path, "wb")
-    stderr_fh = open(stderr_path, "wb")
+    stdout_fh = open(stdout_path, "wb", buffering=0)
+    stderr_fh = open(stderr_path, "wb", buffering=0)
 
     # Open the FIFO write-end in a background thread (open() on a FIFO blocks
     # until a reader appears). The read-end is handed to the process.
@@ -150,6 +151,7 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict]:
             "stdout_file":  stdout_path,
             "stderr_file":  stderr_path,
             "duration":     round(time.monotonic() - t0, 3),
+            "cwd":          cwd,
         })
 
     if fast_done:
@@ -176,11 +178,13 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict]:
             "stdin_write_fh": stdin_write_fh,
             "start": t0,
             "started_at": started_at,
+            "cwd": cwd,
         }
 
     result: dict = {
         "tool_exec_id": exec_id,
         "started_at":       started_at,
+        "cwd":              cwd,
         "stdin_localfile":  stdin_path,
         "stdout_localfile": stdout_path,
         "stderr_localfile": stderr_path,
@@ -227,6 +231,7 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict]:
         "completed": completed,
         "returncode": returncode,  # None while running, int when done
         "started_at": entry["started_at"],
+        "cwd":         entry.get("cwd", ""),
         "duration_time": duration,
         "stdin_localfile": entry["stdin_file"],
         "stdout_localfile_size": stdout_size,

@@ -225,6 +225,7 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict]:
 
     result: dict = {
         "completed": completed,
+        "returncode": returncode,  # None while running, int when done
         "started_at": entry["started_at"],
         "duration_time": duration,
         "stdin_localfile": entry["stdin_file"],
@@ -232,7 +233,6 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict]:
         "stderr_localfile_localsize": stderr_size,
     }
     if completed:
-        result["returncode"] = returncode
         _async_add_inline(result, entry["stdout_file"], entry["stderr_file"])
 
     r = json.dumps(result)

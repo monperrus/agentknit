@@ -977,7 +977,8 @@ def _handle_tool_call(
     _emit(session, "tool_result", name=name, result=result, streamed=streamed,
           fmt=fmt_result(result, streamed=streamed))
     _log(session, {"type": "tool_result", "name": name,
-                   "python_function": entry.get("python_function"), **log_data,
+                   "python_function": entry.get("python_function"),
+                   "result": result, **log_data,
                    "ts": datetime.datetime.now().isoformat(timespec="seconds")})
     return result
 

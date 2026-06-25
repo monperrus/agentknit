@@ -1125,13 +1125,22 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
         # Accumulate token usage from the response and surface it to the user.
         usage = getattr(resp, "usage", None)
         if usage:
-            total_tokens += getattr(usage, "total_tokens", 0) or 0
+            prompt_tok     = getattr(usage, "prompt_tokens", 0) or 0
+            completion_tok = getattr(usage, "completion_tokens", 0) or 0
+            cached_tok     = getattr(usage, "cached_tokens", 0) or 0
+            cache_creat    = getattr(usage, "cache_creation_tokens", 0) or 0
+            # Only count effective (non-cached) tokens toward the budget —
+            # cached tokens were served from a prefix cache and weren't
+            # actually generated/processed, so they shouldn't deplete the
+            # budget as aggressively as new tokens.
+            effective = max(0, prompt_tok - cached_tok) + completion_tok
+            total_tokens += effective
             totals = session["usage_totals"]
-            totals["prompt"]      += getattr(usage, "prompt_tokens", 0) or 0
-            totals["completion"]  += getattr(usage, "completion_tokens", 0) or 0
+            totals["prompt"]      += prompt_tok
+            totals["completion"]  += completion_tok
             totals["total"]       += getattr(usage, "total_tokens", 0) or 0
-            totals["cached"]      += getattr(usage, "cached_tokens", 0) or 0
-            totals["cache_write"] += getattr(usage, "cache_creation_tokens", 0) or 0
+            totals["cached"]      += cached_tok
+            totals["cache_write"] += cache_creat
             _emit(session, "usage",
                   prompt=getattr(usage, "prompt_tokens", 0) or 0,
                   completion=getattr(usage, "completion_tokens", 0) or 0,
@@ -1147,9 +1156,14 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
                            "cache_creation_tokens": getattr(usage, "cache_creation_tokens", 0) or 0,
                            "ts": datetime.datetime.now().isoformat(timespec="seconds")})
         if total_tokens > max_tokens:
+            totals = session["usage_totals"]
+            raw_total = totals["total"]
+            cached_total = totals["cached"]
+            raw_info = f" ({raw_total:,} raw API total, {cached_total:,} cached)" if cached_total else ""
             _emit(session, "token_limit", used=total_tokens, limit=max_tokens,
-                  fmt=f"\n[stopped after exceeding {max_tokens:,} tokens "
-                      f"(used {total_tokens:,})]")
+                  raw_total=raw_total, cached_total=cached_total,
+                  fmt=f"\n[stopped after exceeding {max_tokens:,} effective tokens "
+                      f"(used {total_tokens:,} effective{raw_info})]")
             if not session["non_interactive"]:
                 try:
                     ans = input(f"Double the token budget to {max_tokens * 2:,}? [y/N] ").strip().lower()
@@ -1214,9 +1228,11 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
               fmt="" if already_streamed else f"\n{GREEN}{BOLD}» {RESET}{text.strip()}\n")
         t = session["usage_totals"]
         cached_part = f", {t['cached']:,} cached" if t["cached"] else ""
+        eff = max(0, t['prompt'] - t['cached']) + t['completion']
+        eff_part = f"  |  effective {eff:,}" if t['cached'] else ""
         _emit(session, "session_usage", **t,
               fmt=(f"{DIM}{MAG}[session tokens] prompt {t['prompt']:,}{cached_part}  |  "
-                   f"completion {t['completion']:,}  |  total {t['total']:,}{RESET}\n"))
+                   f"completion {t['completion']:,}  |  total {t['total']:,}{eff_part}{RESET}\n"))
         return _session_result(session)
 
 

@@ -42,6 +42,16 @@ async_completion_queue: _queue.Queue = _queue.Queue()
 _tool_context = threading.local()
 
 
+def get_async_command_for_output_path(path: str) -> str | None:
+    """Return the originating async shell command for a stdout/stderr file."""
+    expanded = os.path.expanduser(path)
+    with _async_exec_lock:
+        for entry in _async_executions.values():
+            if expanded in {entry.get("stdout_file"), entry.get("stderr_file")}:
+                return entry.get("command")
+    return None
+
+
 def _async_try_inline(path: str) -> str | None:
     """Return file text if it fits within ASYNC_INLINE_MAX_BYTES, else None."""
     try:
@@ -172,6 +182,7 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict]:
     with _async_exec_lock:
         _async_executions[exec_id] = {
             "proc": proc,
+            "command": command,
             "stdout_file": stdout_path,
             "stderr_file": stderr_path,
             "stdin_file":  stdin_path,

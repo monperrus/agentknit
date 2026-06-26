@@ -542,6 +542,11 @@ def fmt_result(text: str, streamed: bool = False) -> str:
     return DIM + "\n".join("  " + line for line in head) + RESET + tail
 
 
+def fmt_read_result_with_command(command: str, text: str, streamed: bool = False) -> str:
+    reminder = f"{YEL}{BOLD}  shell output from:{RESET} {YEL}{command}{RESET}\n"
+    return reminder + fmt_result(text, streamed=streamed)
+
+
 def inline_system_prompt(tools: list[dict]) -> str:
     examples = []
     for tool in tools:
@@ -974,8 +979,16 @@ def _handle_tool_call(
                            "ts": datetime.datetime.now().isoformat(timespec="seconds")})
             raise SystemExit(2) from e
 
+    fmt = fmt_result(result, streamed=streamed)
+    if name == "read_file":
+        path = args.get("path")
+        if isinstance(path, str):
+            command = _tool_module.get_async_command_for_output_path(path)
+            if command:
+                fmt = fmt_read_result_with_command(command, result, streamed=streamed)
+
     _emit(session, "tool_result", name=name, result=result, streamed=streamed,
-          fmt=fmt_result(result, streamed=streamed))
+          fmt=fmt)
     _log(session, {"type": "tool_result", "name": name,
                    "python_function": entry.get("python_function"),
                    "result": result, **log_data,
@@ -1636,7 +1649,7 @@ def run_repl(
         pass
     readline.set_history_length(500)
 
-    print(f"{BOLD}probe-agent {model}{RESET}  (type 'exit' to quit)\n")
+    print(f"{BOLD}agentknit {model}{RESET}  (type 'exit' to quit)\n")
     try:
         while True:
             try:
@@ -1800,7 +1813,7 @@ def main() -> None:
         pass
     readline.set_history_length(500)
 
-    print(f"{BOLD}probe-agent {model}{RESET}  (type 'exit' to quit)\n")
+    print(f"{BOLD}agentknit {model}{RESET}  (type 'exit' to quit)\n")
     try:
         while True:
             try:

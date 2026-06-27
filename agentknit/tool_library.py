@@ -41,6 +41,11 @@ async_completion_queue: _queue.Queue = _queue.Queue()
 # can access the current session without being passed the session dict.
 _tool_context = threading.local()
 
+# Optional reference to the active _InputCollector (set by _core REPL loop).
+# When set, t_ask_user_question pauses it before calling input() so the
+# background reader thread doesn't steal keystrokes.
+_input_collector: object | None = None
+
 
 def get_async_command_for_output_path(path: str) -> str | None:
     """Return the originating async shell command for a stdout/stderr file."""
@@ -552,10 +557,17 @@ def t_ask_user_question(question: str = '', options: str = '') -> tuple[str, dic
         for i, opt in enumerate(parsed_options, 1):
             print(f"  {i}. {opt}")
 
+    # Pause the background _InputCollector so it doesn't steal stdin.
+    collector = _input_collector
+    if collector is not None:
+        collector.pause()
     try:
         answer = input(f"{_RL_BOLD}Your answer:{_RL_RESET} ").strip()
     except (EOFError, KeyboardInterrupt):
         return 'ERROR: No user input available', {'result': 'error'}
+    finally:
+        if collector is not None:
+            collector.resume()
 
     if parsed_options and answer.isdigit():
         idx = int(answer)

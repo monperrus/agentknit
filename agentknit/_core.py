@@ -1049,6 +1049,19 @@ class _InputCollector:
             self._thread.join(timeout=0.5)
             self._thread = None
 
+    def pause(self) -> None:
+        """Temporarily stop the reader thread so input() can be called directly."""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+            self._thread = None
+
+    def resume(self) -> None:
+        """Restart the reader thread after a pause()."""
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
     def drain(self) -> list[str]:
         items: list[str] = []
         while True:
@@ -1674,6 +1687,7 @@ def run_repl(
                     continue
                 # ── regular turn (with async input queue) ────────────────────
                 _collector = _InputCollector()
+                _tool_module._input_collector = _collector
                 _pending = [t]
                 while _pending:
                     _task = _pending.pop(0)
@@ -1702,6 +1716,7 @@ def run_repl(
                             _pending.append(_qi)
                         else:
                             _save_messages_snapshot(session)
+                _tool_module._input_collector = None
     finally:
         try:
             readline.write_history_file(_hist_file)
@@ -1838,6 +1853,7 @@ def main() -> None:
                     continue
                 # ── regular turn (with async input queue) ────────────────────
                 _collector = _InputCollector()
+                _tool_module._input_collector = _collector
                 _pending = [t]
                 while _pending:
                     _task = _pending.pop(0)
@@ -1866,6 +1882,7 @@ def main() -> None:
                             _pending.append(_qi)
                         else:
                             _save_messages_snapshot(session)
+                _tool_module._input_collector = None
     finally:
         try:
             readline.write_history_file(_hist_file)

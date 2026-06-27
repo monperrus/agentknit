@@ -55,6 +55,11 @@ from .tool import (
     register_tools_in_library,
 )
 
+from ._tool_spec import (
+    parse_tool_spec_from_docstring,
+    extract_tool_specs_from_module,
+)
+
 from .tool_library import (
     t_execute_async,
     t_query_exec,
@@ -74,6 +79,8 @@ from .slash_commands import (
 )
 
 __all__ = [
+    "parse_tool_spec_from_docstring",
+    "extract_tool_specs_from_module",
     "AgentProbeError", "AgentSpecDisabledError", "AgentSpecInvalidError",
     "PricingLimitExceededError", "AuthenticationError",
     "main", "validate_schema", "create_client", "run_task", "run_repl",

@@ -269,6 +269,22 @@ _active_proc: "subprocess.Popen | None" = None
 
 
 def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tuple[str, dict]:
+    """Read and return the contents of a file at the specified path.
+
+    Tool spec:
+        name: read_file
+        description: Read and return the contents of a file at the specified path.
+        parameters:
+            path:
+                type: string
+                description: Path to the file.
+            offset:
+                type: integer
+                description: Line number to start reading from (0-indexed). Negative values count from end of file.
+            limit:
+                type: integer
+                description: Maximum number of lines to read.
+    """
     try:
         content = Path(os.path.expanduser(path)).read_text()
         if offset is not None or limit is not None:
@@ -287,6 +303,19 @@ def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tu
         return r, {"result": r}
 
 def t_write(path: str, content: str) -> tuple[str, dict]:
+    """Write (or overwrite) a file at the specified path with the given content.
+
+    Tool spec:
+        name: write_file
+        description: Write (or overwrite) a file at the specified path with the given content.
+        parameters:
+            path:
+                type: string
+                description: Path to the file.
+            content:
+                type: string
+                description: Content to write.
+    """
     try:
         p = Path(os.path.expanduser(path))
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -346,6 +375,22 @@ def _apply_patch_format(patch: str) -> tuple[str, dict]:
 
 
 def t_update(path: str = "", old: str = "", new: str = "", patch: str = "") -> tuple[str, dict]:
+    """Edit an existing file by replacing a specific substring.
+
+    Tool spec:
+        name: str_replace
+        description: Edit an existing file by replacing a specific substring.
+        parameters:
+            path:
+                type: string
+                description: Path to the file.
+            old_str:
+                type: string
+                description: Text to replace.
+            new_str:
+                type: string
+                description: Replacement text.
+    """
     if patch:
         return _apply_patch_format(patch)
     try:
@@ -368,6 +413,16 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "") -> t
         return r, {"result": r}
 
 def t_run(command: str) -> tuple[str, dict]:
+    """Execute a shell command and return its stdout, stderr, and exit code.
+
+    Tool spec:
+        name: execute_shell_command
+        description: Execute a shell command and return its stdout, stderr, and exit code.
+        parameters:
+            command:
+                type: string
+                description: Shell command to execute.
+    """
     global _active_proc
     proc: subprocess.Popen[str] | None = None
     try:

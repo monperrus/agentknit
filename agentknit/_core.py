@@ -275,6 +275,8 @@ _DEFAULT_TOOL_SCHEMA = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to the file."},
+                    "offset": {"type": "integer", "description": "Line number to start reading from (0-indexed). Negative values count from end of file."},
+                    "limit": {"type": "integer", "description": "Maximum number of lines to read."},
                 },
                 "required": ["path"],
             },

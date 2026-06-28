@@ -651,19 +651,34 @@ def t_search(path: str = ".", pattern: str = "") -> tuple[str, dict]:
         t_out.join(timeout=5)
         t_err.join(timeout=5)
 
-        out = "".join(stdout_lines) or "(no matches)"
-        return out, {"result": out, "streamed": True}
+        out = "".join(stdout_lines)
+        matches: list[dict] = []
+        for line in out.splitlines():
+            # grep -n output:  file:line:text
+            parts = line.split(":", 2)
+            if len(parts) >= 3:
+                try:
+                    matches.append({
+                        "file": parts[0],
+                        "line": int(parts[1]),
+                        "text": parts[2],
+                    })
+                except ValueError:
+                    pass
+
+        result = json.dumps({"matches": matches}, separators=(",", ":"))
+        return result, {"result": result, "streamed": True, "matches": matches}
     except subprocess.TimeoutExpired:
         if proc is not None:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except Exception:
                 proc.kill()
-        r = "ERROR: search timed out after 30 s"
-        return r, {"result": r}
+        result = json.dumps({"error": "search timed out after 30 s"}, separators=(",", ":"))
+        return result, {"result": result, "error": "search timed out after 30 s"}
     except Exception as e:
-        r = f"ERROR: {e}"
-        return r, {"result": r}
+        result = json.dumps({"error": str(e)}, separators=(",", ":"))
+        return result, {"result": result, "error": str(e)}
     finally:
         _active_proc = None
 

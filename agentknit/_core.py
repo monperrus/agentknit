@@ -2060,6 +2060,13 @@ def _repl_setup(
     )
     model = schema["model"]
 
+    tool_specs = schema.get("inferred_tool_schema") or schema.get("tool_specs") or []
+    if tool_specs:
+        tool_names = [t.get("function", {}).get("name", "?") for t in tool_specs]
+        print(f"Tools:    {', '.join(tool_names)}")
+    else:
+        print("Tools:    (none)")
+
     if session_id:
         print_session_history(session)
 

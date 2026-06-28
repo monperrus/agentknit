@@ -825,6 +825,7 @@ def _save_messages_snapshot(session: dict) -> None:
     if not any(m.get("role") != "system" for m in session["messages"]):
         return
     path = _snapshot_path(session["model"], session["session_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
     # Annotate each message with a timestamp (backward-compatible: existing
     # messages that already have a "ts" key are left unchanged).
     annotated = []
@@ -833,15 +834,26 @@ def _save_messages_snapshot(session: dict) -> None:
         if "ts" not in entry:
             entry["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
         annotated.append(entry)
+    payload = {
+        "metadata": {
+            "endpoint": session.get("endpoint", ""),
+            "model": session["model"],
+            "session_id": session["session_id"],
+        },
+        "messages": annotated,
+    }
     with path.open("w") as f:
-        json.dump(annotated, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
 def _load_messages_snapshot(model: str, session_id: str) -> list | None:
     path = _snapshot_path(model, session_id)
     if path.exists():
         with path.open() as f:
-            return json.load(f)
+            data = json.load(f)
+            if isinstance(data, dict) and "messages" in data:
+                return data["messages"]
+            return data
 
     # If session_id looks like a trajectoriz short ID (e.g. "ap-<hex8>"),
     # resolve it by hashing each snapshot's actual session ID.
@@ -856,7 +868,10 @@ def _load_messages_snapshot(model: str, session_id: str) -> list | None:
                 h = hashlib.sha256(actual_sid.encode()).hexdigest()[:8]
                 if h == target_hash:
                     with snap.open() as f:
-                        return json.load(f)
+                        data = json.load(f)
+                        if isinstance(data, dict) and "messages" in data:
+                            return data["messages"]
+                        return data
 
     return None
 
@@ -892,7 +907,10 @@ def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list | 
     # Prefer the most recently updated trajectory when there are collisions.
     best = max(matches, key=lambda p: p.stat().st_mtime)
     with best.open() as f:
-        return json.load(f), best.parent.name
+        data = json.load(f)
+        if isinstance(data, dict) and "messages" in data:
+            return data["messages"], best.parent.name
+        return data, best.parent.name
 
 
 # ── agent loop ────────────────────────────────────────────────────────────────

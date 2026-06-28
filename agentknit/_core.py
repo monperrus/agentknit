@@ -397,6 +397,20 @@ def load_or_probe(model: str, endpoint: str, force: bool) -> dict:
         with path.open() as f:
             return json.load(f)
 
+    if endpoint:
+        data = {
+            "model": model,
+            "endpoint": endpoint,
+            "status": "default",
+            "tool_specs": _DEFAULT_TOOL_SCHEMA,
+            "tools": _DEFAULT_TOOLS,
+            "behaviour": {"call_delivery_mode": "structured_tool_calls"},
+        }
+        with path.open("w") as f:
+            json.dump(data, f, indent=2)
+        print(f"{DIM}Generated default spec at {path.name}{RESET}")
+        return data
+
     raise AgentSpecInvalidError(
         f"No agent spec found for '{model}'. "
         f"Run `llmprobe {model}` (with --endpoint {endpoint} if needed) "

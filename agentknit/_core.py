@@ -855,12 +855,57 @@ def _save_messages_snapshot(session: dict) -> None:
 
 def _load_messages_snapshot(model: str, session_id: str) -> list | None:
     path = _snapshot_path(model, session_id)
-    if path.exists():
-        with path.open() as f:
-            data = json.load(f)
-            if isinstance(data, dict) and "messages" in data:
-                return data["messages"]
-            return data
+    if not path.exists():
+        return None
+    with path.open() as f:
+        data = json.load(f)
+    msgs = data["messages"] if isinstance(data, dict) and "messages" in data else data
+    if not isinstance(msgs, list):
+        return None
+    # Normalise: merge consecutive user messages so the API's strict
+    # user/assistant alternation is preserved.
+    normalised: list = []
+    for m in msgs:
+        if normalised and m.get("role") == "user" and normalised[-1].get("role") == "user":
+            old = normalised[-1].get("content", "")
+            new = m.get("content", "")
+            normalised[-1]["content"] = f"{old}\n\n{new}" if old else new
+            normalised[-1]["ts"] = m.get("ts")
+        else:
+            normalised.append(dict(m))
+    # Convert tool calls to text descriptions: some providers (e.g.
+    # opencode.ai) do not support resuming conversations with tool call
+    # IDs from a previous session.
+    converted: list = []
+    for m in normalised:
+        if m.get("role") == "assistant" and "tool_calls" in m:
+            for tc in m["tool_calls"]:
+                fn = tc["function"]
+                converted.append({
+                    "role": "assistant",
+                    "content": f"[Tool call: {fn['name']}({fn['arguments']})]",
+                    "ts": m.get("ts"),
+                })
+        elif m.get("role") == "tool":
+            converted.append({
+                "role": "assistant",
+                "content": f"[Tool result: {m.get('content', '')}]",
+                "ts": m.get("ts"),
+            })
+        else:
+            converted.append(m)
+    # Merge consecutive assistant messages to preserve user/assistant
+    # alternation required by the API.
+    merged: list = []
+    for m in converted:
+        if merged and m.get("role") == "assistant" and merged[-1].get("role") == "assistant":
+            old = merged[-1].get("content", "")
+            new = m.get("content", "")
+            merged[-1]["content"] = f"{old}\n\n{new}" if old else new
+            merged[-1]["ts"] = m.get("ts")
+        else:
+            merged.append(dict(m))
+    return merged
 
     # If session_id looks like a trajectoriz short ID (e.g. "ap-<hex8>"),
     # resolve it by hashing each snapshot's actual session ID.
@@ -915,9 +960,53 @@ def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list | 
     best = max(matches, key=lambda p: p.stat().st_mtime)
     with best.open() as f:
         data = json.load(f)
-        if isinstance(data, dict) and "messages" in data:
-            return data["messages"], best.parent.name
-        return data, best.parent.name
+    msgs = data["messages"] if isinstance(data, dict) and "messages" in data else data
+    if not isinstance(msgs, list):
+        return None, None
+    # Normalise: merge consecutive user messages so the API's strict
+    # user/assistant alternation is preserved.
+    normalised: list = []
+    for m in msgs:
+        if normalised and m.get("role") == "user" and normalised[-1].get("role") == "user":
+            old = normalised[-1].get("content", "")
+            new = m.get("content", "")
+            normalised[-1]["content"] = f"{old}\n\n{new}" if old else new
+            normalised[-1]["ts"] = m.get("ts")
+        else:
+            normalised.append(dict(m))
+    # Convert tool calls to text descriptions: some providers (e.g.
+    # opencode.ai) do not support resuming conversations with tool call
+    # IDs from a previous session.
+    converted: list = []
+    for m in normalised:
+        if m.get("role") == "assistant" and "tool_calls" in m:
+            for tc in m["tool_calls"]:
+                fn = tc["function"]
+                converted.append({
+                    "role": "assistant",
+                    "content": f"[Tool call: {fn['name']}({fn['arguments']})]",
+                    "ts": m.get("ts"),
+                })
+        elif m.get("role") == "tool":
+            converted.append({
+                "role": "assistant",
+                "content": f"[Tool result: {m.get('content', '')}]",
+                "ts": m.get("ts"),
+            })
+        else:
+            converted.append(m)
+    # Merge consecutive assistant messages to preserve user/assistant
+    # alternation required by the API.
+    merged: list = []
+    for m in converted:
+        if merged and m.get("role") == "assistant" and merged[-1].get("role") == "assistant":
+            old = merged[-1].get("content", "")
+            new = m.get("content", "")
+            merged[-1]["content"] = f"{old}\n\n{new}" if old else new
+            merged[-1]["ts"] = m.get("ts")
+        else:
+            merged.append(dict(m))
+    return merged, best.parent.name
 
 
 # ── agent loop ────────────────────────────────────────────────────────────────

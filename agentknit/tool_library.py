@@ -285,7 +285,7 @@ def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tu
                 description: Path to the file.
             offset:
                 type: integer
-                description: Line number to start reading from (0-indexed). Negative values count from end of file.
+                description: Line number to start reading from (1-indexed).
             limit:
                 type: integer
                 description: Maximum number of lines to read.
@@ -294,9 +294,8 @@ def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tu
         content = Path(os.path.expanduser(path)).read_text()
         if offset is not None or limit is not None:
             lines = content.splitlines(keepends=True)
-            start = offset if offset is not None else 0
-            if start < 0:
-                start = max(0, len(lines) + start)
+            start = (offset - 1) if offset is not None else 0
+            start = max(0, start)
             if limit is not None:
                 end = start + limit
             else:

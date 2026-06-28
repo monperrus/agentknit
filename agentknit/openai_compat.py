@@ -94,11 +94,12 @@ class _Choice:
 
 class _Usage:
     __slots__ = ("total_tokens", "prompt_tokens", "completion_tokens",
-                 "cached_tokens", "cache_creation_tokens")
+                 "cached_tokens", "cache_creation_tokens", "has_cache_proof")
 
     def __init__(self, total_tokens: int = 0, prompt_tokens: int = 0,
                  completion_tokens: int = 0, cached_tokens: int = 0,
-                 cache_creation_tokens: int = 0) -> None:
+                 cache_creation_tokens: int = 0,
+                 has_cache_proof: bool = False) -> None:
         self.total_tokens = total_tokens
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
@@ -108,6 +109,8 @@ class _Usage:
         # cache_creation_tokens = tokens written to the cache this call
         # (Anthropic-specific; surfaced by claude-haiku-completions.py).
         self.cache_creation_tokens = cache_creation_tokens
+        # True when the provider returned an explicit cache-read or cache-write field.
+        self.has_cache_proof = has_cache_proof
 
 
 class _Response:
@@ -304,16 +307,29 @@ def _parse_response(data: dict) -> _Response:
         )))
     u = data.get("usage") or {}
     details = u.get("prompt_tokens_details") or {}
-    # cache-write count is top-level on Anthropic (cache_creation_input_tokens)
-    # but nested under prompt_tokens_details on OpenRouter (cache_write_tokens).
-    cache_creation = (u.get("cache_creation_input_tokens")
-                      or details.get("cache_write_tokens") or 0)
+    cached_candidates = [
+        details.get("cached_tokens"),
+        u.get("cache_read_input_tokens"),
+        u.get("cache_read_tokens"),
+        details.get("cache_read_tokens"),
+        details.get("cache_read_input_tokens"),
+    ]
+    cache_creation_candidates = [
+        u.get("cache_creation_input_tokens"),
+        u.get("cache_write_tokens"),
+        details.get("cache_write_tokens"),
+        details.get("cache_creation_input_tokens"),
+    ]
+    cached_tokens = next((int(v) for v in cached_candidates if v is not None), 0)
+    cache_creation = next((int(v) for v in cache_creation_candidates if v is not None), 0)
+    has_cache_proof = any(v is not None for v in [*cached_candidates, *cache_creation_candidates])
     return _Response(choices, _Usage(
         total_tokens=u.get("total_tokens", 0) or 0,
         prompt_tokens=u.get("prompt_tokens", 0) or 0,
         completion_tokens=u.get("completion_tokens", 0) or 0,
-        cached_tokens=details.get("cached_tokens", 0) or 0,
+        cached_tokens=cached_tokens,
         cache_creation_tokens=cache_creation,
+        has_cache_proof=has_cache_proof,
     ), provider=data.get("provider"))
 
 

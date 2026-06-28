@@ -20,6 +20,37 @@ result = run_task(schema, "List the files in /tmp")
 print(result.final_reply)
 ```
 
+## Strict Cache Proof
+
+`agentknit` now runs in strict cache-proof mode by default.
+
+After the first LLM call in a session, every later call must return explicit
+server-side cache accounting with a nonzero cache hit. If the provider does
+not expose cache-proof fields, or reports `cached_tokens = 0`, the run aborts.
+
+This is fail-closed by design: models that cannot prove cache reuse should be
+treated as unsupported for cache-sensitive workloads.
+
+The usage layer normalizes several provider response shapes into one check,
+including:
+
+- `usage.prompt_tokens_details.cached_tokens`
+- `usage.cache_read_input_tokens`
+- `usage.cache_read_tokens`
+- cache-write fields such as `cache_creation_input_tokens` and `cache_write_tokens`
+
+Programmatic calls accept `strict_cache_proof=True` by default:
+
+```python
+result = run_task(schema, "List the files in /tmp", strict_cache_proof=True)
+```
+
+CLI usage is also strict by default. To opt out explicitly:
+
+```bash
+agent-probe <model> --no-strict-cache-proof
+```
+
 ### Defining tools with `Tool` & `build_tool_spec`
 
 Declare tools using the `Tool` dataclass and convert them into the schema/dispatch

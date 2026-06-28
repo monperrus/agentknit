@@ -8,6 +8,7 @@ from .exceptions import (
     AgentSpecInvalidError,
     PricingLimitExceededError,
     AuthenticationError,
+    CacheProofError,
 )
 
 from ._core import (
@@ -84,7 +85,7 @@ __all__ = [
     "parse_tool_spec_from_docstring",
     "extract_tool_specs_from_module",
     "AgentProbeError", "AgentSpecDisabledError", "AgentSpecInvalidError",
-    "PricingLimitExceededError", "AuthenticationError",
+    "PricingLimitExceededError", "AuthenticationError", "CacheProofError",
     "main", "run",
     "validate_schema", "create_client", "run_task", "run_repl", "run_async_repl",
     "SessionResult", "CancelToken", "EventCallback", "_default_event_handler",

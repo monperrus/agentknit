@@ -35,3 +35,7 @@ class PricingLimitExceededError(AgentProbeError):
         self.direction     = direction
         self.current_price = current_price
         self.limit         = limit
+
+
+class CacheProofError(AgentProbeError):
+    """Raised when strict cache-proof mode does not observe a cache hit."""

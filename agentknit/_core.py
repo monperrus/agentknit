@@ -102,7 +102,7 @@ from . import tool_library as _tool_module
 from .tool_library import TOOL_LIBRARY, _ASK_USER_FNS
 from .exceptions import (
     AgentSpecDisabledError, AgentSpecInvalidError,
-    PricingLimitExceededError, AuthenticationError,
+    PricingLimitExceededError, AuthenticationError, CacheProofError,
 )
 from .slash_commands import REGISTRY as _slash_registry
 
@@ -665,6 +665,26 @@ def fmt_usage(usage) -> str:
     return "  |  ".join(parts)
 
 
+def _enforce_cache_proof(session: dict, usage) -> None:
+    """Fail closed when strict cache mode does not observe a cache hit."""
+    if not session.get("strict_cache_proof", True):
+        return
+    if session.get("llm_call_count", 0) <= 1:
+        return
+    has_cache_proof = getattr(usage, "has_cache_proof", False)
+    cached_tokens = getattr(usage, "cached_tokens", 0) or 0
+    if not has_cache_proof:
+        raise CacheProofError(
+            "Strict cache mode requires explicit cache accounting from the server "
+            "after the first LLM call, but this response exposed no cache-proof field."
+        )
+    if cached_tokens <= 0:
+        raise CacheProofError(
+            "Strict cache mode requires cached_tokens > 0 after the first LLM call, "
+            "but the server reported no cache hit."
+        )
+
+
 def fmt_result(text: str, streamed: bool = False) -> str:
     if streamed:
         # Output was already streamed to console in real-time; just show a
@@ -910,6 +930,7 @@ def init_session(schema: dict, non_interactive: bool = False,
                  system_prompt_supplement: str = "",
                  cache_key: str | None = None,
                  max_output_tokens: int | None = None,
+                 strict_cache_proof: bool = True,
                  on_event: "EventCallback | None" = None) -> dict:
     """Build a stateful session dict.
 
@@ -984,6 +1005,8 @@ def init_session(schema: dict, non_interactive: bool = False,
                             "cached": 0, "cache_write": 0},
         "provider":        schema.get("provider"),
         "max_output_tokens": max_output_tokens or schema.get("max_output_tokens"),
+        "strict_cache_proof": strict_cache_proof,
+        "llm_call_count":  0,
         "on_event":        on_event or _default_event_handler,
         "streaming":       streaming,
         "options":         schema.get("options") or [],
@@ -1295,135 +1318,151 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
 
     total_tokens = 0
     max_tokens   = DEFAULT_MAX_TOKENS
-    while True:
-        if cancel is not None and cancel.cancelled:
-            raise KeyboardInterrupt()
-        kwargs: dict = dict(model=model, messages=messages, temperature=0)
-        if structured:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-        try:
-            resp  = _complete(client, session, **kwargs)
-        except Exception as exc:
-            err = f"API error: {exc}"
-            _emit(session, "error", text=err,
-                  fmt=f"\n{RED}Error: {err}{RESET}")
-            _log(session, {"type": "error", "error": err,
-                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-            return _session_result(session)
-        msg   = resp.choices[0].message
+    try:
+        while True:
+            if cancel is not None and cancel.cancelled:
+                raise KeyboardInterrupt()
+            kwargs: dict = dict(model=model, messages=messages, temperature=0)
+            if structured:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = "auto"
+            try:
+                resp  = _complete(client, session, **kwargs)
+            except Exception as exc:
+                err = f"API error: {exc}"
+                _emit(session, "error", text=err,
+                      fmt=f"\n{RED}Error: {err}{RESET}")
+                _log(session, {"type": "error", "error": err,
+                               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                return _session_result(session)
+            msg   = resp.choices[0].message
 
-        # Accumulate token usage from the response and surface it to the user.
-        usage = getattr(resp, "usage", None)
-        if usage:
-            prompt_tok     = getattr(usage, "prompt_tokens", 0) or 0
-            completion_tok = getattr(usage, "completion_tokens", 0) or 0
-            cached_tok     = getattr(usage, "cached_tokens", 0) or 0
-            cache_creat    = getattr(usage, "cache_creation_tokens", 0) or 0
-            # Only count effective (non-cached) tokens toward the budget —
-            # cached tokens were served from a prefix cache and weren't
-            # actually generated/processed, so they shouldn't deplete the
-            # budget as aggressively as new tokens.
-            effective = max(0, prompt_tok - cached_tok) + completion_tok
-            total_tokens += effective
-            totals = session["usage_totals"]
-            totals["prompt"]      += prompt_tok
-            totals["completion"]  += completion_tok
-            totals["total"]       += getattr(usage, "total_tokens", 0) or 0
-            totals["cached"]      += cached_tok
-            totals["cache_write"] += cache_creat
-            _emit(session, "usage",
-                  prompt=getattr(usage, "prompt_tokens", 0) or 0,
-                  completion=getattr(usage, "completion_tokens", 0) or 0,
-                  total=getattr(usage, "total_tokens", 0) or 0,
-                  cached=getattr(usage, "cached_tokens", 0) or 0,
-                  cache_write=getattr(usage, "cache_creation_tokens", 0) or 0,
-                  fmt=f"{DIM}{MAG}[tokens] {fmt_usage(usage)}{RESET}")
-            _log(session, {"type": "usage",
-                           "prompt_tokens":      getattr(usage, "prompt_tokens", 0) or 0,
-                           "completion_tokens":  getattr(usage, "completion_tokens", 0) or 0,
-                           "total_tokens":       getattr(usage, "total_tokens", 0) or 0,
-                           "cached_tokens":      getattr(usage, "cached_tokens", 0) or 0,
-                           "cache_creation_tokens": getattr(usage, "cache_creation_tokens", 0) or 0,
-                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-        if total_tokens > max_tokens:
-            totals = session["usage_totals"]
-            raw_total = totals["total"]
-            cached_total = totals["cached"]
-            raw_info = f" ({raw_total:,} raw API total, {cached_total:,} cached)" if cached_total else ""
-            _emit(session, "token_limit", used=total_tokens, limit=max_tokens,
-                  raw_total=raw_total, cached_total=cached_total,
-                  fmt=f"\n[stopped after exceeding {max_tokens:,} effective tokens "
-                      f"(used {total_tokens:,} effective{raw_info})]")
-            if not session["non_interactive"]:
-                try:
-                    ans = input(f"Double the token budget to {max_tokens * 2:,}? [y/N] ").strip().lower()
-                except EOFError:
-                    print()
-                    ans = "n"
-                if ans in ("y", "yes"):
-                    max_tokens *= 2
-                    print(f"{DIM}Token budget doubled to {max_tokens:,}{RESET}", file=sys.stderr)
-                    continue
-            return
+            # Accumulate token usage from the response and surface it to the user.
+            usage = getattr(resp, "usage", None)
+            if usage:
+                session["llm_call_count"] = session.get("llm_call_count", 0) + 1
+                _enforce_cache_proof(session, usage)
+                prompt_tok     = getattr(usage, "prompt_tokens", 0) or 0
+                completion_tok = getattr(usage, "completion_tokens", 0) or 0
+                cached_tok     = getattr(usage, "cached_tokens", 0) or 0
+                cache_creat    = getattr(usage, "cache_creation_tokens", 0) or 0
+                # Only count effective (non-cached) tokens toward the budget —
+                # cached tokens were served from a prefix cache and weren't
+                # actually generated/processed, so they shouldn't deplete the
+                # budget as aggressively as new tokens.
+                effective = max(0, prompt_tok - cached_tok) + completion_tok
+                total_tokens += effective
+                totals = session["usage_totals"]
+                totals["prompt"]      += prompt_tok
+                totals["completion"]  += completion_tok
+                totals["total"]       += getattr(usage, "total_tokens", 0) or 0
+                totals["cached"]      += cached_tok
+                totals["cache_write"] += cache_creat
+                _emit(session, "usage",
+                      prompt=getattr(usage, "prompt_tokens", 0) or 0,
+                      completion=getattr(usage, "completion_tokens", 0) or 0,
+                      total=getattr(usage, "total_tokens", 0) or 0,
+                      cached=getattr(usage, "cached_tokens", 0) or 0,
+                      cache_write=getattr(usage, "cache_creation_tokens", 0) or 0,
+                      fmt=f"{DIM}{MAG}[tokens] {fmt_usage(usage)}{RESET}")
+                _log(session, {"type": "usage",
+                               "prompt_tokens":      getattr(usage, "prompt_tokens", 0) or 0,
+                               "completion_tokens":  getattr(usage, "completion_tokens", 0) or 0,
+                               "total_tokens":       getattr(usage, "total_tokens", 0) or 0,
+                               "cached_tokens":      getattr(usage, "cached_tokens", 0) or 0,
+                               "cache_creation_tokens": getattr(usage, "cache_creation_tokens", 0) or 0,
+                               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+            elif session.get("strict_cache_proof", True) and session.get("llm_call_count", 0) >= 1:
+                err = ("Strict cache mode requires usage metadata on every LLM call after the first, "
+                       "but the server returned no usage block.")
+                _emit(session, "error", text=err, fmt=f"\n{RED}Error: {err}{RESET}")
+                _log(session, {"type": "error", "error": err,
+                               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                return _session_result(session)
+            if total_tokens > max_tokens:
+                totals = session["usage_totals"]
+                raw_total = totals["total"]
+                cached_total = totals["cached"]
+                raw_info = f" ({raw_total:,} raw API total, {cached_total:,} cached)" if cached_total else ""
+                _emit(session, "token_limit", used=total_tokens, limit=max_tokens,
+                      raw_total=raw_total, cached_total=cached_total,
+                      fmt=f"\n[stopped after exceeding {max_tokens:,} effective tokens "
+                          f"(used {total_tokens:,} effective{raw_info})]")
+                if not session["non_interactive"]:
+                    try:
+                        ans = input(f"Double the token budget to {max_tokens * 2:,}? [y/N] ").strip().lower()
+                    except EOFError:
+                        print()
+                        ans = "n"
+                    if ans in ("y", "yes"):
+                        max_tokens *= 2
+                        print(f"{DIM}Token budget doubled to {max_tokens:,}{RESET}", file=sys.stderr)
+                        continue
+                return
 
-        # ── structured tool_calls ────────────────────────────────────────────
-        if structured and msg.tool_calls:
-            now_ts = datetime.datetime.now().isoformat(timespec="seconds")
-            messages.append({
-                "role": "assistant",
-                "tool_calls": [
-                    {"id": tc.id, "type": "function",
-                     "function": {"name": tc.function.name,
-                                  "arguments": tc.function.arguments}}
-                    for tc in msg.tool_calls
-                ],
-                "ts": now_ts,
-            })
-            for tc in msg.tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
-                result = _handle_tool_call(tc.function.name, args, session)
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result,
-                                 "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-            continue
-
-        text = msg.content or ""
-
-        # ── inline JSON tool calls ───────────────────────────────────────────
-        if not structured:
-            now_ts = datetime.datetime.now().isoformat(timespec="seconds")
-            messages.append({"role": "assistant", "content": text, "ts": now_ts})
-            calls = extract_inline_calls(text)
-            if calls:
-                results = []
-                for name, args in calls:
-                    result = _handle_tool_call(name, args, session)
-                    results.append(f"[{name}] {result}")
-                messages.append({"role": "user",
-                                 "content": "Tool results:\n" + "\n\n".join(results),
-                                 "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+            # ── structured tool_calls ────────────────────────────────────────────
+            if structured and msg.tool_calls:
+                now_ts = datetime.datetime.now().isoformat(timespec="seconds")
+                messages.append({
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": tc.id, "type": "function",
+                         "function": {"name": tc.function.name,
+                                      "arguments": tc.function.arguments}}
+                        for tc in msg.tool_calls
+                    ],
+                    "ts": now_ts,
+                })
+                for tc in msg.tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        args = {}
+                    result = _handle_tool_call(tc.function.name, args, session)
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": result,
+                                     "ts": datetime.datetime.now().isoformat(timespec="seconds")})
                 continue
 
-        # ── final answer ─────────────────────────────────────────────────────
-        # In structured mode the assistant message wasn't appended above.
-        if structured:
-            messages.append({"role": "assistant", "content": text,
-                             "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-        _log(session, {"type": "assistant", "content": text,
-                   "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-        already_streamed = session.get("_content_was_streamed", False)
-        _emit(session, "final_answer", text=text.strip(),
-              fmt="" if already_streamed else f"\n{GREEN}{BOLD}» {RESET}{text.strip()}\n")
-        t = session["usage_totals"]
-        cached_part = f", {t['cached']:,} cached" if t["cached"] else ""
-        eff = max(0, t['prompt'] - t['cached']) + t['completion']
-        eff_part = f"  |  effective {eff:,}" if t['cached'] else ""
-        _emit(session, "session_usage", **t,
-              fmt=(f"{DIM}{MAG}[session tokens] prompt {t['prompt']:,}{cached_part}  |  "
-                   f"completion {t['completion']:,}  |  total {t['total']:,}{eff_part}{RESET}\n"))
+            text = msg.content or ""
+
+            # ── inline JSON tool calls ───────────────────────────────────────────
+            if not structured:
+                now_ts = datetime.datetime.now().isoformat(timespec="seconds")
+                messages.append({"role": "assistant", "content": text, "ts": now_ts})
+                calls = extract_inline_calls(text)
+                if calls:
+                    results = []
+                    for name, args in calls:
+                        result = _handle_tool_call(name, args, session)
+                        results.append(f"[{name}] {result}")
+                    messages.append({"role": "user",
+                                     "content": "Tool results:\n" + "\n\n".join(results),
+                                     "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                    continue
+
+            # ── final answer ─────────────────────────────────────────────────────
+            # In structured mode the assistant message wasn't appended above.
+            if structured:
+                messages.append({"role": "assistant", "content": text,
+                                 "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+            _log(session, {"type": "assistant", "content": text,
+                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+            already_streamed = session.get("_content_was_streamed", False)
+            _emit(session, "final_answer", text=text.strip(),
+                  fmt="" if already_streamed else f"\n{GREEN}{BOLD}» {RESET}{text.strip()}\n")
+            t = session["usage_totals"]
+            cached_part = f", {t['cached']:,} cached" if t["cached"] else ""
+            eff = max(0, t['prompt'] - t['cached']) + t['completion']
+            eff_part = f"  |  effective {eff:,}" if t['cached'] else ""
+            _emit(session, "session_usage", **t,
+                  fmt=(f"{DIM}{MAG}[session tokens] prompt {t['prompt']:,}{cached_part}  |  "
+                       f"completion {t['completion']:,}  |  total {t['total']:,}{eff_part}{RESET}\n"))
+            return _session_result(session)
+    except CacheProofError as exc:
+        err = str(exc)
+        _emit(session, "error", text=err, fmt=f"\n{RED}Error: {err}{RESET}")
+        _log(session, {"type": "error", "error": err,
+                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
         return _session_result(session)
 
 
@@ -1739,6 +1778,7 @@ def run_task(
     cache_key: str | None = None,
     system_prompt_supplement: str = "",
     max_output_tokens: int | None = None,
+    strict_cache_proof: bool = True,
     on_event: "EventCallback | None" = None,
 ) -> SessionResult:
     """Run a single task against the agent and return a :class:`SessionResult`.
@@ -1762,6 +1802,7 @@ def run_task(
         system_prompt_supplement=system_prompt_supplement,
         cache_key=cache_key,
         max_output_tokens=max_output_tokens,
+        strict_cache_proof=strict_cache_proof,
         on_event=on_event,
     )
     try:
@@ -1784,6 +1825,7 @@ def run(
     cache_key: str | None = None,
     system_prompt_supplement: str = "",
     max_output_tokens: int | None = None,
+    strict_cache_proof: bool = True,
     on_event: "EventCallback | None" = None,
 ) -> SessionResult:
     """Backward-compatible helper for :func:`run_task`.
@@ -1807,6 +1849,7 @@ def run(
         cache_key=cache_key,
         system_prompt_supplement=system_prompt_supplement,
         max_output_tokens=max_output_tokens,
+        strict_cache_proof=strict_cache_proof,
         on_event=on_event,
     )
 
@@ -1828,6 +1871,7 @@ def _repl_setup(
     cache_key: str | None = None,
     system_prompt_supplement: str = "",
     max_output_tokens: int | None = None,
+    strict_cache_proof: bool = True,
     on_event: "EventCallback | None" = None,
 ) -> tuple:
     """Common REPL setup: validate, create client, init session, return (client, session, model, hist_file)."""
@@ -1840,6 +1884,7 @@ def _repl_setup(
         system_prompt_supplement=system_prompt_supplement,
         cache_key=cache_key,
         max_output_tokens=max_output_tokens,
+        strict_cache_proof=strict_cache_proof,
         on_event=on_event,
     )
     model = schema["model"]
@@ -1969,6 +2014,7 @@ def run_repl(
     cache_key: str | None = None,
     system_prompt_supplement: str = "",
     max_output_tokens: int | None = None,
+    strict_cache_proof: bool = True,
     on_event: "EventCallback | None" = None,
 ) -> None:
     """Start an interactive REPL session against the agent (sync, no background thread).
@@ -1990,6 +2036,7 @@ def run_repl(
         cache_key=cache_key,
         system_prompt_supplement=system_prompt_supplement,
         max_output_tokens=max_output_tokens,
+        strict_cache_proof=strict_cache_proof,
         on_event=on_event,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], "agent-probe")
@@ -2022,6 +2069,7 @@ def run_async_repl(
     cache_key: str | None = None,
     system_prompt_supplement: str = "",
     max_output_tokens: int | None = None,
+    strict_cache_proof: bool = True,
     on_event: "EventCallback | None" = None,
 ) -> None:
     """Start an interactive REPL session with a background input queue.
@@ -2042,6 +2090,7 @@ def run_async_repl(
         cache_key=cache_key,
         system_prompt_supplement=system_prompt_supplement,
         max_output_tokens=max_output_tokens,
+        strict_cache_proof=strict_cache_proof,
         on_event=on_event,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], "agent-probe")
@@ -2089,6 +2138,9 @@ def parse_args() -> argparse.Namespace:
                    help="Cap max output tokens per request. Overrides the spec's "
                         "max_output_tokens. Useful for models with a huge default "
                         "output that would otherwise reserve large credit holds.")
+    p.add_argument("--no-strict-cache-proof", action="store_true",
+                   help="Disable the default fail-closed cache-proof check that "
+                        "requires a nonzero cache hit on every LLM call after the first.")
     return p.parse_args()
 
 
@@ -2118,6 +2170,7 @@ def main() -> None:
         system_prompt_supplement = args.system_prompt_supplement,
         cache_key                = args.cache_key,
         max_output_tokens        = args.max_tokens,
+        strict_cache_proof       = not args.no_strict_cache_proof,
     )
 
     # Print the session header once, before any task runs.

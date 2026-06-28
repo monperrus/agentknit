@@ -290,10 +290,26 @@ def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tu
                 type: integer
                 description: Maximum number of lines to read.
     """
+    # Rationale for XML envelope with checksum tag:
+    #   The outermost XML tag is an 8-hex-char checksum (SHA256 prefix) of the
+    #   returned content.  This lets the model self-consistently identify file
+    #   versions across turns, and provides forensic traceability — given a
+    #   tool-call log, an auditor can verify exactly what content was read,
+    #   even if the file has since changed on disk.  When offset/limit is used
+    #   the tag carries those attributes so a partial read is self-describing.
+    import hashlib
     try:
         content = Path(os.path.expanduser(path)).read_text()
+        lines = content.splitlines(keepends=True)
+        # Default to partial read (first 100 lines) for files larger than 100 lines.
+        # This is essential for token efficiency — reading an entire large file
+        # can consume 10k+ tokens in a single tool call, blowing the budget and
+        # pushing out other context.  The model can always request more via
+        # offset/limit if it needs the rest.
+        if offset is None and limit is None and len(lines) > 100:
+            offset = 1
+            limit = 100
         if offset is not None or limit is not None:
-            lines = content.splitlines(keepends=True)
             start = (offset - 1) if offset is not None else 0
             start = max(0, start)
             if limit is not None:
@@ -301,7 +317,14 @@ def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tu
             else:
                 end = len(lines)
             content = "".join(lines[start:end])
-        return content, {"result": content}
+        checksum = hashlib.sha256(content.encode()).hexdigest()[:8]
+        attrs = ""
+        if offset is not None:
+            attrs += f' offset="{offset}"'
+        if limit is not None:
+            attrs += f' limit="{limit}"'
+        xml = f"<{checksum}{attrs}>{content}</{checksum}>"
+        return xml, {"result": xml}
     except Exception as e:
         r = f"ERROR: {e}"
         return r, {"result": r}

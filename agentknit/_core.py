@@ -111,6 +111,10 @@ DEFAULT_ENDPOINT = "https://openrouter.ai/api/v1"
 DEFAULT_MAX_TOKENS = 3_000_000
 LOG_BASE = Path.home() / ".local" / "share" / "agent_probe"
 
+# Compaction threshold: chosen conservatively so it works across arbitrary
+# endpoints (many models still have 128K–200K context windows).  For
+# large-context models (1M+) this may trigger earlier than necessary; raise
+# it in the agent spec or via compaction_trigger_tokens=….
 DEFAULT_COMPACTION_TRIGGER_TOKENS = 100_000
 DEFAULT_COMPACTION_TARGET_TOKENS = 20_000
 DEFAULT_COMPACTION_KEEP_LAST_TURNS = 2

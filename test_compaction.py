@@ -130,6 +130,48 @@ def test_maybe_compact_at_threshold():
     assert len(client.calls) == 1
 
 
+def test_maybe_compact_does_not_retrigger_immediately():
+    """After compaction, the same token count must not re-trigger compaction."""
+    session = _make_session(messages=[
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+    ])
+    client = _make_fake_client("summary")
+    usage = _FakeUsage(prompt_tokens=DEFAULT_COMPACTION_TRIGGER_TOKENS)
+    _maybe_compact(client, "m", session, usage)
+    assert len(client.calls) == 1
+    # Same token count again — should NOT trigger a second compaction.
+    _maybe_compact(client, "m", session, usage)
+    assert len(client.calls) == 1
+
+
+def test_maybe_compact_retriggers_after_growth():
+    """Compaction fires again only after prompt tokens grow past the last recorded value."""
+    session = _make_session(messages=[
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+    ])
+    client = _make_fake_client("summary")
+    usage1 = _FakeUsage(prompt_tokens=DEFAULT_COMPACTION_TRIGGER_TOKENS)
+    _maybe_compact(client, "m", session, usage1)
+    assert len(client.calls) == 1
+    # Slightly higher token count — should NOT trigger (needs 25 % hysteresis).
+    usage2 = _FakeUsage(prompt_tokens=DEFAULT_COMPACTION_TRIGGER_TOKENS + 1)
+    _maybe_compact(client, "m", session, usage2)
+    assert len(client.calls) == 1
+    # Growth beyond the 25 % hysteresis — should trigger again.
+    hysteresis = DEFAULT_COMPACTION_TRIGGER_TOKENS // 4
+    usage3 = _FakeUsage(prompt_tokens=DEFAULT_COMPACTION_TRIGGER_TOKENS + hysteresis + 1)
+    _maybe_compact(client, "m", session, usage3)
+    assert len(client.calls) == 2
+
+
 # ── _compact_session ──────────────────────────────────────────────────────────
 
 def test_compact_session_keeps_system_and_recent():

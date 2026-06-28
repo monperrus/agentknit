@@ -126,6 +126,8 @@ def _handle_clear(session: dict, client: Any, model: str, args: str) -> None:
     # Reset usage totals.
     session["usage_totals"] = {"prompt": 0, "completion": 0, "total": 0,
                                "cached": 0, "cache_write": 0}
+    # Reset compaction watermark so the next growth cycle can trigger again.
+    session["compaction_last_prompt_tokens"] = 0
     print(f"{GREEN}Context cleared. Session history has been reset.{RESET}")
 
 

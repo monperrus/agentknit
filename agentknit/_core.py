@@ -1097,6 +1097,7 @@ def init_session(schema: dict, non_interactive: bool = False,
             compaction_keep_last_turns if compaction_keep_last_turns is not None
             else schema.get("compaction_keep_last_turns", DEFAULT_COMPACTION_KEEP_LAST_TURNS)
         ),
+        "compaction_last_prompt_tokens": 0,
     }
     _log(session, {"type": "session_start", "model": model,
                    "endpoint": schema.get("endpoint", ""),
@@ -1300,13 +1301,25 @@ def _maybe_compact(
     session: dict,
     usage,
 ) -> None:
-    """Trigger compaction if the session's prompt tokens exceed the threshold."""
+    """Trigger compaction if the session's prompt tokens exceed the threshold.
+
+    Compaction only fires once per growth cycle.  After a compaction we
+    record the pre-compaction prompt count in
+    ``compaction_last_prompt_tokens``.  The next compaction is refused
+    until the count has grown by at least 25 % of the trigger threshold
+    above that recorded value.  This prevents the "compaction storm"
+    where every subsequent turn re-triggers because the threshold is
+    still exceeded or only slightly exceeded.
+    """
     if not session.get("compaction_enabled", True):
         return
     prompt_tok = getattr(usage, "prompt_tokens", 0) or 0
     trigger = session.get("compaction_trigger_tokens", DEFAULT_COMPACTION_TRIGGER_TOKENS)
-    if prompt_tok >= trigger:
+    last = session.get("compaction_last_prompt_tokens", 0)
+    hysteresis = trigger // 4
+    if prompt_tok >= trigger and prompt_tok > last + hysteresis:
         _compact_session(client, model, session)
+        session["compaction_last_prompt_tokens"] = prompt_tok
 
 
 def _handle_tool_call(

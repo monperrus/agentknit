@@ -669,7 +669,7 @@ def fmt_call(name: str, args: dict) -> str:
         pretty = pretty[:200] + "…"
     return f"{CYAN}{BOLD}▶ {name}({pretty}){RESET}"
 
-def fmt_usage(usage) -> str:
+def fmt_usage(usage, *, compaction_trigger: int | None = None) -> str:
     """One-line, human-readable token/cache breakdown for a single completion."""
     prompt      = getattr(usage, "prompt_tokens", 0) or 0
     completion  = getattr(usage, "completion_tokens", 0) or 0
@@ -684,6 +684,9 @@ def fmt_usage(usage) -> str:
     parts = [prompt_part]
     if cache_write:
         parts.append(f"cache-write {cache_write:,}")
+    if compaction_trigger:
+        compact_pct = (prompt / compaction_trigger * 100) if compaction_trigger else 0
+        parts.append(f"compact {compact_pct:.0f}%")
     parts.append(f"completion {completion:,}")
     parts.append(f"total {total:,}")
     return "  |  ".join(parts)
@@ -1265,14 +1268,23 @@ def _compact_session(
     }
     session["messages"] = system_msgs + [summary_msg] + suffix
 
+    compacted_turns = len(prefix) - len(system_msgs)
+    compacted_chars = sum(
+        len(m.get("content", "")) for m in prefix if m.get("role") != "system"
+    )
+    summary_chars = len(summary)
+    ratio = compacted_chars / summary_chars if summary_chars else 0.0
+
     _emit(session, "compaction",
           summary=summary,
-          compacted_turns=len(prefix) - len(system_msgs),
-          fmt=f"{DIM}{MAG}[compaction] {len(prefix) - len(system_msgs)} turns summarized "
-              f"({len(summary)} chars){RESET}")
+          compacted_turns=compacted_turns,
+          fmt=(f"{DIM}{MAG}[compaction] {compacted_turns} turns summarized "
+               f"({len(summary)} chars){RESET}  "
+               f"{CYAN}{BOLD}ratio {ratio:.1f}x{RESET}"))
     _log(session, {"type": "compaction",
-                   "compacted_turns": len(prefix) - len(system_msgs),
+                   "compacted_turns": compacted_turns,
                    "summary_length": len(summary),
+                   "compaction_ratio": round(ratio, 2),
                    "summary": summary,
                    "ts": datetime.datetime.now().isoformat(timespec="seconds")})
     _save_messages_snapshot(session)
@@ -1521,13 +1533,14 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
                 totals["total"]       += getattr(usage, "total_tokens", 0) or 0
                 totals["cached"]      += cached_tok
                 totals["cache_write"] += cache_creat
+                trigger = session.get("compaction_trigger_tokens", DEFAULT_COMPACTION_TRIGGER_TOKENS)
                 _emit(session, "usage",
                       prompt=getattr(usage, "prompt_tokens", 0) or 0,
                       completion=getattr(usage, "completion_tokens", 0) or 0,
                       total=getattr(usage, "total_tokens", 0) or 0,
                       cached=getattr(usage, "cached_tokens", 0) or 0,
                       cache_write=getattr(usage, "cache_creation_tokens", 0) or 0,
-                      fmt=f"{DIM}{MAG}[tokens] {fmt_usage(usage)}{RESET}")
+                      fmt=f"{DIM}{MAG}[tokens] {fmt_usage(usage, compaction_trigger=trigger)}{RESET}")
                 _log(session, {"type": "usage",
                                "prompt_tokens":      getattr(usage, "prompt_tokens", 0) or 0,
                                "completion_tokens":  getattr(usage, "completion_tokens", 0) or 0,

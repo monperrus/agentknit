@@ -42,6 +42,9 @@ from ._core import (
     LOG_BASE,
     DEFAULT_ENDPOINT,
     DEFAULT_MAX_TOKENS,
+    DEFAULT_COMPACTION_TRIGGER_TOKENS,
+    DEFAULT_COMPACTION_TARGET_TOKENS,
+    DEFAULT_COMPACTION_KEEP_LAST_TURNS,
     _parse_run_uri,
     _expand_aliases,
     _open_log,
@@ -50,6 +53,8 @@ from ._core import (
     _find_snapshot_in_other_models,
     _handle_tool_call,
     _complete,
+    _compact_session,
+    _maybe_compact,
 )
 
 from .tool import (
@@ -95,9 +100,12 @@ __all__ = [
     "fmt_usage", "fmt_call", "fmt_result", "safe_model_name",
     "inline_system_prompt", "FatalToolDispatchError",
     "LOG_BASE", "DEFAULT_ENDPOINT", "DEFAULT_MAX_TOKENS",
+    "DEFAULT_COMPACTION_TRIGGER_TOKENS", "DEFAULT_COMPACTION_TARGET_TOKENS",
+    "DEFAULT_COMPACTION_KEEP_LAST_TURNS",
     "_parse_run_uri", "_expand_aliases", "_open_log",
     "_save_messages_snapshot", "_load_messages_snapshot",
     "_find_snapshot_in_other_models", "_handle_tool_call", "_complete",
+    "_compact_session", "_maybe_compact",
     "Tool",
     "build_tool_spec",
     "register_tools_in_library",

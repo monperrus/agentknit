@@ -193,8 +193,49 @@ generic `on_event` handler.
 | `token_limit` | Token budget exceeded | `used`, `limit`, `fmt` |
 | `session_resumed` | Session history was loaded from disk | `session_id`, `messages_loaded`, `fmt` |
 | `provider_pinned` | OpenRouter provider was locked for the session | `provider`, `fmt` |
+| `compaction` | Context was compacted into a summary | `summary`, `compacted_turns`, `fmt` |
 
 Every event data dict includes a `"fmt"` key containing a pre-formatted ANSI
 string suitable for direct printing to a terminal — this is what the default
 handler uses.  Custom handlers may ignore `"fmt"` and use the other keys
 instead.
+
+## Context Compaction
+
+Long sessions automatically compact when the prompt token budget is exceeded.
+The oldest portion of the conversation is summarized by the model into a
+continuation-oriented summary that preserves coding state (objectives, files
+touched, errors, next steps). The summary replaces the compacted prefix, while
+the most recent turns remain in raw form.
+
+Compaction is **enabled by default** and configured via the agent spec or
+programmatic arguments:
+
+```python
+from agentknit import run_task
+
+result = run_task(
+    schema,
+    "Implement feature X",
+    compaction_enabled=True,
+    compaction_trigger_tokens=100_000,   # trigger when prompt tokens reach this
+    compaction_target_tokens=20_000,     # max tokens for the summary call
+    compaction_keep_last_turns=2,        # raw turns to keep after compaction
+)
+```
+
+Or in the agent spec JSON:
+
+```json
+{
+  "model": "...",
+  "compaction_enabled": true,
+  "compaction_trigger_tokens": 100000,
+  "compaction_target_tokens": 20000,
+  "compaction_keep_last_turns": 2
+}
+```
+
+The summary message is tagged with `"compacted_summary": true` so consumers
+can distinguish compacted state from raw conversation turns. Compaction events
+are emitted as `"compaction"` events and logged to the session trace.

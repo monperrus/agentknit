@@ -111,6 +111,30 @@ DEFAULT_ENDPOINT = "https://openrouter.ai/api/v1"
 DEFAULT_MAX_TOKENS = 3_000_000
 LOG_BASE = Path.home() / ".local" / "share" / "agent_probe"
 
+DEFAULT_COMPACTION_TRIGGER_TOKENS = 100_000
+DEFAULT_COMPACTION_TARGET_TOKENS = 20_000
+DEFAULT_COMPACTION_KEEP_LAST_TURNS = 2
+
+_COMPACTION_PROMPT = (
+    "Summarize the conversation above into a dense, structured summary "
+    "optimized for continuing a coding task. Preserve all state needed to "
+    "keep working without re-reading files.\n\n"
+    "Preserve:\n"
+    "- The current objective and any user constraints\n"
+    "- Files that have been touched and what changes were made\n"
+    "- Commands or tools used and their key outcomes\n"
+    "- Errors, failing tests, or build failures\n"
+    "- Failed hypotheses or dead ends already explored\n"
+    "- Unresolved issues or blockers\n"
+    "- The immediate next step if one was identified\n\n"
+    "Avoid:\n"
+    "- Conversational filler or chatter\n"
+    "- Repeated log output (summarize outcomes, don't quote logs verbatim)\n"
+    "- Redundant observations\n"
+    "- Rewriting uncertainty as certainty\n\n"
+    "Format the summary as plain text with clear sections. Be concise but complete."
+)
+
 BOLD = "\033[1m"
 DIM = "\033[2m"
 CYAN = "\033[36m"
@@ -931,7 +955,13 @@ def init_session(schema: dict, non_interactive: bool = False,
                  cache_key: str | None = None,
                  max_output_tokens: int | None = None,
                  strict_cache_proof: bool = True,
-                 on_event: "EventCallback | None" = None) -> dict:
+                 on_event: "EventCallback | None" = None,
+                 *,
+                 compaction_enabled: bool | None = None,
+                 compaction_trigger_tokens: int | None = None,
+                 compaction_target_tokens: int | None = None,
+                 compaction_keep_last_turns: int | None = None,
+                 ) -> dict:
     """Build a stateful session dict.
 
     The cache_key is sent on every call as both `user` and `prompt_cache_key`
@@ -942,6 +972,21 @@ def init_session(schema: dict, non_interactive: bool = False,
     `cache_key` (e.g. derived from the working directory) to keep reusing a
     provider's prefix cache *without* resuming the prior conversation: that
     requires `resumed_from`, which is the only thing that loads past messages.
+
+    Compaction (keyword-only arguments):
+
+    * ``compaction_enabled`` — whether to enable automatic context compaction
+      when the prompt token budget is exceeded.  Defaults to the schema's
+      ``compaction_enabled`` key or ``True``.
+    * ``compaction_trigger_tokens`` — prompt-token threshold that triggers a
+      compaction pass.  Defaults to the schema's ``compaction_trigger_tokens``
+      or ``100_000``.
+    * ``compaction_target_tokens`` — ``max_tokens`` passed to the compaction
+      summary call.  Defaults to the schema's ``compaction_target_tokens`` or
+      ``20_000``.
+    * ``compaction_keep_last_turns`` — number of recent raw turns to keep
+      after compaction.  Defaults to the schema's
+      ``compaction_keep_last_turns`` or ``2``.
     """
     schema = _normalize_schema(schema)
     tools         = schema.get("inferred_tool_schema") or []
@@ -1011,6 +1056,22 @@ def init_session(schema: dict, non_interactive: bool = False,
         "streaming":       streaming,
         "options":         schema.get("options") or [],
         "session_start_ts": session_start_ts,
+        "compaction_enabled": (
+            compaction_enabled if compaction_enabled is not None
+            else schema.get("compaction_enabled", True)
+        ),
+        "compaction_trigger_tokens": (
+            compaction_trigger_tokens if compaction_trigger_tokens is not None
+            else schema.get("compaction_trigger_tokens", DEFAULT_COMPACTION_TRIGGER_TOKENS)
+        ),
+        "compaction_target_tokens": (
+            compaction_target_tokens if compaction_target_tokens is not None
+            else schema.get("compaction_target_tokens", DEFAULT_COMPACTION_TARGET_TOKENS)
+        ),
+        "compaction_keep_last_turns": (
+            compaction_keep_last_turns if compaction_keep_last_turns is not None
+            else schema.get("compaction_keep_last_turns", DEFAULT_COMPACTION_KEEP_LAST_TURNS)
+        ),
     }
     _log(session, {"type": "session_start", "model": model,
                    "endpoint": schema.get("endpoint", ""),
@@ -1128,6 +1189,90 @@ def _complete(client: openai.OpenAI | SubprocessOpenAI, session: dict, **kwargs)
             _log(session, {"type": "provider_pinned", "provider": served,
                    "ts": datetime.datetime.now().isoformat(timespec="seconds")})
     return resp
+
+
+def _compact_session(
+    client: openai.OpenAI | SubprocessOpenAI,
+    model: str,
+    session: dict,
+) -> None:
+    """Replace the oldest portion of the conversation with a continuation-oriented summary.
+
+    Keeps the system prompt and the most recent *compaction_keep_last_turns*
+    turns in raw form.  The middle portion is summarized by the model and
+    replaced with a single assistant message tagged with
+    ``compacted_summary=true`` metadata.
+    """
+    messages = session["messages"]
+    keep = session.get("compaction_keep_last_turns", DEFAULT_COMPACTION_KEEP_LAST_TURNS)
+
+    # Find the boundary: keep system prompt + last `keep` non-system messages.
+    non_system_indices = [i for i, m in enumerate(messages) if m.get("role") != "system"]
+    if len(non_system_indices) <= keep:
+        return  # nothing to compact
+
+    split_idx = non_system_indices[-keep] if keep > 0 else len(messages)
+    prefix = messages[:split_idx]
+    suffix = messages[split_idx:]
+
+    # Build a temporary message list for the compaction call.
+    compaction_messages = list(prefix)
+    compaction_messages.append({"role": "user", "content": _COMPACTION_PROMPT})
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=compaction_messages,
+            temperature=0,
+            max_tokens=session.get("compaction_target_tokens", DEFAULT_COMPACTION_TARGET_TOKENS),
+        )
+    except Exception as exc:
+        _emit(session, "error", text=f"Compaction failed: {exc}",
+              fmt=f"\n{RED}Compaction failed: {exc}{RESET}")
+        _log(session, {"type": "compaction_error", "error": str(exc),
+                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+        return
+
+    summary = (resp.choices[0].message.content or "").strip()
+    if not summary:
+        return
+
+    # Replace the compacted prefix with a single summary message.
+    system_msgs = [m for m in prefix if m.get("role") == "system"]
+    summary_msg = {
+        "role": "assistant",
+        "content": summary,
+        "compacted_summary": True,
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    session["messages"] = system_msgs + [summary_msg] + suffix
+
+    _emit(session, "compaction",
+          summary=summary,
+          compacted_turns=len(prefix) - len(system_msgs),
+          fmt=f"{DIM}{MAG}[compaction] {len(prefix) - len(system_msgs)} turns summarized "
+              f"({len(summary)} chars){RESET}")
+    _log(session, {"type": "compaction",
+                   "compacted_turns": len(prefix) - len(system_msgs),
+                   "summary_length": len(summary),
+                   "summary": summary,
+                   "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+    _save_messages_snapshot(session)
+
+
+def _maybe_compact(
+    client: openai.OpenAI | SubprocessOpenAI,
+    model: str,
+    session: dict,
+    usage,
+) -> None:
+    """Trigger compaction if the session's prompt tokens exceed the threshold."""
+    if not session.get("compaction_enabled", True):
+        return
+    prompt_tok = getattr(usage, "prompt_tokens", 0) or 0
+    trigger = session.get("compaction_trigger_tokens", DEFAULT_COMPACTION_TRIGGER_TOKENS)
+    if prompt_tok >= trigger:
+        _compact_session(client, model, session)
 
 
 def _handle_tool_call(
@@ -1379,6 +1524,8 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
                 _log(session, {"type": "error", "error": err,
                                "ts": datetime.datetime.now().isoformat(timespec="seconds")})
                 return _session_result(session)
+            _maybe_compact(client, model, session, usage)
+
             if total_tokens > max_tokens:
                 totals = session["usage_totals"]
                 raw_total = totals["total"]
@@ -1780,6 +1927,10 @@ def run_task(
     max_output_tokens: int | None = None,
     strict_cache_proof: bool = True,
     on_event: "EventCallback | None" = None,
+    compaction_enabled: bool | None = None,
+    compaction_trigger_tokens: int | None = None,
+    compaction_target_tokens: int | None = None,
+    compaction_keep_last_turns: int | None = None,
 ) -> SessionResult:
     """Run a single task against the agent and return a :class:`SessionResult`.
 
@@ -1804,6 +1955,10 @@ def run_task(
         max_output_tokens=max_output_tokens,
         strict_cache_proof=strict_cache_proof,
         on_event=on_event,
+        compaction_enabled=compaction_enabled,
+        compaction_trigger_tokens=compaction_trigger_tokens,
+        compaction_target_tokens=compaction_target_tokens,
+        compaction_keep_last_turns=compaction_keep_last_turns,
     )
     try:
         return run_turn(client, schema["model"], session, task)
@@ -1827,6 +1982,10 @@ def run(
     max_output_tokens: int | None = None,
     strict_cache_proof: bool = True,
     on_event: "EventCallback | None" = None,
+    compaction_enabled: bool | None = None,
+    compaction_trigger_tokens: int | None = None,
+    compaction_target_tokens: int | None = None,
+    compaction_keep_last_turns: int | None = None,
 ) -> SessionResult:
     """Backward-compatible helper for :func:`run_task`.
 
@@ -1851,6 +2010,10 @@ def run(
         max_output_tokens=max_output_tokens,
         strict_cache_proof=strict_cache_proof,
         on_event=on_event,
+        compaction_enabled=compaction_enabled,
+        compaction_trigger_tokens=compaction_trigger_tokens,
+        compaction_target_tokens=compaction_target_tokens,
+        compaction_keep_last_turns=compaction_keep_last_turns,
     )
 
 
@@ -1873,6 +2036,10 @@ def _repl_setup(
     max_output_tokens: int | None = None,
     strict_cache_proof: bool = True,
     on_event: "EventCallback | None" = None,
+    compaction_enabled: bool | None = None,
+    compaction_trigger_tokens: int | None = None,
+    compaction_target_tokens: int | None = None,
+    compaction_keep_last_turns: int | None = None,
 ) -> tuple:
     """Common REPL setup: validate, create client, init session, return (client, session, model, hist_file)."""
     validate_schema(schema)
@@ -1886,6 +2053,10 @@ def _repl_setup(
         max_output_tokens=max_output_tokens,
         strict_cache_proof=strict_cache_proof,
         on_event=on_event,
+        compaction_enabled=compaction_enabled,
+        compaction_trigger_tokens=compaction_trigger_tokens,
+        compaction_target_tokens=compaction_target_tokens,
+        compaction_keep_last_turns=compaction_keep_last_turns,
     )
     model = schema["model"]
 
@@ -2016,6 +2187,10 @@ def run_repl(
     max_output_tokens: int | None = None,
     strict_cache_proof: bool = True,
     on_event: "EventCallback | None" = None,
+    compaction_enabled: bool | None = None,
+    compaction_trigger_tokens: int | None = None,
+    compaction_target_tokens: int | None = None,
+    compaction_keep_last_turns: int | None = None,
 ) -> None:
     """Start an interactive REPL session against the agent (sync, no background thread).
 
@@ -2038,6 +2213,10 @@ def run_repl(
         max_output_tokens=max_output_tokens,
         strict_cache_proof=strict_cache_proof,
         on_event=on_event,
+        compaction_enabled=compaction_enabled,
+        compaction_trigger_tokens=compaction_trigger_tokens,
+        compaction_target_tokens=compaction_target_tokens,
+        compaction_keep_last_turns=compaction_keep_last_turns,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], "agent-probe")
 
@@ -2071,6 +2250,10 @@ def run_async_repl(
     max_output_tokens: int | None = None,
     strict_cache_proof: bool = True,
     on_event: "EventCallback | None" = None,
+    compaction_enabled: bool | None = None,
+    compaction_trigger_tokens: int | None = None,
+    compaction_target_tokens: int | None = None,
+    compaction_keep_last_turns: int | None = None,
 ) -> None:
     """Start an interactive REPL session with a background input queue.
 
@@ -2092,6 +2275,10 @@ def run_async_repl(
         max_output_tokens=max_output_tokens,
         strict_cache_proof=strict_cache_proof,
         on_event=on_event,
+        compaction_enabled=compaction_enabled,
+        compaction_trigger_tokens=compaction_trigger_tokens,
+        compaction_target_tokens=compaction_target_tokens,
+        compaction_keep_last_turns=compaction_keep_last_turns,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], "agent-probe")
 

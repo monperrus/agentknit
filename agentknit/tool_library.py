@@ -474,15 +474,15 @@ def t_run(command: str) -> tuple[str, dict]:
 
         out = "".join(stdout_lines)
         err = "".join(stderr_lines)
-        combined = out
-        if err:
-            combined += ("\n" if combined else "") + err
-        if proc.returncode != 0:
-            combined += f"\n[exit {proc.returncode}]"
-        return combined or "(no output)", {
+        result = json.dumps({
+            "stdout": out,
+            "stderr": err,
+            "returncode": proc.returncode,
+        }, separators=(",", ":"))
+        return result, {
             "stdout": out, "stderr": err, "returncode": proc.returncode,
             "streamed": True,
-            "result": combined or "(no output)",
+            "result": result,
         }
     except subprocess.TimeoutExpired:
         if proc is not None:
@@ -506,15 +506,16 @@ def t_run(command: str) -> tuple[str, dict]:
         )
         if _exec_async_available:
             hint += " Or use t_execute_async to start the command asynchronously."
-        combined = out
-        if err:
-            combined += ("\n" if combined else "") + err
-        combined += f"\n\n{hint}"
-        r = f"ERROR: command timed out after 60 s\n\n{combined}"
-        return r, {"error": r, "result": r, "stdout": out, "stderr": err, "hint": hint}
+        result = json.dumps({
+            "error": "command timed out after 60 s",
+            "stdout": out,
+            "stderr": err,
+            "hint": hint,
+        }, separators=(",", ":"))
+        return result, {"error": result, "result": result, "stdout": out, "stderr": err, "hint": hint}
     except Exception as e:
-        r = f"ERROR: {e}"
-        return r, {"error": r, "result": r}
+        result = json.dumps({"error": str(e)}, separators=(",", ":"))
+        return result, {"error": result, "result": result}
     finally:
         _active_proc = None
 

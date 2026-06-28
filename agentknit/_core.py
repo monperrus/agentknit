@@ -873,9 +873,12 @@ def _load_messages_snapshot(model: str, session_id: str) -> list | None:
             normalised[-1]["ts"] = m.get("ts")
         else:
             normalised.append(dict(m))
-    # Convert tool calls to text descriptions: some providers (e.g.
-    # opencode.ai) do not support resuming conversations with tool call
-    # IDs from a previous session.
+    # Convert tool calls to text descriptions.  Some providers (e.g.
+    # opencode.ai / deepseek-v4-flash-free) reject tool_call IDs that were
+    # generated in a previous API session.  Re-sending stale IDs produces a
+    # 400 "Upstream request failed" error.  We therefore flatten the tool
+    # call / result pairs into plain assistant text so the conversation
+    # history remains readable while being API-safe on resume.
     converted: list = []
     for m in normalised:
         if m.get("role") == "assistant" and "tool_calls" in m:
@@ -974,9 +977,12 @@ def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list | 
             normalised[-1]["ts"] = m.get("ts")
         else:
             normalised.append(dict(m))
-    # Convert tool calls to text descriptions: some providers (e.g.
-    # opencode.ai) do not support resuming conversations with tool call
-    # IDs from a previous session.
+    # Convert tool calls to text descriptions.  Some providers (e.g.
+    # opencode.ai / deepseek-v4-flash-free) reject tool_call IDs that were
+    # generated in a previous API session.  Re-sending stale IDs produces a
+    # 400 "Upstream request failed" error.  We therefore flatten the tool
+    # call / result pairs into plain assistant text so the conversation
+    # history remains readable while being API-safe on resume.
     converted: list = []
     for m in normalised:
         if m.get("role") == "assistant" and "tool_calls" in m:

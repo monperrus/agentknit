@@ -1616,7 +1616,7 @@ def _build_resume_cmd(model: str, session_id: str, default_program: str | None =
     return f"{default_program} {model} --session {session_id}"
 
 
-def run_repl(
+def _repl_setup(
     schema: dict,
     *,
     non_interactive: bool = False,
@@ -1625,18 +1625,10 @@ def run_repl(
     system_prompt_supplement: str = "",
     max_output_tokens: int | None = None,
     on_event: "EventCallback | None" = None,
-) -> None:
-    """Start an interactive REPL session against the agent.
-
-    Reads tasks line-by-line from stdin and runs :func:`run_turn` for each.
-    The session snapshot is saved after every turn so it can be resumed with
-    ``--session <session_id>``.
-
-    Slash commands (``/clear``, ``/model``, ``/usage``, ``/help``) are
-    intercepted before sending input to the model.
-    """
+) -> tuple:
+    """Common REPL setup: validate, create client, init session, return (client, session, model, hist_file)."""
     validate_schema(schema)
-    client  = create_client(schema)
+    client = create_client(schema)
     session = init_session(
         schema,
         non_interactive=non_interactive,
@@ -1646,13 +1638,11 @@ def run_repl(
         max_output_tokens=max_output_tokens,
         on_event=on_event,
     )
-    model      = schema["model"]
-    resume_cmd = _build_resume_cmd(model, session["session_id"], "agent-probe")
+    model = schema["model"]
 
     if session_id:
         print_session_history(session)
 
-    # Per-directory history so arrow-up recalls prompts from the same folder.
     import hashlib as _hashlib
     _hist_dir = Path.home() / ".local" / "share" / "agent_probe" / "repl_history"
     _hist_dir.mkdir(parents=True, exist_ok=True)
@@ -1663,6 +1653,142 @@ def run_repl(
     except FileNotFoundError:
         pass
     readline.set_history_length(500)
+
+    return client, session, model, _hist_file
+
+
+def _repl_teardown(session: dict, hist_file: Path, resume_cmd: str) -> None:
+    """Common REPL teardown: save history, snapshot, log."""
+    try:
+        readline.write_history_file(hist_file)
+    except Exception:
+        pass
+    _save_messages_snapshot(session)
+    _log(session, {"type": "session_end", "session_id": session["session_id"],
+                   "reason": "repl_exit"})
+    print(f"\n{DIM}Resume: {resume_cmd}{RESET}")
+
+
+def _repl_loop_body(
+    t: str,
+    client: openai.OpenAI | SubprocessOpenAI,
+    session: dict,
+    model: str,
+    *,
+    use_async_input: bool = False,
+) -> None:
+    """Run one REPL turn, optionally with async input queue.
+
+    When *use_async_input* is True a background ``_InputCollector`` thread
+    queues keystrokes typed while the agent is thinking; they are drained
+    and run as follow-up turns.  When False (the default) the turn runs
+    synchronously with no background reader — simpler and immune to stdin
+    races with tools that call ``input()``.
+    """
+    current_model = session.get("model", model)
+    if _slash_registry.dispatch(t, session, client, current_model):
+        _save_messages_snapshot(session)
+        return
+
+    if use_async_input:
+        _async_repl_turn(t, client, session, current_model)
+    else:
+        _sync_repl_turn(t, client, session, current_model)
+
+
+def _sync_repl_turn(
+    t: str,
+    client: openai.OpenAI | SubprocessOpenAI,
+    session: dict,
+    model: str,
+) -> None:
+    """Run a single turn synchronously — no background reader thread."""
+    try:
+        run_turn(client, model, session, t)
+    except KeyboardInterrupt:
+        print(f"\n{DIM}[interrupted]{RESET}")
+    except Exception as exc:
+        _emit(session, "error", text=str(exc),
+              fmt=f"\n{RED}Error: {exc}{RESET}")
+        _log(session, {"type": "error", "error": str(exc),
+               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+    _save_messages_snapshot(session)
+
+
+def _async_repl_turn(
+    t: str,
+    client: openai.OpenAI | SubprocessOpenAI,
+    session: dict,
+    model: str,
+) -> None:
+    """Run a turn with a background ``_InputCollector`` queuing keystrokes."""
+    _collector = _InputCollector()
+    _tool_module._input_collector = _collector
+    _pending = [t]
+    try:
+        while _pending:
+            _task = _pending.pop(0)
+            _collector.start()
+            _interrupted = False
+            try:
+                run_turn(client, model, session, _task)
+            except KeyboardInterrupt:
+                print(f"\n{DIM}[interrupted]{RESET}")
+                _interrupted = True
+            except Exception as exc:
+                _emit(session, "error", text=str(exc),
+                      fmt=f"\n{RED}Error: {exc}{RESET}")
+                _log(session, {"type": "error", "error": str(exc),
+                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+            finally:
+                _collector.stop()
+            _save_messages_snapshot(session)
+            if _interrupted:
+                break
+            for _qi in _collector.drain():
+                _qs = _qi.strip()
+                if not _qs or _qs.lower() in ("exit", "quit", "q"):
+                    continue
+                if not _slash_registry.dispatch(_qs, session, client, model):
+                    _pending.append(_qi)
+                else:
+                    _save_messages_snapshot(session)
+    finally:
+        _tool_module._input_collector = None
+
+
+def run_repl(
+    schema: dict,
+    *,
+    non_interactive: bool = False,
+    session_id: str | None = None,
+    cache_key: str | None = None,
+    system_prompt_supplement: str = "",
+    max_output_tokens: int | None = None,
+    on_event: "EventCallback | None" = None,
+) -> None:
+    """Start an interactive REPL session against the agent (sync, no background thread).
+
+    Reads tasks line-by-line from stdin and runs :func:`run_turn` for each.
+    The session snapshot is saved after every turn so it can be resumed with
+    ``--session <session_id>``.
+
+    Slash commands (``/clear``, ``/model``, ``/usage``, ``/help``) are
+    intercepted before sending input to the model.
+
+    This is the *sync* variant — no background reader thread, so tools that
+    call ``input()`` (e.g. ``ask_user_question``) work without stdin races.
+    """
+    client, session, model, hist_file = _repl_setup(
+        schema,
+        non_interactive=non_interactive,
+        session_id=session_id,
+        cache_key=cache_key,
+        system_prompt_supplement=system_prompt_supplement,
+        max_output_tokens=max_output_tokens,
+        on_event=on_event,
+    )
+    resume_cmd = _build_resume_cmd(model, session["session_id"], "agent-probe")
 
     print(f"{BOLD}agentknit {model}{RESET}  (type 'exit' to quit)\n")
     try:
@@ -1679,53 +1805,61 @@ def run_repl(
             if cmd.lower() in ("exit", "quit", "q"):
                 break
             if cmd:
-                # ── slash command interception ───────────────────────────────
-                # Use the potentially updated model from session (e.g. after /model switch).
-                current_model = session.get("model", model)
-                if _slash_registry.dispatch(cmd, session, client, current_model):
-                    _save_messages_snapshot(session)
-                    continue
-                # ── regular turn (with async input queue) ────────────────────
-                _collector = _InputCollector()
-                _tool_module._input_collector = _collector
-                _pending = [t]
-                while _pending:
-                    _task = _pending.pop(0)
-                    _collector.start()
-                    _interrupted = False
-                    try:
-                        run_turn(client, current_model, session, _task)
-                    except KeyboardInterrupt:
-                        print(f"\n{DIM}[interrupted]{RESET}")
-                        _interrupted = True
-                    except Exception as exc:
-                        _emit(session, "error", text=str(exc),
-                              fmt=f"\n{RED}Error: {exc}{RESET}")
-                        _log(session, {"type": "error", "error": str(exc),
-                               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-                    finally:
-                        _collector.stop()
-                    _save_messages_snapshot(session)
-                    if _interrupted:
-                        break
-                    for _qi in _collector.drain():
-                        _qs = _qi.strip()
-                        if not _qs or _qs.lower() in ("exit", "quit", "q"):
-                            continue
-                        if not _slash_registry.dispatch(_qs, session, client, current_model):
-                            _pending.append(_qi)
-                        else:
-                            _save_messages_snapshot(session)
-                _tool_module._input_collector = None
+                _repl_loop_body(cmd, client, session, model, use_async_input=False)
     finally:
-        try:
-            readline.write_history_file(_hist_file)
-        except Exception:
-            pass
-        _save_messages_snapshot(session)
-        _log(session, {"type": "session_end", "session_id": session["session_id"],
-                       "reason": "repl_exit"})
-        print(f"\n{DIM}Resume: {resume_cmd}{RESET}")
+        _repl_teardown(session, hist_file, resume_cmd)
+
+
+def run_async_repl(
+    schema: dict,
+    *,
+    non_interactive: bool = False,
+    session_id: str | None = None,
+    cache_key: str | None = None,
+    system_prompt_supplement: str = "",
+    max_output_tokens: int | None = None,
+    on_event: "EventCallback | None" = None,
+) -> None:
+    """Start an interactive REPL session with a background input queue.
+
+    Same as :func:`run_repl` but spawns a background ``_InputCollector``
+    thread that queues keystrokes typed while the agent is thinking.  Those
+    queued inputs are drained and run as follow-up turns after the current
+    turn completes.
+
+    **Caveat**: tools that call ``input()`` (e.g. ``ask_user_question``) may
+    race with the background reader thread for stdin.  Use ``run_repl``
+    (sync) if you need those tools.
+    """
+    client, session, model, hist_file = _repl_setup(
+        schema,
+        non_interactive=non_interactive,
+        session_id=session_id,
+        cache_key=cache_key,
+        system_prompt_supplement=system_prompt_supplement,
+        max_output_tokens=max_output_tokens,
+        on_event=on_event,
+    )
+    resume_cmd = _build_resume_cmd(model, session["session_id"], "agent-probe")
+
+    print(f"{BOLD}agentknit {model}{RESET}  (type 'exit' to quit)\n")
+    try:
+        while True:
+            try:
+                t = read_repl_input(f"{RL_BOLD}>{RL_RESET} ")
+            except EOFError:
+                print()
+                break
+            except KeyboardInterrupt:
+                print()
+                continue
+            cmd = t.strip()
+            if cmd.lower() in ("exit", "quit", "q"):
+                break
+            if cmd:
+                _repl_loop_body(cmd, client, session, model, use_async_input=True)
+    finally:
+        _repl_teardown(session, hist_file, resume_cmd)
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -1818,80 +1952,9 @@ def main() -> None:
         return
 
     # Interactive REPL — reuse the already-created client + session.
-    # Per-directory history so arrow-up recalls prompts from the same folder.
-    import hashlib as _hashlib
-    _hist_dir = Path.home() / ".local" / "share" / "agent_probe" / "repl_history"
-    _hist_dir.mkdir(parents=True, exist_ok=True)
-    _cwd_tag = _hashlib.md5(os.getcwd().encode()).hexdigest()[:12]
-    _hist_file = _hist_dir / f"{_cwd_tag}.hist"
-    try:
-        readline.read_history_file(_hist_file)
-    except FileNotFoundError:
-        pass
-    readline.set_history_length(500)
-
-    print(f"{BOLD}agentknit {model}{RESET}  (type 'exit' to quit)\n")
-    try:
-        while True:
-            try:
-                t = read_repl_input(f"{RL_BOLD}>{RL_RESET} ")
-            except EOFError:
-                print()
-                break
-            except KeyboardInterrupt:
-                print()
-                continue
-            cmd = t.strip()
-            if cmd.lower() in ("exit", "quit", "q"):
-                break
-            if cmd:
-                # ── slash command interception ───────────────────────────────
-                # Use the potentially updated model from session (e.g. after /model switch).
-                current_model = session.get("model", model)
-                if _slash_registry.dispatch(cmd, session, client, current_model):
-                    _save_messages_snapshot(session)
-                    continue
-                # ── regular turn (with async input queue) ────────────────────
-                _collector = _InputCollector()
-                _tool_module._input_collector = _collector
-                _pending = [t]
-                while _pending:
-                    _task = _pending.pop(0)
-                    _collector.start()
-                    _interrupted = False
-                    try:
-                        run_turn(client, current_model, session, _task)
-                    except KeyboardInterrupt:
-                        print(f"\n{DIM}[interrupted]{RESET}")
-                        _interrupted = True
-                    except Exception as exc:
-                        _emit(session, "error", text=str(exc),
-                              fmt=f"\n{RED}Error: {exc}{RESET}")
-                        _log(session, {"type": "error", "error": str(exc),
-                               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-                    finally:
-                        _collector.stop()
-                    _save_messages_snapshot(session)
-                    if _interrupted:
-                        break
-                    for _qi in _collector.drain():
-                        _qs = _qi.strip()
-                        if not _qs or _qs.lower() in ("exit", "quit", "q"):
-                            continue
-                        if not _slash_registry.dispatch(_qs, session, client, current_model):
-                            _pending.append(_qi)
-                        else:
-                            _save_messages_snapshot(session)
-                _tool_module._input_collector = None
-    finally:
-        try:
-            readline.write_history_file(_hist_file)
-        except Exception:
-            pass
-        _save_messages_snapshot(session)
-        _log(session, {"type": "session_end", "session_id": session["session_id"],
-                       "reason": "repl_exit"})
-        print(f"\n{DIM}Resume: {resume_cmd}{RESET}")
+    repl_opts = {k: v for k, v in opts.items() if k != "resumed_from"}
+    repl_opts["session_id"] = opts.get("resumed_from")
+    run_repl(schema, **repl_opts)
 
 
 if __name__ == "__main__":

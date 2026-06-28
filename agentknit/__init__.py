@@ -12,6 +12,8 @@ from .exceptions import (
 
 from ._core import (
     main,
+    run,
+    configure_agent,
     validate_schema,
     create_client,
     run_task,
@@ -84,7 +86,9 @@ __all__ = [
     "extract_tool_specs_from_module",
     "AgentProbeError", "AgentSpecDisabledError", "AgentSpecInvalidError",
     "PricingLimitExceededError", "AuthenticationError",
-    "main", "validate_schema", "create_client", "run_task", "run_repl", "run_async_repl",
+    "main", "run",
+    "configure_agent",
+    "validate_schema", "create_client", "run_task", "run_repl", "run_async_repl",
     "SessionResult", "CancelToken", "EventCallback", "_default_event_handler",
     "subscribe", "unsubscribe", "on",
     "run_turn", "init_session", "dispatch", "load_or_probe",

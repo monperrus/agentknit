@@ -663,10 +663,26 @@ def _save_messages_snapshot(session: dict) -> None:
 
 def _load_messages_snapshot(model: str, session_id: str) -> list | None:
     path = _snapshot_path(model, session_id)
-    if not path.exists():
-        return None
-    with path.open() as f:
-        return json.load(f)
+    if path.exists():
+        with path.open() as f:
+            return json.load(f)
+
+    # If session_id looks like a trajectoriz short ID (e.g. "ap-<hex8>"),
+    # resolve it by hashing each snapshot's actual session ID.
+    if "-" in session_id and len(session_id.split("-")[-1]) == 8:
+        import hashlib
+        snap_dir = LOG_BASE / safe_model_name(model)
+        if snap_dir.is_dir():
+            target_hash = session_id.split("-")[-1]
+            for snap in snap_dir.glob("*_messages.json"):
+                stem = snap.stem
+                actual_sid = stem.rsplit("_messages", 1)[0]
+                h = hashlib.sha256(actual_sid.encode()).hexdigest()[:8]
+                if h == target_hash:
+                    with snap.open() as f:
+                        return json.load(f)
+
+    return None
 
 
 def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list | None, str | None]:
@@ -680,6 +696,20 @@ def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list | 
         p for p in LOG_BASE.glob(f"*/{filename}")
         if p.parent.name != current and p.is_file()
     ]
+    # Also try trajectoriz short-ID resolution across other model dirs
+    if not matches and "-" in session_id and len(session_id.split("-")[-1]) == 8:
+        import hashlib
+        target_hash = session_id.split("-")[-1]
+        for model_dir in sorted(LOG_BASE.iterdir()):
+            if model_dir.name == current or not model_dir.is_dir():
+                continue
+            for snap in model_dir.glob("*_messages.json"):
+                stem = snap.stem
+                actual_sid = stem.rsplit("_messages", 1)[0]
+                h = hashlib.sha256(actual_sid.encode()).hexdigest()[:8]
+                if h == target_hash:
+                    matches.append(snap)
+
     if not matches:
         return None, None
 

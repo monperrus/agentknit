@@ -490,8 +490,28 @@ def t_run(command: str) -> tuple[str, dict]:
                 os.killpg(proc.pid, signal.SIGKILL)
             except Exception:
                 proc.kill()
-        r = "ERROR: command timed out after 60 s"
-        return r, {"error": r, "result": r}
+        # Give drain threads a moment to capture what was buffered.
+        t_out.join(timeout=2)
+        t_err.join(timeout=2)
+        out = "".join(stdout_lines)
+        err = "".join(stderr_lines)
+        _exec_async_available = any(
+            e.get("python_function") == "t_execute_async"
+            for e in getattr(_tool_context, "tool_dispatch", {}).values()
+        )
+        hint = (
+            "The command did not finish within 60 seconds. "
+            "For long-running commands, use 'nohup <command> &' to run in the "
+            "background."
+        )
+        if _exec_async_available:
+            hint += " Or use t_execute_async to start the command asynchronously."
+        combined = out
+        if err:
+            combined += ("\n" if combined else "") + err
+        combined += f"\n\n{hint}"
+        r = f"ERROR: command timed out after 60 s\n\n{combined}"
+        return r, {"error": r, "result": r, "stdout": out, "stderr": err, "hint": hint}
     except Exception as e:
         r = f"ERROR: {e}"
         return r, {"error": r, "result": r}

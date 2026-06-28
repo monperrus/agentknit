@@ -1340,6 +1340,7 @@ def _handle_tool_call(
     _emit(session, "tool_call", name=name, args=args, fmt=fmt_call(name, args))
 
     _tool_module._tool_context.session_id = session.get("session_id")
+    _tool_module._tool_context.tool_dispatch = tool_dispatch
 
     if is_ask and non_interactive:
         result = "ERROR: user interaction is disabled (--non-interactive)"

@@ -335,6 +335,12 @@ _DEFAULT_TOOL_DISPATCH = {
     "str_replace":          {"python_function": "t_update",      "param_map": {"old_str": "old", "new_str": "new"}},
     "execute_shell_command":{"python_function": "t_run",         "param_map": {}},
 }
+_DEFAULT_TOOLS = [
+    "t_read",
+    "t_write",
+    "t_update",
+    "t_run",
+]
 
 
 # ── probe / cache ─────────────────────────────────────────────────────────────
@@ -358,12 +364,12 @@ def load_or_probe(model: str, endpoint: str, force: bool) -> dict:
             with path.open() as f:
                 return json.load(f)
         data = {
-            "model":                model,
-            "endpoint":             endpoint,
-            "status":               "default",
-            "inferred_tool_schema": _DEFAULT_TOOL_SCHEMA,
-            "behaviour":            {"call_delivery_mode": "structured_tool_calls"},
-            "tool_dispatch":        _DEFAULT_TOOL_DISPATCH,
+            "model":       model,
+            "endpoint":    endpoint,
+            "status":      "default",
+            "tool_specs":  _DEFAULT_TOOL_SCHEMA,
+            "tools":       _DEFAULT_TOOLS,
+            "behaviour":   {"call_delivery_mode": "structured_tool_calls"},
         }
         with path.open("w") as f:
             json.dump(data, f, indent=2)
@@ -403,6 +409,118 @@ def load_or_probe(model: str, endpoint: str, force: bool) -> dict:
 
 class FatalToolDispatchError(RuntimeError):
     """Raised when the agent requests a tool that cannot be dispatched."""
+
+
+def _tool_name_from_spec(tool_spec: dict) -> str:
+    """Return the model-facing tool name from an OpenAI-compatible tool spec."""
+    fn = tool_spec.get("function") or tool_spec
+    return fn.get("name", "")
+
+
+def _tool_param_names(tool_spec: dict) -> list[str]:
+    """Return the model-facing parameter names from *tool_spec* in declaration order."""
+    fn = tool_spec.get("function") or tool_spec
+    params = ((fn.get("parameters") or {}).get("properties") or {})
+    return list(params.keys())
+
+
+def _callable_param_names(fn: Callable) -> list[str]:
+    """Return positional/keyword parameter names for *fn* in signature order."""
+    import inspect
+
+    sig = inspect.signature(fn)
+    result: list[str] = []
+    for name, param in sig.parameters.items():
+        if name in ("self", "cls"):
+            continue
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        result.append(name)
+    return result
+
+
+def _derive_param_map(tool_spec: dict, fn_name: str) -> dict[str, str]:
+    """Infer model-arg -> Python-kwarg mapping for *fn_name* and *tool_spec*."""
+    fn = TOOL_LIBRARY.get(fn_name)
+    if fn is None:
+        raise AgentSpecInvalidError(
+            f"Tool function {fn_name!r} not found in TOOL_LIBRARY.",
+            model=fn_name,
+        )
+
+    spec_params = _tool_param_names(tool_spec)
+    sig_params = _callable_param_names(fn)
+    if len(spec_params) > len(sig_params):
+        raise AgentSpecInvalidError(
+            f"Tool spec for {_tool_name_from_spec(tool_spec)!r} declares "
+            f"{len(spec_params)} params but {fn_name} only accepts {len(sig_params)}.",
+            model=_tool_name_from_spec(tool_spec) or fn_name,
+        )
+
+    return {
+        spec_name: sig_params[idx]
+        for idx, spec_name in enumerate(spec_params)
+        if spec_name != sig_params[idx]
+    }
+
+
+def _build_dispatch_from_tools(tool_specs: list[dict], tools: list[str]) -> dict[str, dict]:
+    """Build a tool_dispatch dict from ordered tool specs and TOOL_LIBRARY names."""
+    if len(tool_specs) != len(tools):
+        raise AgentSpecInvalidError(
+            f"'tool_specs' has {len(tool_specs)} entries but 'tools' has {len(tools)}.",
+        )
+
+    dispatch: dict[str, dict] = {}
+    for tool_spec, fn_name in zip(tool_specs, tools, strict=False):
+        if not isinstance(fn_name, str):
+            raise AgentSpecInvalidError("'tools' must be a list of TOOL_LIBRARY function names.")
+        if fn_name not in TOOL_LIBRARY:
+            raise AgentSpecInvalidError(f"Unknown tool function {fn_name!r} in 'tools'.")
+        tool_name = _tool_name_from_spec(tool_spec)
+        if not tool_name:
+            raise AgentSpecInvalidError("Every 'tool_specs' entry must define function.name.")
+        dispatch[tool_name] = {
+            "python_function": fn_name,
+            "param_map": _derive_param_map(tool_spec, fn_name),
+        }
+    return dispatch
+
+
+def _default_dispatch_for_tool_specs(tool_specs: list[dict]) -> dict[str, dict]:
+    """Return built-in dispatch entries for tool specs whose names are known defaults."""
+    dispatch: dict[str, dict] = {}
+    for tool_spec in tool_specs:
+        tool_name = _tool_name_from_spec(tool_spec)
+        entry = _DEFAULT_TOOL_DISPATCH.get(tool_name)
+        if entry is not None:
+            dispatch[tool_name] = copy.deepcopy(entry)
+    return dispatch
+
+
+def _normalize_schema(schema: dict) -> dict:
+    """Return a schema copy with public tool fields normalized for runtime use."""
+    normalized = copy.deepcopy(schema)
+    tool_specs = normalized.get("tool_specs")
+    if tool_specs is None:
+        tool_specs = normalized.get("inferred_tool_schema")
+    if tool_specs is None:
+        tool_specs = []
+    normalized["tool_specs"] = tool_specs
+    normalized["inferred_tool_schema"] = tool_specs
+
+    tools = normalized.get("tools")
+    if tools is not None:
+        if not isinstance(tools, list) or any(not isinstance(t, str) for t in tools):
+            raise AgentSpecInvalidError("'tools' must be a list of TOOL_LIBRARY function names.")
+        normalized["tool_dispatch"] = _build_dispatch_from_tools(tool_specs, tools)
+    elif not normalized.get("tool_dispatch"):
+        normalized["tool_dispatch"] = _default_dispatch_for_tool_specs(tool_specs)
+
+    return normalized
 
 
 def _resolve_fn(entry: dict) -> Callable | None:
@@ -790,6 +908,7 @@ def init_session(schema: dict, non_interactive: bool = False,
     provider's prefix cache *without* resuming the prior conversation: that
     requires `resumed_from`, which is the only thing that loads past messages.
     """
+    schema = _normalize_schema(schema)
     tools         = schema.get("inferred_tool_schema") or []
     behaviour     = schema.get("behaviour") or {}
     tool_dispatch = schema.get("tool_dispatch") or {}
@@ -1501,6 +1620,7 @@ def validate_schema(schema: dict) -> None:
         AgentSpecDisabledError: if ``schema["disabled"]`` is true.
         AgentSpecInvalidError:  if ``schema["inferred_tool_schema"]`` is absent.
     """
+    schema = _normalize_schema(schema)
     if schema.get("disabled"):
         comment = schema.get("comment", "This agent spec is disabled.")
         raise AgentSpecDisabledError(comment, comment=comment)
@@ -1580,6 +1700,7 @@ def create_client(schema: dict) -> "openai.OpenAI | SubprocessOpenAI":
     client constructor to enforce a client-side rate limit (e.g. 40 RPM
     for NVIDIA NIM free-tier endpoints).
     """
+    schema = _normalize_schema(schema)
     endpoint    = schema.get("endpoint") or DEFAULT_ENDPOINT
     binary_path = _parse_run_uri(endpoint) or _parse_run_uri(schema.get("model", ""))
     auth        = schema.get("auth")
@@ -1635,6 +1756,45 @@ def run_task(
         _save_messages_snapshot(session)
         _log(session, {"type": "session_end", "session_id": session["session_id"],
                        "reason": "run_task_complete"})
+
+
+def run(
+    schema: dict | None = None,
+    task: str | None = None,
+    *,
+    model: str | None = None,
+    endpoint: str | None = None,
+    reprobe: bool = False,
+    non_interactive: bool = False,
+    session_id: str | None = None,
+    cache_key: str | None = None,
+    system_prompt_supplement: str = "",
+    max_output_tokens: int | None = None,
+    on_event: "EventCallback | None" = None,
+) -> SessionResult:
+    """Backward-compatible helper for :func:`run_task`.
+
+    Accepts either a loaded schema dict or a ``model``/``endpoint`` pair for
+    wrapper scripts that want to skip ``agentknit.main()``.
+    """
+    if schema is None:
+        if model is None or endpoint is None:
+            raise TypeError("run() requires either `schema` or both `model` and `endpoint`.")
+        schema = load_or_probe(model, endpoint, reprobe)
+    elif model is not None or endpoint is not None:
+        raise TypeError("run() accepts either `schema` or `model`/`endpoint`, not both.")
+    if task is None:
+        raise TypeError("run() missing required argument: 'task'")
+    return run_task(
+        schema,
+        task,
+        non_interactive=non_interactive,
+        session_id=session_id,
+        cache_key=cache_key,
+        system_prompt_supplement=system_prompt_supplement,
+        max_output_tokens=max_output_tokens,
+        on_event=on_event,
+    )
 
 
 def _build_resume_cmd(model: str, session_id: str, default_program: str | None = None) -> str:

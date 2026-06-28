@@ -20,8 +20,9 @@ An agent spec is a JSON file that describes how agentknit should connect to a mo
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `inferred_tool_schema` | array | yes | OpenAI-compatible tool definitions — the list of `{"type": "function", "function": {...}}` objects sent to the model. |
-| `tool_dispatch` | object | no | Maps each tool name to a Python function entry (see [Tool dispatch](#tool-dispatch) below).  Omit to use the framework's built-in dispatch. |
+| `tool_specs` | array | yes | OpenAI-compatible tool definitions — the list of `{"type": "function", "function": {...}}` objects sent to the model. |
+| `tools` | array of strings | no | Ordered list of Python function names from `tool_library.TOOL_LIBRARY`. Each entry is paired with the tool spec at the same index. |
+| `tool_dispatch` | object | no | Legacy explicit dispatch mapping (see [Tool dispatch](#tool-dispatch) below).  Prefer `tools` for new specs. |
 | `aliases` | object | no | Maps alias names to canonical tool names already present in `tool_dispatch`.  Both the tool schema and dispatch table are expanded at session start so aliases behave identically to the original tool. |
 
 ### Behaviour
@@ -76,7 +77,7 @@ Key resolution order: `keyring_service`+`keyring_username` → `key_env` → `OP
 
 ## Tool dispatch
 
-Each key in `tool_dispatch` is a tool name matching an entry in `inferred_tool_schema`.
+Each key in `tool_dispatch` is a tool name matching an entry in `tool_specs`.
 
 ```json
 "tool_dispatch": {
@@ -114,7 +115,7 @@ String flags in the `options` array enable provider-specific workarounds:
 {
   "model": "qwen/qwen3-8b",
   "endpoint": "https://openrouter.ai/api/v1",
-  "inferred_tool_schema": [
+  "tool_specs": [
     {
       "type": "function",
       "function": {
@@ -128,7 +129,7 @@ String flags in the `options` array enable provider-specific workarounds:
       }
     }
   ],
+  "tools": ["t_run"],
   "behaviour": { "call_delivery_mode": "structured_tool_calls" }
 }
 ```
-

@@ -10,9 +10,8 @@ from agentknit._core import init_session
 _MINIMAL_SCHEMA = {
     "model": "test-model",
     "endpoint": "https://example.com",
-    "inferred_tool_schema": [],
+    "tool_specs": [],
     "behaviour": {"call_delivery_mode": "structured_tool_calls"},
-    "tool_dispatch": {},
 }
 
 

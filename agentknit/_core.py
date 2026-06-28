@@ -1504,10 +1504,16 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
     tools      = session["tools"]
     structured = session["structured"]
 
-    messages.append({"role": "user", "content": task,
-                     "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-    _log(session, {"type": "user", "content": task,
-                   "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+    now_ts = datetime.datetime.now().isoformat(timespec="seconds")
+    if messages and messages[-1].get("role") == "user":
+        # Merge consecutive user messages to keep the API-valid
+        # user/assistant alternation.
+        old = messages[-1]["content"]
+        messages[-1]["content"] = f"{old}\n\n{task}" if old else task
+        messages[-1]["ts"] = now_ts
+    else:
+        messages.append({"role": "user", "content": task, "ts": now_ts})
+    _log(session, {"type": "user", "content": task, "ts": now_ts})
 
     total_tokens = 0
     max_tokens   = DEFAULT_MAX_TOKENS

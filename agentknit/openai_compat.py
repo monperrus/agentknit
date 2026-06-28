@@ -405,11 +405,11 @@ class _SubprocessCompletions:
             timeout=300,
         )
         if proc.stderr:
-            print(f"  [subprocess stderr] {proc.stderr[:500]}", flush=True)
+            print(f"  [subprocess stderr] {proc.stderr}", flush=True)
         if proc.returncode != 0:
             raise RuntimeError(
                 f"Binary {self._client._binary_path!r} exited {proc.returncode}: "
-                f"{proc.stderr[:500]}"
+                f"{proc.stderr}"
             )
         data = json.loads(proc.stdout)
         return _parse_response(data)

@@ -2220,7 +2220,8 @@ def run_repl(
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], "agent-probe")
 
-    print(f"{BOLD}agentknit {model}{RESET}  (type 'exit' to quit)\n")
+    display_name = schema.get("display_name", f"agentknit {model}")
+    print(f"{BOLD}{display_name}{RESET}  (type 'exit' to quit)\n")
     try:
         while True:
             try:
@@ -2282,7 +2283,8 @@ def run_async_repl(
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], "agent-probe")
 
-    print(f"{BOLD}agentknit {model}{RESET}  (type 'exit' to quit)\n")
+    display_name = schema.get("display_name", f"agentknit {model}")
+    print(f"{BOLD}{display_name}{RESET}  (type 'exit' to quit)\n")
     try:
         while True:
             try:

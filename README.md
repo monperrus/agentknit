@@ -239,3 +239,20 @@ Or in the agent spec JSON:
 The summary message is tagged with `"compacted_summary": true` so consumers
 can distinguish compacted state from raw conversation turns. Compaction events
 are emitted as `"compaction"` events and logged to the session trace.
+
+## rtk Integration (optional token savings)
+
+[rtk](https://github.com/rtk-ai/rtk) is a CLI proxy that rewrites shell
+command output for 60–90% token savings. When installed, you can opt in by
+calling `enable_rtk_rewrite()` once before `run_task()`:
+
+```python
+from agentknit import enable_rtk_rewrite, run_task
+
+enable_rtk_rewrite()   # no-op if rtk is not in PATH
+
+result = run_task(schema, "List the files in /tmp")
+```
+
+This patches `t_run` and `t_execute_async` in the tool library so every shell
+command passes through `rtk rewrite` before execution. It is off by default.

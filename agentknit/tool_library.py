@@ -735,6 +735,39 @@ TOOL_LIBRARY: dict[str, callable] = {
     "t_query_exec":         t_query_exec,
 }
 
+def enable_rtk_rewrite() -> None:
+    """Patch TOOL_LIBRARY so shell commands are rewritten through rtk before execution.
+
+    rtk (https://github.com/rtk-ai/rtk) is a CLI proxy that filters command
+    output for 60-90% token savings. This function is a no-op when rtk is not
+    in PATH. Call it once before agentknit.main() to opt in; it is off by default.
+    """
+    import shutil
+    if not shutil.which("rtk"):
+        return
+
+    import subprocess as _sp
+
+    def _rewrite(command: str) -> str:
+        try:
+            r = _sp.run(["rtk", "rewrite", command], capture_output=True, text=True, timeout=2)
+            if r.returncode in (0, 3) and r.stdout.strip():
+                return r.stdout.strip()
+        except Exception:
+            pass
+        return command
+
+    _orig_t_run = TOOL_LIBRARY["t_run"]
+    def _rtk_t_run(command: str, **kw):
+        return _orig_t_run(_rewrite(command), **kw)
+    TOOL_LIBRARY["t_run"] = _rtk_t_run
+
+    _orig_t_execute_async = TOOL_LIBRARY["t_execute_async"]
+    def _rtk_t_execute_async(command: str, **kw):
+        return _orig_t_execute_async(_rewrite(command), **kw)
+    TOOL_LIBRARY["t_execute_async"] = _rtk_t_execute_async
+
+
 def _register_generated(fn_name: str, source: str) -> bool:
     """Exec *source* and add the resulting callable to TOOL_LIBRARY.
 

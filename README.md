@@ -108,6 +108,29 @@ tools = [
 The framework ships with a built-in set of tools (`read_file`, `write_file`,
 `str_replace`, `execute_shell_command`). 
 
+### Sandboxed tool execution (Linux)
+
+Direct local tool dispatch remains the default. For untrusted replay workloads,
+pass a `BubblewrapToolExecutor` to keep file and shell tools in an isolated
+workspace while the controller retains the model credential and network access:
+
+```python
+from pathlib import Path
+from agentknit import BubblewrapToolExecutor, SandboxPolicy, run_task
+
+executor = BubblewrapToolExecutor(SandboxPolicy(
+    workspace=Path("/tmp/replay-worktree"),
+    network="none",
+    environment={"PATH": "/usr/bin:/bin"},
+))
+result = run_task(schema, task, tool_executor=executor)
+```
+
+The Bubblewrap executor supports the built-in file tools and synchronous shell
+commands. It rejects custom Python and asynchronous tools unless they provide a
+sandbox adapter; it never falls back to local execution. Paths are restricted
+to the workspace and the selected sandbox policy is recorded in the session log.
+
 
 ## Event System
 

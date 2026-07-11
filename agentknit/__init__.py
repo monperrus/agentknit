@@ -63,6 +63,14 @@ from .tool import (
     register_tools_in_library,
 )
 
+from .sandbox import (
+    ToolExecutor,
+    ToolSessionContext,
+    LocalToolExecutor,
+    SandboxPolicy,
+    BubblewrapToolExecutor,
+)
+
 from ._tool_spec import (
     parse_tool_spec_from_docstring,
     extract_tool_specs_from_module,
@@ -110,6 +118,8 @@ __all__ = [
     "Tool",
     "build_tool_spec",
     "register_tools_in_library",
+    "ToolExecutor", "ToolSessionContext", "LocalToolExecutor",
+    "SandboxPolicy", "BubblewrapToolExecutor",
     "SlashCommand",
     "SlashCommandRegistry",
     "slash_registry",

@@ -1076,6 +1076,7 @@ def init_session(schema: dict, non_interactive: bool = False,
                  max_output_tokens: int | None = None,
                  strict_cache_proof: bool = True,
                  on_event: "EventCallback | None" = None,
+                 tool_executor: "ToolExecutor | None" = None,
                  *,
                  compaction_enabled: bool | None = None,
                  compaction_trigger_tokens: int | None = None,
@@ -1160,6 +1161,7 @@ def init_session(schema: dict, non_interactive: bool = False,
         "tools":           tools,
         "structured":      structured,
         "tool_dispatch":   tool_dispatch,
+        "tool_executor":   tool_executor,
         "session_id":      session_id,
         "cache_key":       cache_key or session_id,
         "model":           model,
@@ -1200,6 +1202,8 @@ def init_session(schema: dict, non_interactive: bool = False,
                    "mode": behaviour.get("call_delivery_mode"),
                    "non_interactive": non_interactive,
                    "cwd": os.getcwd(),
+                   "sandbox_policy": (tool_executor.policy.metadata()
+                                      if getattr(tool_executor, "policy", None) else None),
                    "ts": session_start_ts})
     if resumed_from:
         loaded = _load_messages_snapshot(model, resumed_from)
@@ -1443,7 +1447,12 @@ def _handle_tool_call(
         streamed = False
     else:
         try:
-            result, log_data = dispatch(name, args, tool_dispatch)
+            executor = session.get("tool_executor")
+            if executor is None:
+                result, log_data = dispatch(name, args, tool_dispatch)
+            else:
+                result, log_data = executor.execute(
+                    name, args, entry, session={"session_id": session.get("session_id", "")})
             streamed = log_data.pop("streamed", False)
         except FatalToolDispatchError as e:
             result = str(e)
@@ -1576,7 +1585,8 @@ class _InputCollector:
 
 
 def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dict, task: str,
-             *, cancel: CancelToken | None = None) -> SessionResult:
+             *, cancel: CancelToken | None = None,
+             tool_executor: "ToolExecutor | None" = None) -> SessionResult:
     """Run one agent turn and return a :class:`SessionResult`.
 
     The result reflects the session state at the end of the turn.
@@ -1588,6 +1598,8 @@ def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dict
     global _in_turn
     _in_turn = True
     try:
+        if tool_executor is not None:
+            session["tool_executor"] = tool_executor
         return _run_turn(client, model, session, task, cancel=cancel)
     finally:
         _in_turn = False
@@ -2077,6 +2089,7 @@ def run_task(
     max_output_tokens: int | None = None,
     strict_cache_proof: bool = True,
     on_event: "EventCallback | None" = None,
+    tool_executor: "ToolExecutor | None" = None,
     compaction_enabled: bool | None = None,
     compaction_trigger_tokens: int | None = None,
     compaction_target_tokens: int | None = None,
@@ -2105,6 +2118,7 @@ def run_task(
         max_output_tokens=max_output_tokens,
         strict_cache_proof=strict_cache_proof,
         on_event=on_event,
+        tool_executor=tool_executor,
         compaction_enabled=compaction_enabled,
         compaction_trigger_tokens=compaction_trigger_tokens,
         compaction_target_tokens=compaction_target_tokens,
@@ -2132,6 +2146,7 @@ def run(
     max_output_tokens: int | None = None,
     strict_cache_proof: bool = True,
     on_event: "EventCallback | None" = None,
+    tool_executor: "ToolExecutor | None" = None,
     compaction_enabled: bool | None = None,
     compaction_trigger_tokens: int | None = None,
     compaction_target_tokens: int | None = None,
@@ -2160,6 +2175,7 @@ def run(
         max_output_tokens=max_output_tokens,
         strict_cache_proof=strict_cache_proof,
         on_event=on_event,
+        tool_executor=tool_executor,
         compaction_enabled=compaction_enabled,
         compaction_trigger_tokens=compaction_trigger_tokens,
         compaction_target_tokens=compaction_target_tokens,

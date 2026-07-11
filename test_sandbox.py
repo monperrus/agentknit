@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -6,7 +7,9 @@ from agentknit import BubblewrapToolExecutor, SandboxPolicy, init_session
 
 
 def executor(tmp_path: Path) -> BubblewrapToolExecutor:
-    return BubblewrapToolExecutor(SandboxPolicy(workspace=tmp_path))
+    # File-policy tests do not invoke bwrap; a known executable keeps them
+    # portable while production construction still checks the default runtime.
+    return BubblewrapToolExecutor(SandboxPolicy(workspace=tmp_path), binary="true")
 
 
 def test_file_tools_stay_inside_workspace(tmp_path: Path) -> None:
@@ -44,7 +47,15 @@ def test_custom_and_async_tools_are_rejected(tmp_path: Path) -> None:
 
 
 def test_shell_runs_in_workspace_with_a_minimal_environment(tmp_path: Path) -> None:
-    result, _ = executor(tmp_path).execute("execute_shell_command",
+    if shutil.which("bwrap") is None:
+        pytest.skip("Bubblewrap is not installed on this runner")
+    e = BubblewrapToolExecutor(SandboxPolicy(workspace=tmp_path))
+    result, _ = e.execute("execute_shell_command",
         {"command": "printf '%s:%s' \"$PWD\" \"${SECRET:-missing}\""},
         {"python_function": "t_run", "param_map": {}}, session={})
     assert '"stdout":"/workspace:missing"' in result
+
+
+def test_missing_bubblewrap_fails_closed(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="refusing to fall back"):
+        BubblewrapToolExecutor(SandboxPolicy(workspace=tmp_path), binary="does-not-exist")

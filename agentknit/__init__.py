@@ -23,6 +23,7 @@ from ._core import (
     CancelToken,
     EventCallback,
     _default_event_handler,
+    enable_osc8_hyperlinks,
     subscribe,
     unsubscribe,
     on,
@@ -63,6 +64,14 @@ from .tool import (
     register_tools_in_library,
 )
 
+from .sandbox import (
+    ToolExecutor,
+    ToolSessionContext,
+    LocalToolExecutor,
+    SandboxPolicy,
+    BubblewrapToolExecutor,
+)
+
 from ._tool_spec import (
     parse_tool_spec_from_docstring,
     extract_tool_specs_from_module,
@@ -95,6 +104,7 @@ __all__ = [
     "main", "run",
     "validate_schema", "create_client", "run_task", "run_repl", "run_async_repl",
     "SessionResult", "CancelToken", "EventCallback", "_default_event_handler",
+    "enable_osc8_hyperlinks",
     "subscribe", "unsubscribe", "on",
     "run_turn", "init_session", "dispatch", "load_or_probe",
     "check_and_display_pricing", "extract_inline_calls", "schema_props",
@@ -110,6 +120,8 @@ __all__ = [
     "Tool",
     "build_tool_spec",
     "register_tools_in_library",
+    "ToolExecutor", "ToolSessionContext", "LocalToolExecutor",
+    "SandboxPolicy", "BubblewrapToolExecutor",
     "SlashCommand",
     "SlashCommandRegistry",
     "slash_registry",

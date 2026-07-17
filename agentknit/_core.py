@@ -413,9 +413,39 @@ _DEFAULT_TOOLS = [
 ]
 
 
-# ── probe / cache ─────────────────────────────────────────────────────────────
+# ── spec loading ──────────────────────────────────────────────────────────────
 
-def load_or_probe(model: str, endpoint: str, force: bool) -> dict:
+def load_specification(model: str, endpoint: str, force: bool) -> dict:
+    """Load an agent spec for `model`, without ever probing the model itself.
+
+    agentknit only consumes specs — it does not generate them by talking to a
+    model. This resolves, in order:
+
+    1. A ``run://`` URI (in `endpoint` or `model`): looks for a cached
+       ``agent_spec_<model>.json`` next to the project root; if absent,
+       writes and returns a default spec (structured tool calls, default
+       tool set) rather than probing the subprocess binary.
+    2. A direct path to a ``.json`` schema file (`model` ending in
+       ``.json``): loaded and returned as-is.
+    3. A cached spec file for `model`, checked in order under the project
+       root as ``agent_spec_<model>.json``, ``inferred_tool_schema_<model>.json``,
+       then ``tool_schema_<model>.json``.
+    4. If none exists and `endpoint` is given: a default spec is generated
+       and cached, same as case 1.
+    5. Otherwise: raises `AgentSpecInvalidError` telling the caller to run
+       an external probing tool (e.g. `llmprobe`) to generate a real spec.
+
+    Set `force=True` to skip the cache and regenerate a default spec.
+
+    :param model: Model identifier, a `run://` URI, or a path to a `.json`
+        spec file.
+    :param endpoint: Base URL of the OpenAI-compatible endpoint, or a
+        `run://` URI.
+    :param force: If True, ignore any cached spec and regenerate a default.
+    :returns: The loaded (or freshly generated default) spec as a dict.
+    :raises AgentSpecInvalidError: If no cached spec exists and `endpoint`
+        is falsy, so no default spec can be generated either.
+    """
     # Spec JSON files live in the project root (parent of the package directory).
     here = Path(__file__).resolve().parent.parent
 
@@ -2101,7 +2131,7 @@ def create_client(schema: dict) -> "openai.OpenAI | SubprocessOpenAI":
     """Create an API client from a loaded agent spec schema.
 
     Handles subprocess (run://), OpenCode GitHub-Copilot, and standard
-    OpenAI-compatible endpoints.  Call :func:`load_or_probe` first to obtain
+    OpenAI-compatible endpoints.  Call :func:`load_specification` first to obtain
     a schema.
 
     If the schema contains a ``max_rpm`` key, it is passed to the OpenAI
@@ -2148,7 +2178,7 @@ def run_task(
 
     Example::
 
-        schema = load_or_probe("qwen/qwen3-8b", "https://openrouter.ai/api/v1", False)
+        schema = load_specification("qwen/qwen3-8b", "https://openrouter.ai/api/v1", False)
         result = run_task(schema, "List the files in /tmp")
         print(result.final_reply)
         print(result.usage)
@@ -2206,7 +2236,7 @@ def run(
     if schema is None:
         if model is None or endpoint is None:
             raise TypeError("run() requires either `schema` or both `model` and `endpoint`.")
-        schema = load_or_probe(model, endpoint, reprobe)
+        schema = load_specification(model, endpoint, reprobe)
     elif model is not None or endpoint is not None:
         raise TypeError("run() accepts either `schema` or `model`/`endpoint`, not both.")
     if task is None:
@@ -2557,7 +2587,7 @@ def main() -> None:
         enable_osc8_hyperlinks()
     args   = parse_args()
     try:
-        schema = load_or_probe(args.model, args.endpoint, args.reprobe)
+        schema = load_specification(args.model, args.endpoint, args.reprobe)
         validate_schema(schema)
         check_and_display_pricing(schema)
     except AgentSpecDisabledError as e:

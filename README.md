@@ -13,9 +13,9 @@ pip install agentknit
 ### Programmatic
 
 ```python
-from agentknit import load_or_probe, run_task
+from agentknit import load_specification, run_task
 
-schema = load_or_probe("qwen/qwen3-8b", "https://openrouter.ai/api/v1", force=False)
+schema = load_specification("qwen/qwen3-8b", "https://openrouter.ai/api/v1", force=False)
 result = run_task(schema, "List the files in /tmp")
 print(result.final_reply)
 ```
@@ -146,7 +146,7 @@ specific event type:
 ```python
 from agentknit import subscribe, init_session, run_turn, create_client
 
-schema = load_or_probe("qwen/qwen3-8b", "https://openrouter.ai/api/v1", False)
+schema = load_specification("qwen/qwen3-8b", "https://openrouter.ai/api/v1", False)
 client = create_client(schema)
 session = init_session(schema)
 

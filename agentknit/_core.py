@@ -831,6 +831,8 @@ def print_session_history(session: dict) -> None:
                         args = json.loads(fn.get("arguments", "{}"))
                     except json.JSONDecodeError:
                         args = {}
+                    if not isinstance(args, dict):
+                        args = {}
                     print(fmt_call(name, args))
             elif content:
                 if not structured:
@@ -1768,6 +1770,8 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
                     try:
                         args = json.loads(tc.function.arguments)
                     except json.JSONDecodeError:
+                        args = {}
+                    if not isinstance(args, dict):
                         args = {}
                     result = _handle_tool_call(tc.function.name, args, session)
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": result,

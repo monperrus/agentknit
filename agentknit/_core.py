@@ -460,7 +460,7 @@ def load_specification(model: str, endpoint: str, force: bool) -> dict:
         endpoint = run_endpoint
         path = here / f"agent_spec_{safe_model_name(model)}.json"
         if path.exists() and not force:
-            print(f"{DIM}Using cached spec at {path.name}{RESET}")
+            print(f"{DIM}Using specification from {path.name}{RESET}")
             with path.open() as f:
                 return json.load(f)
         data = {

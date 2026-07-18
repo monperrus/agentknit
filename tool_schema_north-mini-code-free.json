@@ -1,0 +1,111 @@
+{
+  "model": "north-mini-code-free",
+  "endpoint": "https://opencode.ai/zen/v1",
+  "status": "default",
+  "tool_specs": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read and return the contents of a file at the specified path.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Path to the file."
+            },
+            "offset": {
+              "type": "integer",
+              "description": "Line number to start reading from (1-indexed)."
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Maximum number of lines to read."
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "write_file",
+        "description": "Write (or overwrite) a file at the specified path with the given content.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Path to the file."
+            },
+            "content": {
+              "type": "string",
+              "description": "Content to write."
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "str_replace",
+        "description": "Edit an existing file by replacing a specific substring.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "old_str": {
+              "type": "string"
+            },
+            "new_str": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "old_str",
+            "new_str"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "execute_shell_command",
+        "description": "Execute a shell command and return its stdout, stderr, and exit code.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ]
+        }
+      }
+    }
+  ],
+  "tools": [
+    "t_read",
+    "t_write",
+    "t_update",
+    "t_run"
+  ],
+  "behaviour": {
+    "call_delivery_mode": "structured_tool_calls"
+  }
+}

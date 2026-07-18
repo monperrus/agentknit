@@ -449,7 +449,7 @@ def load_specification(model: str, endpoint: str, force: bool) -> dict:
     # Spec JSON files live in the project root (parent of the package directory).
     here = Path(__file__).resolve().parent.parent
 
-    # run:// URI → subprocess binary; use cached spec or generate a default.
+    # run:// URI → subprocess binary; use cached spec or return in-memory default.
     # Accept run:// in either endpoint or model (CLI convenience).
     binary_path = _parse_run_uri(endpoint) or _parse_run_uri(model)
     if binary_path is not None:
@@ -458,7 +458,7 @@ def load_specification(model: str, endpoint: str, force: bool) -> dict:
         if _parse_run_uri(model):
             model = binary_path
         endpoint = run_endpoint
-        # Write spec next to the binary, not into site-packages.
+        # Check for an existing spec next to the binary.
         spec_dir = Path(binary_path).resolve().parent
         path = spec_dir / f"agent_spec_{safe_model_name(model)}.json"
         if path.exists() and not force:
@@ -473,9 +473,11 @@ def load_specification(model: str, endpoint: str, force: bool) -> dict:
             "tools":       _DEFAULT_TOOLS,
             "behaviour":   {"call_delivery_mode": "structured_tool_calls"},
         }
-        with path.open("w") as f:
-            json.dump(data, f, indent=2)
-        print(f"{DIM}Generated default spec at {path.name}{RESET}")
+        if force:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w") as f:
+                json.dump(data, f, indent=2)
+            print(f"{DIM}Generated default spec at {path.name}{RESET}")
         return data
 
     # Accept a direct path to a JSON schema file.
@@ -515,9 +517,10 @@ def load_specification(model: str, endpoint: str, force: bool) -> dict:
             "tools": _DEFAULT_TOOLS,
             "behaviour": {"call_delivery_mode": "structured_tool_calls"},
         }
-        with cwd_path.open("w") as f:
-            json.dump(data, f, indent=2)
-        print(f"{DIM}Generated default spec at {cwd_path.name}{RESET}")
+        if force:
+            with cwd_path.open("w") as f:
+                json.dump(data, f, indent=2)
+            print(f"{DIM}Generated default spec at {cwd_path.name}{RESET}")
         return data
 
     raise AgentSpecInvalidError(

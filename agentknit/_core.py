@@ -415,33 +415,31 @@ _DEFAULT_TOOLS = [
 
 # ── spec loading ──────────────────────────────────────────────────────────────
 
-def load_specification(model: str, endpoint: str, force: bool) -> dict:
+def load_specification(model: str, endpoint: str) -> dict:
     """Load an agent spec for `model`, without ever probing the model itself.
 
     agentknit only consumes specs — it does not generate them by talking to a
     model. This resolves, in order:
 
     1. A ``run://`` URI (in `endpoint` or `model`): looks for a cached
-       ``agent_spec_<model>.json`` next to the project root; if absent,
-       writes and returns a default spec (structured tool calls, default
-       tool set) rather than probing the subprocess binary.
+       ``agent_spec_<model>.json`` next to the binary; if absent returns an
+       in-memory default spec (structured tool calls, default tool set).
     2. A direct path to a ``.json`` schema file (`model` ending in
        ``.json``): loaded and returned as-is.
-    3. A cached spec file for `model`, checked in order under the project
-       root as ``agent_spec_<model>.json``, ``inferred_tool_schema_<model>.json``,
-       then ``tool_schema_<model>.json``.
-    4. If none exists and `endpoint` is given: a default spec is generated
-       and cached, same as case 1.
-    5. Otherwise: raises `AgentSpecInvalidError` telling the caller to run
+    3. A cached spec file for `model`, checked in order under the package
+       directory as ``agent_spec_<model>.json``,
+       ``inferred_tool_schema_<model>.json``, then
+       ``tool_schema_<model>.json``.
+    4. A spec file for `model` in the current working directory.
+    5. If none exists and `endpoint` is given: returns an in-memory default
+       spec.
+    6. Otherwise: raises `AgentSpecInvalidError` telling the caller to run
        an external probing tool (e.g. `llmprobe`) to generate a real spec.
-
-    Set `force=True` to skip the cache and regenerate a default spec.
 
     :param model: Model identifier, a `run://` URI, or a path to a `.json`
         spec file.
     :param endpoint: Base URL of the OpenAI-compatible endpoint, or a
         `run://` URI.
-    :param force: If True, ignore any cached spec and regenerate a default.
     :returns: The loaded (or freshly generated default) spec as a dict.
     :raises AgentSpecInvalidError: If no cached spec exists and `endpoint`
         is falsy, so no default spec can be generated either.
@@ -461,11 +459,11 @@ def load_specification(model: str, endpoint: str, force: bool) -> dict:
         # Check for an existing spec next to the binary.
         spec_dir = Path(binary_path).resolve().parent
         path = spec_dir / f"agent_spec_{safe_model_name(model)}.json"
-        if path.exists() and not force:
+        if path.exists():
             print(f"{DIM}Using specification from {path.name}{RESET}")
             with path.open() as f:
                 return json.load(f)
-        data = {
+        return {
             "model":       model,
             "endpoint":    endpoint,
             "status":      "default",
@@ -473,12 +471,6 @@ def load_specification(model: str, endpoint: str, force: bool) -> dict:
             "tools":       _DEFAULT_TOOLS,
             "behaviour":   {"call_delivery_mode": "structured_tool_calls"},
         }
-        if force:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("w") as f:
-                json.dump(data, f, indent=2)
-            print(f"{DIM}Generated default spec at {path.name}{RESET}")
-        return data
 
     # Accept a direct path to a JSON schema file.
     if model.endswith(".json"):
@@ -496,20 +488,20 @@ def load_specification(model: str, endpoint: str, force: bool) -> dict:
         here / f"inferred_tool_schema_{safe_model_name(model)}.json",
         here / f"tool_schema_{safe_model_name(model)}.json",
     ):
-        if candidate.exists() and not force:
+        if candidate.exists():
             print(f"{DIM}Using cached probe at {candidate.name}{RESET}")
             with candidate.open() as f:
                 return json.load(f)
 
     # Also check the working directory for a user-created spec.
     cwd_path = Path.cwd() / f"agent_spec_{safe_model_name(model)}.json"
-    if cwd_path.exists() and not force:
+    if cwd_path.exists():
         print(f"{DIM}Using specification from {cwd_path.name}{RESET}")
         with cwd_path.open() as f:
             return json.load(f)
 
     if endpoint:
-        data = {
+        return {
             "model": model,
             "endpoint": endpoint,
             "status": "default",
@@ -517,11 +509,6 @@ def load_specification(model: str, endpoint: str, force: bool) -> dict:
             "tools": _DEFAULT_TOOLS,
             "behaviour": {"call_delivery_mode": "structured_tool_calls"},
         }
-        if force:
-            with cwd_path.open("w") as f:
-                json.dump(data, f, indent=2)
-            print(f"{DIM}Generated default spec at {cwd_path.name}{RESET}")
-        return data
 
     raise AgentSpecInvalidError(
         f"No agent spec found for '{model}'. "
@@ -2293,7 +2280,7 @@ def run_task(
 
     Example::
 
-        schema = load_specification("qwen/qwen3-8b", "https://openrouter.ai/api/v1", False)
+        schema = load_specification("qwen/qwen3-8b", "https://openrouter.ai/api/v1")
         result = run_task(schema, "List the files in /tmp")
         print(result.final_reply)
         print(result.usage)
@@ -2331,7 +2318,6 @@ def run(
     *,
     model: str | None = None,
     endpoint: str | None = None,
-    reprobe: bool = False,
     non_interactive: bool = False,
     session_id: str | None = None,
     cache_key: str | None = None,
@@ -2355,7 +2341,7 @@ def run(
     if schema is None:
         if model is None or endpoint is None:
             raise TypeError("run() requires either `schema` or both `model` and `endpoint`.")
-        schema = load_specification(model, endpoint, reprobe)
+        schema = load_specification(model, endpoint)
     elif model is not None or endpoint is not None:
         raise TypeError("run() accepts either `schema` or `model`/`endpoint`, not both.")
     if task is None:
@@ -2692,7 +2678,6 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Probe + agent loop for any OpenRouter model.")
     p.add_argument("model", help="Model ID, e.g. qwen/qwen3-vl-32b-instruct")
     p.add_argument("task", nargs="*", help="Task to run (omit for REPL or stdin)")
-    p.add_argument("--reprobe", action="store_true", help="Force re-probing")
     p.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="Endpoint base URL")
     p.add_argument("--non-interactive", action="store_true", dest="non_interactive",
                    help="Remove ask_user_question from the tool schema; "
@@ -2720,7 +2705,7 @@ def main() -> None:
         enable_osc8_hyperlinks()
     args   = parse_args()
     try:
-        schema = load_specification(args.model, args.endpoint, args.reprobe)
+        schema = load_specification(args.model, args.endpoint)
         validate_schema(schema)
         check_and_display_pricing(schema)
     except AgentSpecDisabledError as e:

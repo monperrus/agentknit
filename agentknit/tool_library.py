@@ -347,8 +347,13 @@ def t_write(path: str, content: str) -> tuple[str, dict]:
         p = Path(os.path.expanduser(path))
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
+        added = len(content.splitlines()) if content else 0
         r = f"OK: wrote {len(content)} bytes to {path}"
-        return r, {"result": r}
+        return r, {
+            "result": r,
+            "files": [path],
+            "diff_summary": {"path": path, "added": added, "removed": 0},
+        }
     except Exception as e:
         r = f"ERROR: {e}"
         return r, {"result": r}
@@ -433,8 +438,13 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "") -> t
         # Count lines and UTF-8 characters in the replaced text
         old_lines = old.count('\n') + (1 if old else 0)
         old_chars = len(old)
+        new_lines = new.count('\n') + (1 if new else 0)
         r = f"OK: replaced {n} occurrence(s) ({old_lines} line(s), {old_chars} UTF-8 character(s)) in {path}"
-        return r, {"result": r}
+        return r, {
+            "result": r,
+            "files": [path],
+            "diff_summary": {"path": path, "added": new_lines, "removed": old_lines},
+        }
     except Exception as e:
         r = f"ERROR: {e}"
         return r, {"result": r}

@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from agentknit._core import subscribe, unsubscribe, on, _emit, _default_event_handler
+import os
+import tempfile
+from pathlib import Path
+
+from agentknit._core import subscribe, unsubscribe, on, _emit, _default_event_handler, _handle_tool_call
+from agentknit.tool_library import t_write, t_update
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -187,3 +192,93 @@ def test_default_handler_used_when_no_on_event():
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
+
+
+# ── tool_result / file-change metadata ───────────────────────────────────────
+
+def _session_with_tool_dispatch(tmp_path: str | None = None) -> dict:
+    import tempfile
+    log_dir = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    log_path = log_dir / "test.jsonl"
+    return {
+        "on_event": _default_event_handler,
+        "_event_handlers": {},
+        "tool_dispatch": {
+            "write_file": {"python_function": "t_write", "param_map": {}},
+            "str_replace": {"python_function": "t_update",
+                            "param_map": {"old_str": "old", "new_str": "new"}},
+            "read_file": {"python_function": "t_read", "param_map": {}},
+        },
+        "non_interactive": True,
+        "session_id": "test-session",
+        "log_path": log_path,
+    }
+
+
+def test_tool_result_includes_files_on_write():
+    """tool_result event includes files list after t_write."""
+    with tempfile.TemporaryDirectory() as tmp:
+        session = _session_with_tool_dispatch(tmp)
+        received = []
+
+        def handler(et: str, data: dict) -> None:
+            if et == "tool_result":
+                received.append(data)
+
+        subscribe(session, "tool_result", handler)
+
+        path = str(Path(tmp) / "test.txt")
+        _handle_tool_call("write_file", {"path": path, "content": "hello world"}, session)
+
+    assert len(received) == 1
+    assert received[0]["files"] == [path]
+    assert received[0]["diff_summary"] is not None
+    assert received[0]["diff_summary"]["path"] == path
+    assert received[0]["diff_summary"]["added"] == 1  # one line
+
+
+def test_tool_result_includes_files_on_update():
+    """tool_result event includes files and diff_summary after str_replace."""
+    with tempfile.TemporaryDirectory() as tmp:
+        session = _session_with_tool_dispatch(tmp)
+        received = []
+
+        def handler(et: str, data: dict) -> None:
+            if et == "tool_result":
+                received.append(data)
+
+        subscribe(session, "tool_result", handler)
+
+        path = str(Path(tmp) / "test.txt")
+        Path(path).write_text("line1\nline2\nline3\n")
+        _handle_tool_call("str_replace", {"path": path,
+                                          "old_str": "line2",
+                                          "new_str": "line2_modified\nline2b"}, session)
+
+    assert len(received) == 1
+    assert received[0]["files"] == [path]
+    assert received[0]["diff_summary"] is not None
+    assert received[0]["diff_summary"]["path"] == path
+    assert received[0]["diff_summary"]["removed"] == 1   # "line2" is 1 line
+    assert received[0]["diff_summary"]["added"] == 2     # "line2_modified\nline2b" is 2 lines
+
+
+def test_tool_result_files_is_none_for_read():
+    """tool_result event has files=None for tools that don't touch files."""
+    with tempfile.TemporaryDirectory() as tmp:
+        session = _session_with_tool_dispatch(tmp)
+        received = []
+
+        def handler(et: str, data: dict) -> None:
+            if et == "tool_result":
+                received.append(data)
+
+        subscribe(session, "tool_result", handler)
+
+        path = str(Path(tmp) / "existing.txt")
+        Path(path).write_text("content")
+        _handle_tool_call("read_file", {"path": path}, session)
+
+    assert len(received) == 1
+    assert received[0].get("files") is None
+    assert received[0].get("diff_summary") is None

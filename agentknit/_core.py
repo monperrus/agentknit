@@ -1642,7 +1642,12 @@ def _handle_tool_call(
             if command:
                 fmt = fmt_read_result_with_command(command, result, streamed=streamed)
 
-    _emit(session, "tool_result", name=name, result=result, streamed=streamed,
+    # Pass file-change metadata from log_data to the event payload
+    # so consumers (e.g. Telegram controller) can show "Changed path +5 -2".
+    _emit(session, "tool_result",
+          name=name, result=result, streamed=streamed,
+          files=log_data.get("files"),
+          diff_summary=log_data.get("diff_summary"),
           fmt=fmt)
     _log(session, {"type": "tool_result", "name": name,
                    "python_function": entry.get("python_function"),

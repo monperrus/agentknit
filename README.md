@@ -204,7 +204,7 @@ generic `on_event` handler.
 | Event type | When it fires | Data keys |
 |---|---|---|
 | `tool_call` | Before dispatching a tool | `name`, `args`, `fmt` |
-| `tool_result` | After receiving tool result | `name`, `result`, `streamed`, `fmt` |
+| `tool_result` | After receiving tool result | `name`, `result`, `streamed`, `files`, `diff_summary`, `fmt` |
 | `content_delta` | Streaming text chunk from the model | `text`, `first`, `no_newline`, `fmt` |
 | `reasoning_delta` | Streaming reasoning trace | `text`, `first`, `no_newline`, `fmt` |
 | `content_stream_end` | End of a streaming content sequence | `no_newline`, `fmt` |
@@ -222,6 +222,21 @@ Every event data dict includes a `"fmt"` key containing a pre-formatted ANSI
 string suitable for direct printing to a terminal — this is what the default
 handler uses.  Custom handlers may ignore `"fmt"` and use the other keys
 instead.
+
+The `tool_result` event includes additional metadata for file-writing tools:
+
+- **`files`** — a list of file paths that were created or modified by the tool
+  call (e.g. `["src/main.py"]`).  `None` for tools that don't touch files.
+- **`diff_summary`** — a dict with `path`, `added` (lines added), and `removed`
+  (lines removed) so consumers can display summaries like `+5 -2 src/main.py`
+  without re-reading the file.  `None` for non-file tools.
+
+Example::
+
+    subscribe(session, "tool_result", lambda et, data: print(
+        f"Files changed: {data.get('files')}  "
+        f"Diff: {data.get('diff_summary')}"
+    ))
 
 ## Context Compaction
 

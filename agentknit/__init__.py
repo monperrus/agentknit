@@ -54,6 +54,7 @@ from ._core import (
     _find_snapshot_in_other_models,
     _handle_tool_call,
     _complete,
+    compact_session,
     _compact_session,
     _maybe_compact,
 )
@@ -116,7 +117,7 @@ __all__ = [
     "_parse_run_uri", "_expand_aliases", "_open_log",
     "_save_messages_snapshot", "_load_messages_snapshot",
     "_find_snapshot_in_other_models", "_handle_tool_call", "_complete",
-    "_compact_session", "_maybe_compact",
+    "compact_session", "_compact_session", "_maybe_compact",
     "Tool",
     "build_tool_spec",
     "register_tools_in_library",

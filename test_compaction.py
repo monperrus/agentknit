@@ -7,8 +7,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from agentknit._core import (
+    compact_session,
     _compact_session,
     _maybe_compact,
+    _apply_compaction_policy,
     DEFAULT_COMPACTION_TRIGGER_TOKENS,
     DEFAULT_COMPACTION_TARGET_TOKENS,
     DEFAULT_COMPACTION_KEEP_LAST_TURNS,
@@ -288,6 +290,155 @@ def test_compact_session_summary_metadata():
     summary_msg = session["messages"][1]
     assert summary_msg.get("compacted_summary") is True
     assert "ts" in summary_msg
+
+
+def test_compact_session_returns_true_on_success_false_on_noop():
+    session = _make_session(messages=[
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+    ])
+    client = _make_fake_client("summary")
+    assert compact_session(client, "m", session) is True
+
+    empty = _make_session(messages=[{"role": "system", "content": "sys"}])
+    assert compact_session(client, "m", empty) is False
+
+
+def test_compact_session_min_chars_guard():
+    """Compaction is skipped while the compactable text is below the minimum."""
+    session = _make_session(
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "short"},
+            {"role": "assistant", "content": "reply"},
+        ],
+        compaction_keep_last_turns=0,
+        compaction_min_chars=1000,
+    )
+    client = _make_fake_client("summary")
+    assert compact_session(client, "m", session) is False
+    assert len(client.calls) == 0
+
+    # Enough text → compaction proceeds.
+    session["messages"][1]["content"] = "x" * 2000
+    assert compact_session(client, "m", session) is True
+
+
+def test_compact_session_never_splits_tool_call_pairs():
+    """The keep boundary snaps back to a user message, keeping tool pairs intact."""
+    session = _make_session(
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "tool_calls": [{"id": "t1", "type": "function",
+                                                  "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "t1", "content": "result"},
+            {"role": "assistant", "content": "final"},
+        ],
+        compaction_keep_last_turns=2,  # naive split would land on the tool message
+    )
+    client = _make_fake_client("summary")
+    assert compact_session(client, "m", session) is True
+
+    roles = [m["role"] for m in session["messages"]]
+    # Snapped back to u2: system + summary + [u2, tool_calls, tool, final].
+    assert roles == ["system", "assistant", "user", "assistant", "tool", "assistant"]
+    assert session["messages"][2]["content"] == "u2"
+
+
+def test_compact_session_no_clean_boundary_is_noop():
+    """If no user boundary exists inside the compactable range, skip."""
+    session = _make_session(
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "assistant", "content": "a2"},
+        ],
+        compaction_keep_last_turns=2,
+    )
+    client = _make_fake_client("summary")
+    # Snapping back from a2 reaches u1, the first non-system message: the
+    # prefix would be empty, so nothing is compacted.
+    assert compact_session(client, "m", session) is False
+    assert len(client.calls) == 0
+
+
+# ── _apply_compaction_policy ──────────────────────────────────────────────────
+
+_POLICY_MESSAGES = [
+    {"role": "system", "content": "sys"},
+    {"role": "user", "content": "u1"},
+    {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "u2"},
+    {"role": "assistant", "content": "a2"},
+]
+
+
+def test_policy_every_turn_compacts_at_turn_end_unconditionally():
+    session = _make_session(messages=list(_POLICY_MESSAGES),
+                            compaction_policy="every_turn",
+                            compaction_keep_last_turns=0)
+    client = _make_fake_client("summary")
+    usage = _FakeUsage(prompt_tokens=10)  # far below any threshold
+    _apply_compaction_policy(client, "m", session, usage, phase="turn_end")
+    assert len(client.calls) == 1
+    assert session["messages"][1].get("compacted_summary") is True
+
+
+def test_policy_every_turn_keeps_threshold_backstop_mid_turn():
+    session = _make_session(messages=list(_POLICY_MESSAGES),
+                            compaction_policy="every_turn")
+    client = _make_fake_client("summary")
+    # Below threshold mid-turn: nothing happens.
+    _apply_compaction_policy(client, "m", session, _FakeUsage(prompt_tokens=10),
+                             phase="mid_turn")
+    assert len(client.calls) == 0
+    # Above threshold mid-turn: the backstop fires.
+    _apply_compaction_policy(client, "m", session,
+                             _FakeUsage(prompt_tokens=DEFAULT_COMPACTION_TRIGGER_TOKENS),
+                             phase="mid_turn")
+    assert len(client.calls) == 1
+
+
+def test_policy_threshold_is_default_and_ignores_turn_end():
+    session = _make_session(messages=list(_POLICY_MESSAGES))
+    client = _make_fake_client("summary")
+    _apply_compaction_policy(client, "m", session, _FakeUsage(prompt_tokens=10),
+                             phase="turn_end")
+    assert len(client.calls) == 0
+
+
+def test_policy_never_disables_all_compaction():
+    session = _make_session(messages=list(_POLICY_MESSAGES),
+                            compaction_policy="never")
+    client = _make_fake_client("summary")
+    big = _FakeUsage(prompt_tokens=DEFAULT_COMPACTION_TRIGGER_TOKENS * 2)
+    _apply_compaction_policy(client, "m", session, big, phase="mid_turn")
+    _apply_compaction_policy(client, "m", session, big, phase="turn_end")
+    assert len(client.calls) == 0
+
+
+def test_policy_callable_receives_phase_and_decides():
+    seen: list[str] = []
+
+    def policy(session, usage, phase):
+        seen.append(phase)
+        return phase == "turn_end"
+
+    session = _make_session(messages=list(_POLICY_MESSAGES),
+                            compaction_policy=policy,
+                            compaction_keep_last_turns=0)
+    client = _make_fake_client("summary")
+    _apply_compaction_policy(client, "m", session, None, phase="mid_turn")
+    assert len(client.calls) == 0
+    _apply_compaction_policy(client, "m", session, None, phase="turn_end")
+    assert len(client.calls) == 1
+    assert seen == ["mid_turn", "turn_end"]
 
 
 def test_compact_session_turn_count():

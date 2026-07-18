@@ -1156,6 +1156,8 @@ def init_session(schema: dict, non_interactive: bool = False,
                  compaction_trigger_tokens: int | None = None,
                  compaction_target_tokens: int | None = None,
                  compaction_keep_last_turns: int | None = None,
+                 compaction_policy: "str | Callable[..., bool] | None" = None,
+                 compaction_min_chars: int | None = None,
                  ) -> dict:
     """Build a stateful session dict.
 
@@ -1179,9 +1181,21 @@ def init_session(schema: dict, non_interactive: bool = False,
     * ``compaction_target_tokens`` — ``max_tokens`` passed to the compaction
       summary call.  Defaults to the schema's ``compaction_target_tokens`` or
       ``20_000``.
-    * ``compaction_keep_last_turns`` — number of recent raw turns to keep
-      after compaction.  Defaults to the schema's
-      ``compaction_keep_last_turns`` or ``2``.
+    * ``compaction_keep_last_turns`` — number of recent raw non-system
+      *messages* to keep after compaction (the boundary is snapped back to a
+      user message so tool-call pairs are never split).  Defaults to the
+      schema's ``compaction_keep_last_turns`` or ``2``.
+    * ``compaction_policy`` — when automatic compaction runs:
+      ``"threshold"`` (default, token threshold with hysteresis),
+      ``"every_turn"`` (unconditional at each turn end, threshold as mid-turn
+      backstop), ``"never"``, or a callable
+      ``policy(session, usage, phase) -> bool`` with *phase* one of
+      ``"mid_turn"`` / ``"turn_end"``.  Defaults to the schema's
+      ``compaction_policy`` or ``"threshold"``.
+    * ``compaction_min_chars`` — skip compaction while the compactable text
+      is shorter than this many characters (guards against summaries that
+      are longer than what they replace).  Defaults to the schema's
+      ``compaction_min_chars`` or ``0`` (no minimum).
     """
     schema = _normalize_schema(schema)
     tools         = schema.get("inferred_tool_schema") or []
@@ -1267,6 +1281,14 @@ def init_session(schema: dict, non_interactive: bool = False,
         "compaction_keep_last_turns": (
             compaction_keep_last_turns if compaction_keep_last_turns is not None
             else schema.get("compaction_keep_last_turns", DEFAULT_COMPACTION_KEEP_LAST_TURNS)
+        ),
+        "compaction_policy": (
+            compaction_policy if compaction_policy is not None
+            else schema.get("compaction_policy", "threshold")
+        ),
+        "compaction_min_chars": (
+            compaction_min_chars if compaction_min_chars is not None
+            else schema.get("compaction_min_chars", 0)
         ),
         "compaction_last_prompt_tokens": 0,
     }
@@ -1390,17 +1412,26 @@ def _complete(client: openai.OpenAI | SubprocessOpenAI, session: dict, **kwargs)
     return resp
 
 
-def _compact_session(
+def compact_session(
     client: openai.OpenAI | SubprocessOpenAI,
     model: str,
     session: dict,
-) -> None:
+) -> bool:
     """Replace the oldest portion of the conversation with a continuation-oriented summary.
 
     Keeps the system prompt and the most recent *compaction_keep_last_turns*
-    turns in raw form.  The middle portion is summarized by the model and
-    replaced with a single assistant message tagged with
-    ``compacted_summary=true`` metadata.
+    non-system messages in raw form.  The kept boundary is snapped back to a
+    user message so an assistant ``tool_calls`` message is never separated
+    from its ``tool`` results (which would produce an API-invalid sequence)
+    and the summary is always followed by a user turn.  The compacted portion
+    is summarized by the model and replaced with a single assistant message
+    tagged with ``compacted_summary=true`` metadata.
+
+    If ``compaction_min_chars`` is set on the session, compaction is skipped
+    when the compactable text is shorter than that — summarizing a tiny
+    history costs an LLM call and can *grow* the context.
+
+    Returns ``True`` if the history was compacted, ``False`` if skipped.
     """
     messages = session["messages"]
     keep = session.get("compaction_keep_last_turns", DEFAULT_COMPACTION_KEEP_LAST_TURNS)
@@ -1408,11 +1439,39 @@ def _compact_session(
     # Find the boundary: keep system prompt + last `keep` non-system messages.
     non_system_indices = [i for i, m in enumerate(messages) if m.get("role") != "system"]
     if len(non_system_indices) <= keep:
-        return  # nothing to compact
+        return False  # nothing to compact
 
     split_idx = non_system_indices[-keep] if keep > 0 else len(messages)
+    if keep > 0 and messages[split_idx].get("role") != "user":
+        # Snap to a user-message boundary.  Prefer snapping back (keeping
+        # more); if that would empty the compactable prefix, snap forward
+        # (keeping fewer) instead.
+        back = split_idx
+        while back > non_system_indices[0] and messages[back].get("role") != "user":
+            back -= 1
+        if messages[back].get("role") == "user" and back > non_system_indices[0]:
+            split_idx = back
+        else:
+            fwd = split_idx
+            while fwd < len(messages) and messages[fwd].get("role") != "user":
+                fwd += 1
+            if fwd == len(messages):
+                return False  # no clean boundary to split at
+            split_idx = fwd
+
     prefix = messages[:split_idx]
     suffix = messages[split_idx:]
+
+    if not any(m.get("role") != "system" for m in prefix):
+        return False  # boundary snapping left nothing to compact
+
+    min_chars = session.get("compaction_min_chars", 0) or 0
+    if min_chars:
+        compactable_chars = sum(
+            len(m.get("content") or "") for m in prefix if m.get("role") != "system"
+        )
+        if compactable_chars < min_chars:
+            return False
 
     # Build a temporary message list for the compaction call.
     compaction_messages = list(prefix)
@@ -1430,11 +1489,11 @@ def _compact_session(
               fmt=f"\n{RED}Compaction failed: {exc}{RESET}")
         _log(session, {"type": "compaction_error", "error": str(exc),
                        "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-        return
+        return False
 
     summary = (resp.choices[0].message.content or "").strip()
     if not summary:
-        return
+        return False
 
     # Replace the compacted prefix with a single summary message.
     system_msgs = [m for m in prefix if m.get("role") == "system"]
@@ -1448,7 +1507,7 @@ def _compact_session(
 
     compacted_turns = len(prefix) - len(system_msgs)
     compacted_chars = sum(
-        len(m.get("content", "")) for m in prefix if m.get("role") != "system"
+        len(m.get("content") or "") for m in prefix if m.get("role") != "system"
     )
     summary_chars = len(summary)
     ratio = compacted_chars / summary_chars if summary_chars else 0.0
@@ -1466,6 +1525,11 @@ def _compact_session(
                    "summary": summary,
                    "ts": datetime.datetime.now().isoformat(timespec="seconds")})
     _save_messages_snapshot(session)
+    return True
+
+
+# Backward-compatible alias for the pre-public name.
+_compact_session = compact_session
 
 
 def _maybe_compact(
@@ -1493,6 +1557,39 @@ def _maybe_compact(
     if prompt_tok >= trigger and prompt_tok > last + hysteresis:
         _compact_session(client, model, session)
         session["compaction_last_prompt_tokens"] = prompt_tok
+
+
+def _apply_compaction_policy(
+    client: openai.OpenAI | SubprocessOpenAI,
+    model: str,
+    session: dict,
+    usage,
+    phase: str,
+) -> None:
+    """Run the session's compaction policy at *phase*.
+
+    *phase* is ``"mid_turn"`` (after each completion inside the tool loop) or
+    ``"turn_end"`` (after a successful final answer).  Policies:
+
+    * ``"threshold"`` (default) — token-threshold compaction with hysteresis
+      mid-turn (the historical behaviour); nothing extra at turn end.
+    * ``"every_turn"`` — unconditional compaction at turn end, with the
+      threshold check kept mid-turn as an overflow backstop.
+    * ``"never"`` — no automatic compaction.
+    * a callable ``policy(session, usage, phase) -> bool`` — compaction runs
+      whenever it returns true.  The callable bypasses ``compaction_enabled``.
+    """
+    policy = session.get("compaction_policy", "threshold")
+    if callable(policy):
+        if policy(session, usage, phase):
+            compact_session(client, model, session)
+        return
+    if policy == "never":
+        return
+    if phase == "mid_turn":
+        _maybe_compact(client, model, session, usage)
+    elif policy == "every_turn":
+        compact_session(client, model, session)
 
 
 def _handle_tool_call(
@@ -1760,7 +1857,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
                 _log(session, {"type": "error", "error": err,
                                "ts": datetime.datetime.now().isoformat(timespec="seconds")})
                 return _session_result(session)
-            _maybe_compact(client, model, session, usage)
+            _apply_compaction_policy(client, model, session, usage, phase="mid_turn")
 
             if total_tokens > max_tokens:
                 totals = session["usage_totals"]
@@ -1842,7 +1939,11 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
             _emit(session, "session_usage", **t,
                   fmt=(f"{DIM}{MAG}[session tokens] prompt {t['prompt']:,}{cached_part}  |  "
                        f"completion {t['completion']:,}  |  total {t['total']:,}{eff_part}{RESET}\n"))
-            return _session_result(session)
+            # Build the result before turn-end compaction so final_reply
+            # survives even when the policy summarizes the whole history away.
+            result = _session_result(session)
+            _apply_compaction_policy(client, model, session, usage, phase="turn_end")
+            return result
     except CacheProofError as exc:
         err = str(exc)
         _emit(session, "error", text=err, fmt=f"\n{RED}Error: {err}{RESET}")
@@ -2170,6 +2271,8 @@ def run_task(
     compaction_trigger_tokens: int | None = None,
     compaction_target_tokens: int | None = None,
     compaction_keep_last_turns: int | None = None,
+    compaction_policy: "str | Callable[..., bool] | None" = None,
+    compaction_min_chars: int | None = None,
 ) -> SessionResult:
     """Run a single task against the agent and return a :class:`SessionResult`.
 
@@ -2199,6 +2302,8 @@ def run_task(
         compaction_trigger_tokens=compaction_trigger_tokens,
         compaction_target_tokens=compaction_target_tokens,
         compaction_keep_last_turns=compaction_keep_last_turns,
+        compaction_policy=compaction_policy,
+        compaction_min_chars=compaction_min_chars,
     )
     try:
         return run_turn(client, schema["model"], session, task)
@@ -2227,6 +2332,8 @@ def run(
     compaction_trigger_tokens: int | None = None,
     compaction_target_tokens: int | None = None,
     compaction_keep_last_turns: int | None = None,
+    compaction_policy: "str | Callable[..., bool] | None" = None,
+    compaction_min_chars: int | None = None,
 ) -> SessionResult:
     """Backward-compatible helper for :func:`run_task`.
 
@@ -2256,6 +2363,8 @@ def run(
         compaction_trigger_tokens=compaction_trigger_tokens,
         compaction_target_tokens=compaction_target_tokens,
         compaction_keep_last_turns=compaction_keep_last_turns,
+        compaction_policy=compaction_policy,
+        compaction_min_chars=compaction_min_chars,
     )
 
 
@@ -2282,6 +2391,8 @@ def _repl_setup(
     compaction_trigger_tokens: int | None = None,
     compaction_target_tokens: int | None = None,
     compaction_keep_last_turns: int | None = None,
+    compaction_policy: "str | Callable[..., bool] | None" = None,
+    compaction_min_chars: int | None = None,
 ) -> tuple:
     """Common REPL setup: validate, create client, init session, return (client, session, model, hist_file)."""
     validate_schema(schema)
@@ -2299,6 +2410,8 @@ def _repl_setup(
         compaction_trigger_tokens=compaction_trigger_tokens,
         compaction_target_tokens=compaction_target_tokens,
         compaction_keep_last_turns=compaction_keep_last_turns,
+        compaction_policy=compaction_policy,
+        compaction_min_chars=compaction_min_chars,
     )
     model = schema["model"]
 
@@ -2440,6 +2553,8 @@ def run_repl(
     compaction_trigger_tokens: int | None = None,
     compaction_target_tokens: int | None = None,
     compaction_keep_last_turns: int | None = None,
+    compaction_policy: "str | Callable[..., bool] | None" = None,
+    compaction_min_chars: int | None = None,
 ) -> None:
     """Start an interactive REPL session against the agent (sync, no background thread).
 
@@ -2466,6 +2581,8 @@ def run_repl(
         compaction_trigger_tokens=compaction_trigger_tokens,
         compaction_target_tokens=compaction_target_tokens,
         compaction_keep_last_turns=compaction_keep_last_turns,
+        compaction_policy=compaction_policy,
+        compaction_min_chars=compaction_min_chars,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], "agent-probe")
 
@@ -2504,6 +2621,8 @@ def run_async_repl(
     compaction_trigger_tokens: int | None = None,
     compaction_target_tokens: int | None = None,
     compaction_keep_last_turns: int | None = None,
+    compaction_policy: "str | Callable[..., bool] | None" = None,
+    compaction_min_chars: int | None = None,
 ) -> None:
     """Start an interactive REPL session with a background input queue.
 
@@ -2529,6 +2648,8 @@ def run_async_repl(
         compaction_trigger_tokens=compaction_trigger_tokens,
         compaction_target_tokens=compaction_target_tokens,
         compaction_keep_last_turns=compaction_keep_last_turns,
+        compaction_policy=compaction_policy,
+        compaction_min_chars=compaction_min_chars,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], "agent-probe")
 

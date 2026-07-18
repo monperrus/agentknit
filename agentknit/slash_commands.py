@@ -3,9 +3,10 @@ Slash-command dispatch for the agentknit REPL.
 
 Provides a registry and built-in commands:
 
-* ``/clear``  – reset session context (keep system prompt)
-* ``/model``  – list / switch models (queries the endpoint's ``/models`` endpoint)
-* ``/usage``  – show token usage for the current session
+* ``/clear``   – reset session context (keep system prompt)
+* ``/compact`` – summarize older history into a compact continuation summary
+* ``/model``   – list / switch models (queries the endpoint's ``/models`` endpoint)
+* ``/usage``   – show token usage for the current session
 
 Commands are intercepted in the REPL loop before the input is sent to the model.
 
@@ -129,6 +130,18 @@ def _handle_clear(session: dict, client: Any, model: str, args: str) -> None:
     # Reset compaction watermark so the next growth cycle can trigger again.
     session["compaction_last_prompt_tokens"] = 0
     print(f"{GREEN}Context cleared. Session history has been reset.{RESET}")
+
+
+def _handle_compact(session: dict, client: Any, model: str, args: str) -> None:
+    """Compact the session history into a continuation summary now."""
+    from ._core import compact_session
+
+    before = len(session["messages"])
+    if compact_session(client, session.get("model", model), session):
+        after = len(session["messages"])
+        print(f"{GREEN}Context compacted: {before} → {after} messages.{RESET}")
+    else:
+        print(f"{YEL}Nothing to compact.{RESET}")
 
 
 def _fetch_models_from_endpoint(endpoint: str, api_key: str) -> list[dict]:
@@ -274,6 +287,11 @@ REGISTRY.register(SlashCommand(
     handler=_handle_clear,
 ))
 REGISTRY.register(SlashCommand(
+    name="compact",
+    description="Summarize older history into a compact continuation summary.",
+    handler=_handle_compact,
+))
+REGISTRY.register(SlashCommand(
     name="model",
     description="List available models or switch: /model <model-id>.",
     handler=_handle_model,
@@ -296,17 +314,18 @@ REGISTRY.register(SlashCommand(
 slash_tool_ctx: dict = {"session": None, "client": None, "model": None}
 
 _HANDLERS: dict[str, Callable] = {
-    "clear": _handle_clear,
-    "model": _handle_model,
-    "usage": _handle_usage,
-    "help":  _handle_help,
+    "clear":   _handle_clear,
+    "compact": _handle_compact,
+    "model":   _handle_model,
+    "usage":   _handle_usage,
+    "help":    _handle_help,
 }
 
 
 def t_slash_command(command: str, args: str = "") -> tuple[str, dict]:
     """Run a slash command and return its output as a tool result.
 
-    command must be one of: clear, model, usage, help.
+    command must be one of: clear, compact, model, usage, help.
     For 'model', pass a model-id in args to switch; omit to list.
 
     Populate :data:`slash_tool_ctx` with the live session, client, and model
@@ -333,7 +352,7 @@ from .tool import Tool as _Tool  # noqa: E402
 
 SLASH_COMMAND_TOOL = _Tool(
     "slash_command",
-    "Run a slash command. command: one of clear, model, usage, help. "
+    "Run a slash command. command: one of clear, compact, model, usage, help. "
     "For 'model', pass a model-id in args to switch; omit args to list.",
     t_slash_command,
     parameters={
@@ -341,7 +360,7 @@ SLASH_COMMAND_TOOL = _Tool(
         "properties": {
             "command": {
                 "type": "string",
-                "enum": ["clear", "model", "usage", "help"],
+                "enum": ["clear", "compact", "model", "usage", "help"],
                 "description": "Slash command to run.",
             },
             "args": {

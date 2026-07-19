@@ -1142,8 +1142,32 @@ def _expand_aliases(
     return tools, tool_dispatch
 
 
+_REQUIRED_SESSION_KEYS = frozenset({
+    "messages", "tools", "structured", "tool_dispatch", "session_id",
+    "cache_key", "model", "endpoint", "non_interactive", "usage_totals",
+    "provider", "max_output_tokens", "strict_cache_proof", "llm_call_count",
+    "on_event", "streaming", "options", "session_start_ts",
+    "compaction_enabled", "compaction_trigger_tokens", "compaction_target_tokens",
+    "compaction_keep_last_turns", "compaction_policy", "compaction_min_chars",
+    "compaction_last_prompt_tokens",
+})
+
+
+def _validate_session_dict(session: dict) -> None:
+    """Check that *session* has all keys required for restoration.
+
+    Raises ``ValueError`` if any required key is missing.
+    """
+    missing = _REQUIRED_SESSION_KEYS - set(session.keys())
+    if missing:
+        raise ValueError(
+            f"Session dict is missing required keys: {', '.join(sorted(missing))}"
+        )
+
+
 def init_session(schema: dict, non_interactive: bool = False,
                  resumed_from: str | None = None,
+                 session: dict | None = None,
                  system_prompt_supplement: str = "",
                  cache_key: str | None = None,
                  max_output_tokens: int | None = None,
@@ -1168,6 +1192,12 @@ def init_session(schema: dict, non_interactive: bool = False,
     `cache_key` (e.g. derived from the working directory) to keep reusing a
     provider's prefix cache *without* resuming the prior conversation: that
     requires `resumed_from`, which is the only thing that loads past messages.
+
+    When *session* is provided (a dict previously returned by this function),
+    the function restores that session's state — messages, usage totals,
+    tool dispatch, event subscriptions, etc. — into a freshly initialized
+    session.  A new log file is opened and compaction state is reset.
+    Keyword arguments act as overrides on the restored session.
 
     Compaction (keyword-only arguments):
 
@@ -1218,6 +1248,49 @@ def init_session(schema: dict, non_interactive: bool = False,
         tools = [t for t in tools
                  if ((t.get("function") or t).get("name")) not in ask_tool_names]
 
+    # ── Restore from an existing session dict ──────────────────────────
+    if session is not None:
+        _validate_session_dict(session)
+        # Messages, usage totals, call count, session id, cache key, etc.
+        # are preserved from the saved session.
+        restored = dict(session)  # shallow copy – we override several keys below
+        restored["log_path"] = _open_log(model, restored.get("session_id", uuid.uuid4().hex[:12]))
+        # Reset compaction state so the new session starts fresh.
+        restored["compaction_last_prompt_tokens"] = 0
+        # Replace event handler if a new one was provided.
+        if on_event is not None:
+            restored["on_event"] = on_event
+        # Apply keyword overrides that the caller explicitly passed.
+        if cache_key is not None:
+            restored["cache_key"] = cache_key
+        if max_output_tokens is not None:
+            restored["max_output_tokens"] = max_output_tokens
+        if tool_executor is not None:
+            restored["tool_executor"] = tool_executor
+        # Compaction overrides.
+        if compaction_enabled is not None:
+            restored["compaction_enabled"] = compaction_enabled
+        if compaction_trigger_tokens is not None:
+            restored["compaction_trigger_tokens"] = compaction_trigger_tokens
+        if compaction_target_tokens is not None:
+            restored["compaction_target_tokens"] = compaction_target_tokens
+        if compaction_keep_last_turns is not None:
+            restored["compaction_keep_last_turns"] = compaction_keep_last_turns
+        if compaction_policy is not None:
+            restored["compaction_policy"] = compaction_policy
+        if compaction_min_chars is not None:
+            restored["compaction_min_chars"] = compaction_min_chars
+        # Log the restoration event.
+        _log(restored, {"type": "session_restored",
+                        "session_id": restored.get("session_id"),
+                        "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+        _emit(restored, "session_restored",
+              session_id=restored.get("session_id"),
+              fmt=f"{DIM}Restored session {restored.get('session_id')} "
+                  f"({len(restored.get('messages', []))} messages){RESET}")
+        return restored
+
+    # ── Build a brand-new session ──────────────────────────────────────
     sys_msg = (
         "You are a helpful coding agent. Use the provided tools to complete the task."
         " When finished, reply in plain text."

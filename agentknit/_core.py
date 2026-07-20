@@ -2081,12 +2081,10 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
             _emit(session, "final_answer", text=text.strip(),
                   fmt="" if already_streamed else f"\n{GREEN}{BOLD}» {RESET}{text.strip()}\n")
             t = session["usage_totals"]
-            cached_part = f", {t['cached']:,} cached" if t["cached"] else ""
-            eff = max(0, t['prompt'] - t['cached']) + t['completion']
-            eff_part = f"  |  effective {eff:,}" if t['cached'] else ""
+            cached_part = f"  |  cached {t['cached']:,}" if t["cached"] else ""
             _emit(session, "session_usage", **t,
                   fmt=(f"{DIM}{MAG}[session tokens] prompt {t['prompt']:,}{cached_part}  |  "
-                       f"completion {t['completion']:,}  |  total {t['total']:,}{eff_part}{RESET}\n"))
+                       f"completion {t['completion']:,}{RESET}\n"))
             # Build the result before turn-end compaction so final_reply
             # survives even when the policy summarizes the whole history away.
             result = _session_result(session)

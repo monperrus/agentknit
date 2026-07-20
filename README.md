@@ -217,6 +217,7 @@ generic `on_event` handler.
 | `session_resumed` | Session history was loaded from disk | `session_id`, `messages_loaded`, `fmt` |
 | `provider_pinned` | OpenRouter provider was locked for the session | `provider`, `fmt` |
 | `compaction` | Context was compacted into a summary | `summary`, `compacted_turns`, `fmt` |
+| `cache_cold` | Resumed turn missed the (expired) prefix cache | `age`, `fmt` |
 
 Every event data dict includes a `"fmt"` key containing a pre-formatted ANSI
 string suitable for direct printing to a terminal — this is what the default

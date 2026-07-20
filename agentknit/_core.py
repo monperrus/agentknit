@@ -71,6 +71,11 @@ Event types
 ``provider_pinned``
     OpenRouter provider was locked for the remainder of the session.  Data:
     ``provider``, ``fmt``.
+``cache_cold``
+    A resumed turn was served with no cache hit because the prefix cache
+    had expired (last message older than ``CACHE_COLD_GAP_SECONDS``).
+    Strict cache-proof enforcement is relaxed for this case.  Data:
+    ``age``, ``fmt``.
 
 Every data dict contains a ``\"fmt\"`` key with a pre-formatted ANSI string.
 """
@@ -118,6 +123,14 @@ LOG_BASE = Path.home() / ".local" / "share" / "agent_probe"
 DEFAULT_COMPACTION_TRIGGER_TOKENS = 100_000
 DEFAULT_COMPACTION_TARGET_TOKENS = 20_000
 DEFAULT_COMPACTION_KEEP_LAST_TURNS = 2
+
+# Prefix-cache "cold resume" threshold.  Provider prefix caches expire after
+# a few minutes (OpenAI ~5–10 min, Anthropic 5 min).  If the last message in
+# a resumed session is older than this, the cache has almost certainly
+# evaporated through no fault of the caller, so strict cache-proof
+# enforcement would spuriously abort the turn.  Such turns are marked "cold"
+# and warn instead of failing — see :func:`_enforce_cache_proof`.
+CACHE_COLD_GAP_SECONDS = 3600
 
 _COMPACTION_PROMPT = (
     "Summarize the conversation above into a dense, structured summary "
@@ -767,14 +780,61 @@ def fmt_usage(usage, *, compaction_trigger: int | None = None) -> str:
     return "  |  ".join(parts)
 
 
+def _last_message_age_seconds(session: dict) -> float | None:
+    """Seconds since the last message in the session, or None if unmeasurable.
+
+    When resuming a session after a break, the provider's prefix cache may
+    have expired (OpenAI caches live ~5–10 min, Anthropic ~5 min).  This
+    lets the caller distinguish a genuine cache miss from a cold resume.
+    """
+    messages = session.get("messages") or []
+    last_ts = None
+    for msg in reversed(messages):
+        ts = msg.get("ts") if isinstance(msg, dict) else None
+        if ts:
+            last_ts = ts
+            break
+    if not last_ts:
+        return None
+    try:
+        last_dt = datetime.datetime.fromisoformat(last_ts)
+    except (ValueError, TypeError):
+        return None
+    now = datetime.datetime.now()
+    return (now - last_dt).total_seconds()
+
+
 def _enforce_cache_proof(session: dict, usage) -> None:
-    """Fail closed when strict cache mode does not observe a cache hit."""
+    """Fail closed when strict cache mode does not observe a cache hit.
+
+    A resumed session whose last message is older than
+    :data:`CACHE_COLD_GAP_SECONDS` is assumed to be a *cold resume*: the
+    provider's prefix cache has expired through no fault of the caller, so
+    the first post-resume call is allowed to miss without raising.  A dim
+    notice is emitted instead so the output is not broken.
+    """
     if not session.get("strict_cache_proof", True):
         return
     if session.get("llm_call_count", 0) <= 1:
         return
+
     has_cache_proof = getattr(usage, "has_cache_proof", False)
     cached_tokens = getattr(usage, "cached_tokens", 0) or 0
+
+    # Detect a cold resume: the caller paused long enough that the provider's
+    # prefix cache has surely expired.  Don't break the turn for something
+    # outside the caller's control; warn once instead.
+    age = _last_message_age_seconds(session)
+    cold_resume = age is not None and age > CACHE_COLD_GAP_SECONDS
+    if cold_resume and not (has_cache_proof and cached_tokens > 0):
+        notice = (
+            f"{DIM}Prefix cache expired (last message {int(age)}s old); "
+            f"this turn was not served from cache and will re-process the prompt.{RESET}"
+        )
+        _emit(session, "cache_cold", age=int(age), fmt=notice)
+        session["_cache_cold_warned"] = True
+        return
+
     if not has_cache_proof:
         raise CacheProofError(
             "Strict cache mode requires explicit cache accounting from the server "
@@ -1928,12 +1988,23 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
                                "cache_creation_tokens": getattr(usage, "cache_creation_tokens", 0) or 0,
                                "ts": datetime.datetime.now().isoformat(timespec="seconds")})
             elif session.get("strict_cache_proof", True) and session.get("llm_call_count", 0) >= 1:
-                err = ("Strict cache mode requires usage metadata on every LLM call after the first, "
-                       "but the server returned no usage block.")
-                _emit(session, "error", text=err, fmt=f"\n{RED}Error: {err}{RESET}")
-                _log(session, {"type": "error", "error": err,
-                               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-                return _session_result(session)
+                age = _last_message_age_seconds(session)
+                if age is not None and age > CACHE_COLD_GAP_SECONDS:
+                    # Cold resume: cache has expired; a missing usage block on
+                    # the first post-resume call is not a hard violation.
+                    notice = (
+                        f"{DIM}Prefix cache expired (last message {int(age)}s old); "
+                        f"usage metadata unavailable this turn.{RESET}"
+                    )
+                    _emit(session, "cache_cold", age=int(age), fmt=notice)
+                    session["_cache_cold_warned"] = True
+                else:
+                    err = ("Strict cache mode requires usage metadata on every LLM call after the first, "
+                           "but the server returned no usage block.")
+                    _emit(session, "error", text=err, fmt=f"\n{RED}Error: {err}{RESET}")
+                    _log(session, {"type": "error", "error": err,
+                                   "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                    return _session_result(session)
             _apply_compaction_policy(client, model, session, usage, phase="mid_turn")
 
             if total_tokens > max_tokens:

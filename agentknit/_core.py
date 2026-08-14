@@ -880,11 +880,25 @@ def inline_system_prompt(tools: list[dict]) -> str:
 
 def read_repl_input(prompt: str) -> str:
     """Read one REPL task, coalescing multiline clipboard paste into one turn."""
-    text = input(prompt)
+    # Do not use input() here. With readline enabled, input() can read ahead
+    # into readline's private buffer. select() cannot see those buffered paste
+    # lines, so a multiline paste was split into separate REPL turns.
+    print(prompt.replace("\x01", "").replace("\x02", ""), end="", flush=True)
+    first_line = sys.stdin.readline()
+    if first_line == "":
+        raise EOFError
+
+    text = first_line.rstrip("\n")
     # If paste arrives line-by-line, keep draining until input has been idle briefly.
     while select.select([sys.stdin], [], [], PASTE_IDLE_TIMEOUT_S)[0]:
-        text += "\n" + sys.stdin.readline().rstrip("\n")
-    return text.rstrip("\n")
+        line = sys.stdin.readline()
+        if line == "":
+            break
+        text += "\n" + line.rstrip("\n")
+    text = text.rstrip("\n")
+    if text:
+        readline.add_history(text)
+    return text
 
 
 def print_session_history(session: dict) -> None:

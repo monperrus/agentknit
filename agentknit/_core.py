@@ -2528,13 +2528,54 @@ def run(
     )
 
 
-def _build_resume_cmd(model: str, session_id: str, default_program: str | None = None) -> str:
+# Executables that are the agentknit CLI itself: they take <model> as a
+# positional argument, so the resume hint must repeat it.  Any other
+# executable (a wrapper such as `agent-glm-5.2.py`) pins the model itself
+# and must be resumed without it.
+_FRAMEWORK_CLI_NAMES = frozenset({"agentknit", "agent-probe"})
+
+
+def _is_framework_cli(program: str) -> bool:
+    """Return True if *program* is the agentknit CLI rather than a wrapper."""
+    if not program:
+        return False
+    if Path(program).name in _FRAMEWORK_CLI_NAMES:
+        return True
+    try:
+        return Path(program).resolve() == Path(__file__).resolve()
+    except (OSError, ValueError):
+        return False
+
+
+def _build_resume_cmd(
+    model: str,
+    session_id: str,
+    default_program: str | None = None,
+    include_model: bool | None = None,
+) -> str:
+    """Build the ``Resume: ...`` hint printed when a session ends.
+
+    Resolution order:
+
+    1. ``AGENTKNIT_RESUME_COMMAND`` — wrappers that need full control set it;
+       the value is used verbatim, with just ``--session`` appended.
+    2. The running executable (``sys.argv[0]``, or *default_program*).
+       The ``<model>`` argument is appended only when that executable is
+       the agentknit CLI itself; wrapper executables embed the model, so
+       their resume command is ``<executable> --session <id>``.
+
+    *include_model* forces the decision (``True``/``False``) instead of
+    deriving it from the program name.
+    """
     program = os.environ.get("AGENTKNIT_RESUME_COMMAND")
     if program:
         return f"{program} --session {session_id}"
     if default_program is None:
         default_program = sys.argv[0]
-    return f"{default_program} {model} --session {session_id}"
+    if include_model is None:
+        include_model = _is_framework_cli(default_program)
+    model_part = f"{model} " if include_model else ""
+    return f"{default_program} {model_part}--session {session_id}"
 
 
 def _repl_setup(
@@ -2744,7 +2785,7 @@ def run_repl(
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
     )
-    resume_cmd = _build_resume_cmd(model, session["session_id"], "agent-probe")
+    resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
 
     display_name = schema.get("display_name", f"agentknit {model}")
     print(f"{BOLD}{display_name}{RESET}  (type 'exit' to quit)\n")
@@ -2811,7 +2852,7 @@ def run_async_repl(
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
     )
-    resume_cmd = _build_resume_cmd(model, session["session_id"], "agent-probe")
+    resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
 
     display_name = schema.get("display_name", f"agentknit {model}")
     print(f"{BOLD}{display_name}{RESET}  (type 'exit' to quit)\n")

@@ -841,6 +841,7 @@ def _enforce_cache_proof(session: dict, usage) -> None:
             "after the first LLM call, but this response exposed no cache-proof field."
         )
     if cached_tokens <= 0:
+        # Some servers only caches eligible prefixes of at least N tokens (eg GPT-5.6 at least 1024 tokens).
         raise CacheProofError(
             "Strict cache mode requires cached_tokens > 0 after the first LLM call, "
             "but the server reported no cache hit."

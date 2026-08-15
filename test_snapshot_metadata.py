@@ -195,12 +195,14 @@ def test_save_snapshot_records_custom_tools(monkeypatch):
 
 
 def test_save_snapshot_records_auth_config(monkeypatch):
+    """One key source only in metadata.auth: keyring XOR key_env (never both)."""
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
         core_mod = _patched_commit(monkeypatch)
         orig_log_base = core_mod.LOG_BASE
         core_mod.LOG_BASE = base
         try:
+            # Keyring present (even alongside key_env) → keyring wins, key_env dropped.
             session = _make_session(
                 messages=[{"role": "user", "content": "hi"}],
                 model="glm-5.2",
@@ -213,18 +215,51 @@ def test_save_snapshot_records_auth_config(monkeypatch):
             assert data["metadata"]["auth"] == {
                 "keyring_service": "z.ai", "keyring_username": "api_key",
             }
-            # No auth config in the session → empty dict, never a key value.
+            assert "key_env" not in data["metadata"]["auth"]
+            # Env-var-only auth → key_env alone.
             session2 = _make_session(
+                messages=[{"role": "user", "content": "hi"}],
+                model="glm-5.2",
+                session_id="sess-env",
+            )
+            session2["auth"] = {"key_env": "MISTRAL_API_KEY"}
+            _save_messages_snapshot(session2)
+            data2 = json.loads(
+                (base / safe_model_name("glm-5.2") / "sess-env_messages.json").read_text())
+            assert data2["metadata"]["auth"] == {"key_env": "MISTRAL_API_KEY"}
+            # No auth config in the session → empty dict, never a key value.
+            session3 = _make_session(
                 messages=[{"role": "user", "content": "hi"}],
                 model="glm-5.2",
                 session_id="sess-noauth",
             )
-            _save_messages_snapshot(session2)
-            data2 = json.loads(
+            _save_messages_snapshot(session3)
+            data3 = json.loads(
                 (base / safe_model_name("glm-5.2") / "sess-noauth_messages.json").read_text())
-            assert data2["metadata"]["auth"] == {}
+            assert data3["metadata"]["auth"] == {}
         finally:
             core_mod.LOG_BASE = orig_log_base
+
+
+def test_init_session_auth_picks_single_key_source():
+    """init_session records keyring XOR key_env, matching _get_key_for_schema."""
+    schema = {
+        "model": "m", "endpoint": "https://e/v1",
+        "tool_specs": [], "tools": [],
+    }
+    # Both configured → keyring wins.
+    both = dict(schema, keyring_service="z.ai", keyring_username="api_key",
+                key_env="ZAI_API_KEY")
+    s = __import__("agentknit").init_session(both)
+    assert s["auth"] == {"keyring_service": "z.ai", "keyring_username": "api_key"}
+    # Only env → env.
+    env_only = dict(schema, key_env="MISTRAL_API_KEY")
+    s2 = __import__("agentknit").init_session(env_only)
+    assert s2["auth"] == {"key_env": "MISTRAL_API_KEY"}
+    # Auth scheme is recorded alongside either source.
+    scheme = dict(schema, auth="opencode-github-copilot", key_env="X")
+    s3 = __import__("agentknit").init_session(scheme)
+    assert s3["auth"] == {"auth": "opencode-github-copilot", "key_env": "X"}
 
 
 def test_save_skips_when_only_system_messages():

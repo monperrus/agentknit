@@ -44,7 +44,7 @@ An agent spec is a JSON file that describes how agentknit should connect to a mo
 | `keyring_service` | string | no | Keyring service name for retrieving the API key via the system keyring. |
 | `keyring_username` | string | no | Keyring username.  Also used (uppercased, `-` → `_`) as a fallback env var name when the keyring lookup fails. |
 
-Key resolution order: `keyring_service`+`keyring_username` → `key_env` → `OPENROUTER_API_KEY`.
+Key resolution order: `keyring_service`+`keyring_username` → `key_env` → `OPENROUTER_API_KEY`.  Specify one key source only (`key_env` **xor** `keyring_service`+`keyring_username`); the first matching source wins, and session snapshots record only that single source.
 
 ### Pricing limits
 

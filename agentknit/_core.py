@@ -1481,10 +1481,17 @@ def init_session(schema: dict, non_interactive: bool = False,
         "model":           model,
         "endpoint":        schema.get("endpoint", ""),
         # Auth *configuration* (never the resolved key itself) so a snapshot
-        # can be replayed without the wrapper that injected it.
-        "auth":            {k: schema[k] for k in
-                           ("auth", "key_env", "keyring_service", "keyring_username")
-                           if schema.get(k) is not None},
+        # can be replayed without the wrapper that injected it.  One key
+        # source only: keyring (keyring_service+keyring_username) takes
+        # precedence over key_env, mirroring _get_key_for_schema's resolution
+        # order.  "auth" (the scheme, e.g. "opencode-github-copilot") is
+        # orthogonal and always recorded when present.
+        "auth":            ({k: schema[k] for k in
+                            ("auth", "keyring_service", "keyring_username")
+                            if schema.get(k) is not None}
+                           if schema.get("keyring_service") and schema.get("keyring_username")
+                           else {k: schema[k] for k in ("auth", "key_env")
+                                 if schema.get(k) is not None}),
         "log_path":        _open_log(model, session_id),
         "non_interactive": non_interactive,
         "usage_totals":    {"prompt": 0, "completion": 0, "total": 0,

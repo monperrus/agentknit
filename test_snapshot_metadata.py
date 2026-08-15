@@ -194,6 +194,39 @@ def test_save_snapshot_records_custom_tools(monkeypatch):
             core_mod.LOG_BASE = orig_log_base
 
 
+def test_save_snapshot_records_auth_config(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        core_mod = _patched_commit(monkeypatch)
+        orig_log_base = core_mod.LOG_BASE
+        core_mod.LOG_BASE = base
+        try:
+            session = _make_session(
+                messages=[{"role": "user", "content": "hi"}],
+                model="glm-5.2",
+                session_id="sess-auth",
+            )
+            session["auth"] = {"keyring_service": "z.ai", "keyring_username": "api_key"}
+            _save_messages_snapshot(session)
+            data = json.loads(
+                (base / safe_model_name("glm-5.2") / "sess-auth_messages.json").read_text())
+            assert data["metadata"]["auth"] == {
+                "keyring_service": "z.ai", "keyring_username": "api_key",
+            }
+            # No auth config in the session → empty dict, never a key value.
+            session2 = _make_session(
+                messages=[{"role": "user", "content": "hi"}],
+                model="glm-5.2",
+                session_id="sess-noauth",
+            )
+            _save_messages_snapshot(session2)
+            data2 = json.loads(
+                (base / safe_model_name("glm-5.2") / "sess-noauth_messages.json").read_text())
+            assert data2["metadata"]["auth"] == {}
+        finally:
+            core_mod.LOG_BASE = orig_log_base
+
+
 def test_save_skips_when_only_system_messages():
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)

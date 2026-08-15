@@ -1061,6 +1061,7 @@ def _save_messages_snapshot(session: dict) -> None:
             "default_tools": default_tools,
             "tools": tool_names,
             "agentknit_commit": _agentknit_commit(),
+            "auth": dict(session.get("auth") or {}),
         },
         "messages": annotated,
     }
@@ -1479,6 +1480,11 @@ def init_session(schema: dict, non_interactive: bool = False,
         "cache_key":       cache_key or session_id,
         "model":           model,
         "endpoint":        schema.get("endpoint", ""),
+        # Auth *configuration* (never the resolved key itself) so a snapshot
+        # can be replayed without the wrapper that injected it.
+        "auth":            {k: schema[k] for k in
+                           ("auth", "key_env", "keyring_service", "keyring_username")
+                           if schema.get(k) is not None},
         "log_path":        _open_log(model, session_id),
         "non_interactive": non_interactive,
         "usage_totals":    {"prompt": 0, "completion": 0, "total": 0,

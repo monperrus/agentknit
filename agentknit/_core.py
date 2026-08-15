@@ -132,6 +132,17 @@ DEFAULT_COMPACTION_KEEP_LAST_TURNS = 2
 # and warn instead of failing — see :func:`_enforce_cache_proof`.
 CACHE_COLD_GAP_SECONDS = 3600
 
+# Default minimum cacheable prompt size (in prompt tokens) used by
+# _enforce_cache_proof() when a session doesn't declare its own
+# min_cacheable_tokens.  0 means "no minimum" — any zero-cache response after
+# the first call is treated as a real cache miss.  Providers enforce their
+# own floor below which nothing is cached regardless of prompt content, e.g.
+# Anthropic Claude Haiku ~4096 input tokens, GPT-5.6-class models ~1024.
+# Set schema["min_cacheable_tokens"] (or pass min_cacheable_tokens=... to
+# init_session/run_task/run) to the provider's documented floor so small
+# prompts don't spuriously trip strict cache-proof mode.
+DEFAULT_MIN_CACHEABLE_TOKENS = 0
+
 _COMPACTION_PROMPT = (
     "Summarize the conversation above into a dense, structured summary "
     "optimized for continuing a coding task. Preserve all state needed to "
@@ -812,6 +823,13 @@ def _enforce_cache_proof(session: dict, usage) -> None:
     provider's prefix cache has expired through no fault of the caller, so
     the first post-resume call is allowed to miss without raising.  A dim
     notice is emitted instead so the output is not broken.
+
+    Below ``session["min_cacheable_tokens"]`` prompt tokens, providers cache
+    nothing by design (e.g. Anthropic Claude Haiku ~4096, GPT-5.6-class
+    ~1024) — such calls report ``cached_tokens == 0`` even though caching
+    works fine for larger prompts.  If the current call's prompt is below
+    that floor, a zero-cache response is treated as expected and skipped
+    rather than raised.  See :data:`DEFAULT_MIN_CACHEABLE_TOKENS`.
     """
     if not session.get("strict_cache_proof", True):
         return
@@ -820,6 +838,7 @@ def _enforce_cache_proof(session: dict, usage) -> None:
 
     has_cache_proof = getattr(usage, "has_cache_proof", False)
     cached_tokens = getattr(usage, "cached_tokens", 0) or 0
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
 
     # Detect a cold resume: the caller paused long enough that the provider's
     # prefix cache has surely expired.  Don't break the turn for something
@@ -841,7 +860,20 @@ def _enforce_cache_proof(session: dict, usage) -> None:
             "after the first LLM call, but this response exposed no cache-proof field."
         )
     if cached_tokens <= 0:
-        # Some servers only caches eligible prefixes of at least N tokens (eg GPT-5.6 at least 1024 tokens).
+        min_cacheable = session.get("min_cacheable_tokens", DEFAULT_MIN_CACHEABLE_TOKENS) or 0
+        if min_cacheable and prompt_tokens < min_cacheable:
+            notice = (
+                f"{DIM}No cache hit, but prompt ({prompt_tokens} tokens) is below the "
+                f"provider's minimum cacheable prefix ({min_cacheable} tokens); "
+                f"not a caching failure.{RESET}"
+            )
+            _emit(session, "cache_below_minimum", prompt_tokens=prompt_tokens,
+                  min_cacheable_tokens=min_cacheable, fmt=notice)
+            return
+        # Some servers only cache eligible prefixes of at least N tokens (e.g.
+        # Anthropic Claude Haiku ~4096, GPT-5.6-class models ~1024). Configure
+        # session["min_cacheable_tokens"] to that floor to avoid this raising
+        # on legitimately small prompts.
         raise CacheProofError(
             "Strict cache mode requires cached_tokens > 0 after the first LLM call, "
             "but the server reported no cache hit."
@@ -1224,7 +1256,7 @@ _REQUIRED_SESSION_KEYS = frozenset({
     "on_event", "streaming", "options", "session_start_ts",
     "compaction_enabled", "compaction_trigger_tokens", "compaction_target_tokens",
     "compaction_keep_last_turns", "compaction_policy", "compaction_min_chars",
-    "compaction_last_prompt_tokens",
+    "compaction_last_prompt_tokens", "min_cacheable_tokens",
 })
 
 
@@ -1256,6 +1288,7 @@ def init_session(schema: dict, non_interactive: bool = False,
                  compaction_keep_last_turns: int | None = None,
                  compaction_policy: "str | Callable[..., bool] | None" = None,
                  compaction_min_chars: int | None = None,
+                 min_cacheable_tokens: int | None = None,
                  ) -> dict:
     """Build a stateful session dict.
 
@@ -1300,6 +1333,14 @@ def init_session(schema: dict, non_interactive: bool = False,
       is shorter than this many characters (guards against summaries that
       are longer than what they replace).  Defaults to the schema's
       ``compaction_min_chars`` or ``0`` (no minimum).
+
+    ``min_cacheable_tokens`` — the provider's minimum cacheable prompt size,
+    in prompt tokens. Below this size the provider caches nothing by design
+    (e.g. Anthropic Claude Haiku ~4096, GPT-5.6-class models ~1024), so
+    strict cache-proof mode treats a zero-cache response as expected rather
+    than a failure when the prompt is below this floor. Defaults to the
+    schema's ``min_cacheable_tokens`` or ``0`` (no minimum — any zero-cache
+    call after the first is treated as a genuine miss).
     """
     schema = _normalize_schema(schema)
     tools         = schema.get("inferred_tool_schema") or []
@@ -1355,6 +1396,8 @@ def init_session(schema: dict, non_interactive: bool = False,
             restored["compaction_policy"] = compaction_policy
         if compaction_min_chars is not None:
             restored["compaction_min_chars"] = compaction_min_chars
+        if min_cacheable_tokens is not None:
+            restored["min_cacheable_tokens"] = min_cacheable_tokens
         # Log the restoration event.
         _log(restored, {"type": "session_restored",
                         "session_id": restored.get("session_id"),
@@ -1438,6 +1481,10 @@ def init_session(schema: dict, non_interactive: bool = False,
             else schema.get("compaction_min_chars", 0)
         ),
         "compaction_last_prompt_tokens": 0,
+        "min_cacheable_tokens": (
+            min_cacheable_tokens if min_cacheable_tokens is not None
+            else schema.get("min_cacheable_tokens", DEFAULT_MIN_CACHEABLE_TOKENS)
+        ),
     }
     _log(session, {"type": "session_start", "model": model,
                    "endpoint": schema.get("endpoint", ""),
@@ -2434,6 +2481,7 @@ def run_task(
     compaction_keep_last_turns: int | None = None,
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
+    min_cacheable_tokens: int | None = None,
 ) -> SessionResult:
     """Run a single task against the agent and return a :class:`SessionResult`.
 
@@ -2446,6 +2494,11 @@ def run_task(
         result = run_task(schema, "List the files in /tmp")
         print(result.final_reply)
         print(result.usage)
+
+    Pass ``min_cacheable_tokens=N`` (or set it in the schema) when the
+    provider has a minimum cacheable prompt size, so small prompts that
+    legitimately miss the cache don't trip strict cache-proof mode. See
+    :func:`init_session` for details.
     """
     validate_schema(schema)
     client  = create_client(schema)
@@ -2465,6 +2518,7 @@ def run_task(
         compaction_keep_last_turns=compaction_keep_last_turns,
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
+        min_cacheable_tokens=min_cacheable_tokens,
     )
     try:
         return run_turn(client, schema["model"], session, task)
@@ -2494,6 +2548,7 @@ def run(
     compaction_keep_last_turns: int | None = None,
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
+    min_cacheable_tokens: int | None = None,
 ) -> SessionResult:
     """Backward-compatible helper for :func:`run_task`.
 
@@ -2525,6 +2580,7 @@ def run(
         compaction_keep_last_turns=compaction_keep_last_turns,
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
+        min_cacheable_tokens=min_cacheable_tokens,
     )
 
 
@@ -2594,6 +2650,7 @@ def _repl_setup(
     compaction_keep_last_turns: int | None = None,
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
+    min_cacheable_tokens: int | None = None,
 ) -> tuple:
     """Common REPL setup: validate, create client, init session, return (client, session, model, hist_file)."""
     validate_schema(schema)
@@ -2613,6 +2670,7 @@ def _repl_setup(
         compaction_keep_last_turns=compaction_keep_last_turns,
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
+        min_cacheable_tokens=min_cacheable_tokens,
     )
     model = schema["model"]
 
@@ -2756,6 +2814,7 @@ def run_repl(
     compaction_keep_last_turns: int | None = None,
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
+    min_cacheable_tokens: int | None = None,
 ) -> None:
     """Start an interactive REPL session against the agent (sync, no background thread).
 
@@ -2784,6 +2843,7 @@ def run_repl(
         compaction_keep_last_turns=compaction_keep_last_turns,
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
+        min_cacheable_tokens=min_cacheable_tokens,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
 
@@ -2824,6 +2884,7 @@ def run_async_repl(
     compaction_keep_last_turns: int | None = None,
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
+    min_cacheable_tokens: int | None = None,
 ) -> None:
     """Start an interactive REPL session with a background input queue.
 
@@ -2851,6 +2912,7 @@ def run_async_repl(
         compaction_keep_last_turns=compaction_keep_last_turns,
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
+        min_cacheable_tokens=min_cacheable_tokens,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
 
@@ -2900,6 +2962,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-strict-cache-proof", action="store_true",
                    help="Disable the default fail-closed cache-proof check that "
                         "requires a nonzero cache hit on every LLM call after the first.")
+    p.add_argument("--min-cacheable-tokens", type=int, dest="min_cacheable_tokens", default=None,
+                   help="Provider's minimum cacheable prompt size in tokens (e.g. 4096 for "
+                        "Anthropic Claude Haiku, 1024 for GPT-5.6-class models). Below this "
+                        "size, a zero-cache-hit response under strict cache-proof mode is "
+                        "treated as expected rather than a failure. Overrides the spec's "
+                        "min_cacheable_tokens.")
     return p.parse_args()
 
 
@@ -2932,6 +3000,7 @@ def main() -> None:
         cache_key                = args.cache_key,
         max_output_tokens        = args.max_tokens,
         strict_cache_proof       = not args.no_strict_cache_proof,
+        min_cacheable_tokens     = args.min_cacheable_tokens,
     )
 
     # Print the session header once, before any task runs.

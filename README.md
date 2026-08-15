@@ -51,6 +51,40 @@ CLI usage is also strict by default. To opt out explicitly:
 agent-probe <model> --no-strict-cache-proof
 ```
 
+#### Provider minimum cacheable prompt size
+
+Some providers cache nothing below a documented minimum prompt size —
+e.g. Anthropic Claude Haiku requires roughly 4096 input tokens before any
+caching kicks in, while GPT-5.6-class models cache from roughly 1024 tokens.
+A short prompt that legitimately misses the cache would otherwise trip
+strict cache-proof mode and abort the run with `CacheProofError`.
+
+Set `min_cacheable_tokens` (prompt-token floor) to tell agentknit that a
+zero-cache-hit response is *expected*, not a failure, whenever the current
+call's prompt is below that floor:
+
+```python
+result = run_task(schema, "Hello", min_cacheable_tokens=4096)
+```
+
+Or in the agent spec JSON:
+
+```json
+{
+  "model": "...",
+  "min_cacheable_tokens": 4096
+}
+```
+
+Or from the CLI:
+
+```bash
+agent-probe <model> --min-cacheable-tokens 4096
+```
+
+Defaults to `0` (no minimum) — any zero-cache-hit call after the first is
+still treated as a genuine cache miss unless you configure this.
+
 ### Defining tools with `Tool` & `build_tool_spec`
 
 Declare tools using the `Tool` dataclass and convert them into the schema/dispatch

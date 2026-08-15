@@ -39,3 +39,20 @@ class PricingLimitExceededError(AgentProbeError):
 
 class CacheProofError(AgentProbeError):
     """Raised when strict cache-proof mode does not observe a cache hit."""
+
+
+class RateLimitError(AgentProbeError):
+    """Raised when the server returns HTTP 429 with no usable retry delay.
+
+    A retry is only attempted automatically when the response tells us
+    *when* it's safe to retry (``Retry-After``, ``retry-after-ms``, or
+    ``x-ratelimit-reset-requests``). Without one of those headers we have
+    no basis for guessing a delay, so the call is aborted instead of
+    looping forever.
+    """
+
+    def __init__(self, message: str, *, status_code: int = 429,
+                 headers: dict | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.headers = headers or {}

@@ -22,6 +22,8 @@ import requests
 import threading
 import collections
 
+from .exceptions import RateLimitError
+
 
 # ── rate limiter (token-bucket) ───────────────────────────────────────────────
 
@@ -56,6 +58,44 @@ class RateLimiter:
                     time.sleep(wait)
                     now = time.monotonic()
             self._timestamps.append(now)
+
+
+def _retry_delay_seconds(headers) -> float | None:  # type: ignore[no-untyped-def]
+    """Return the retry delay (seconds) a 429 response tells us to wait, or None.
+
+    Checked in order of precedence: ``retry-after-ms``, ``retry-after``
+    (RFC 7231 — either delta-seconds or an HTTP-date), then
+    ``x-ratelimit-reset-requests``. Returns ``None`` when no header gives
+    a usable, well-formed delay.
+    """
+    if headers.get("retry-after-ms"):
+        try:
+            return float(headers["retry-after-ms"]) / 1000
+        except (TypeError, ValueError):
+            pass
+    if headers.get("retry-after"):
+        raw = headers["retry-after"]
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            pass
+        try:
+            from email.utils import parsedate_to_datetime
+            import datetime as _dt
+            dt = parsedate_to_datetime(raw)
+            if dt is not None:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_dt.timezone.utc)
+                delta = (dt - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+                return max(0.0, delta)
+        except (TypeError, ValueError):
+            pass
+    if headers.get("x-ratelimit-reset-requests"):
+        try:
+            return max(0.0, float(headers["x-ratelimit-reset-requests"]))
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 class _Function:
@@ -149,22 +189,20 @@ class _Completions:
             resp = requests.post(url, headers=headers, json=payload,
                                  stream=stream, timeout=300)
             if resp.status_code == 429:
-                delay: float | None = None
-                if resp.headers.get("retry-after-ms"):
-                    delay = float(resp.headers["retry-after-ms"]) / 1000
-                elif resp.headers.get("retry-after"):
-                    delay = float(resp.headers["retry-after"])
-                elif resp.headers.get("x-ratelimit-reset-requests"):
-                    delay = float(resp.headers["x-ratelimit-reset-requests"])
-                if delay is not None:
-                    print(f"  [rate-limited] waiting {delay:.1f}s …", flush=True)
-                else:
-                    print("  [rate-limited] unknown duration; headers:", flush=True)
-                    _SKIP = {"content-type", "content-length", "connection", "vary"}
-                    for k, v in resp.headers.items():
-                        if k.lower() not in _SKIP:
-                            print(f"    {k}: {v}")
-                    delay = 5.0
+                delay = _retry_delay_seconds(resp.headers)
+                if delay is None:
+                    # No header told us when it's safe to retry — guessing a
+                    # delay risks looping forever against a hard block.
+                    # Surface a typed error instead so the caller (CLI/TUI)
+                    # can show a clear message and stop.
+                    raise RateLimitError(
+                        "Rate limited (HTTP 429) and the server did not "
+                        "specify a retry delay (no Retry-After / "
+                        "retry-after-ms / x-ratelimit-reset-requests "
+                        "header) — stopping instead of retrying blindly.",
+                        headers=dict(resp.headers),
+                    )
+                print(f"  [rate-limited] waiting {delay:.1f}s …", flush=True)
                 time.sleep(delay)
                 continue
             return resp
@@ -208,14 +246,13 @@ class _Completions:
         assembled_tool_calls: dict[int, dict] = {}
         usage_data: dict = {}
 
-        while True:
-            resp = self._retry_post(url, headers, payload, stream=True)
-            if resp.status_code == 429:
-                continue  # _retry_post already slept; shouldn't reach here
-            if not resp.ok:
-                print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
-                resp.raise_for_status()
-            break
+        # _retry_post loops internally while a retryable 429 is seen, and
+        # raises RateLimitError for a non-retryable one — it never returns
+        # a 429 response here.
+        resp = self._retry_post(url, headers, payload, stream=True)
+        if not resp.ok:
+            print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
+            resp.raise_for_status()
 
         with resp:
             for raw_line in resp.iter_lines():

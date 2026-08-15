@@ -108,6 +108,7 @@ from .tool_library import TOOL_LIBRARY, _ASK_USER_FNS
 from .exceptions import (
     AgentSpecDisabledError, AgentSpecInvalidError,
     PricingLimitExceededError, AuthenticationError, CacheProofError,
+    RateLimitError,
 )
 from .slash_commands import REGISTRY as _slash_registry
 
@@ -1726,6 +1727,12 @@ def compact_session(
             temperature=0,
             max_tokens=session.get("compaction_target_tokens", DEFAULT_COMPACTION_TARGET_TOKENS),
         )
+    except RateLimitError as exc:
+        err = f"Compaction rate limited: {exc}"
+        _emit(session, "error", text=err, fmt=f"\n{RED}{err}{RESET}")
+        _log(session, {"type": "compaction_error", "error": err, "error_kind": "rate_limit",
+                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+        return False
     except Exception as exc:
         _emit(session, "error", text=f"Compaction failed: {exc}",
               fmt=f"\n{RED}Compaction failed: {exc}{RESET}")
@@ -2052,6 +2059,13 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
                 kwargs["tool_choice"] = "auto"
             try:
                 resp  = _complete(client, session, **kwargs)
+            except RateLimitError as exc:
+                err = str(exc)
+                _emit(session, "error", text=err,
+                      fmt=f"\n{RED}Rate limited: {err}{RESET}")
+                _log(session, {"type": "error", "error": err, "error_kind": "rate_limit",
+                               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                return _session_result(session)
             except Exception as exc:
                 err = f"API error: {exc}"
                 _emit(session, "error", text=err,
@@ -3035,6 +3049,8 @@ def main() -> None:
         sys.exit(f"{RED}ABORT: {e}{RESET}")
     except AuthenticationError as e:
         sys.exit(f"{RED}Authentication error: {e}{RESET}")
+    except RateLimitError as e:
+        sys.exit(f"{RED}Rate limited: {e}{RESET}")
 
     model    = schema["model"]
     behaviour = schema.get("behaviour") or {}

@@ -116,6 +116,24 @@ DEFAULT_ENDPOINT = "https://openrouter.ai/api/v1"
 DEFAULT_MAX_TOKENS = 3_000_000
 LOG_BASE = Path.home() / ".local" / "share" / "agent_probe"
 
+
+def _agentknit_commit() -> str:
+    """Return the agentknit commit id (git HEAD) behind this process.
+
+    Resolved from the package directory's enclosing git repository, so a
+    snapshot can be traced back to the exact tool / runtime definitions in
+    force when it was written.  Returns ``"unknown"`` when not run from a
+    git checkout (e.g. pip-installed wheel).
+    """
+    import subprocess
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(Path(__file__).resolve().parent.parent), "rev-parse", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip() or "unknown"
+    except Exception:
+        return "unknown"
+
 # Compaction threshold: chosen conservatively so it works across arbitrary
 # endpoints (many models still have 128K–200K context windows).  For
 # large-context models (1M+) this may trigger earlier than necessary; raise
@@ -1021,11 +1039,28 @@ def _save_messages_snapshot(session: dict) -> None:
         if "ts" not in entry:
             entry["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
         annotated.append(entry)
+    # Tool provenance: whether the default tool schema was used (no explicit
+    # tools given) plus the resolved tool-name list, so a snapshot records
+    # exactly which tools the model had.  Traceability of their definitions
+    # is provided by the agentknit commit id below.
+    tool_specs = session.get("tools")
+    default_names = [t["function"]["name"] for t in _DEFAULT_TOOL_SCHEMA]
+    if tool_specs:
+        tool_names = [((t.get("function") or t).get("name") or "?") for t in tool_specs]
+        default_tools = tool_names == default_names
+    else:
+        # No tools given → the runtime used the default tool set; record it
+        # explicitly so the snapshot is self-describing.
+        tool_names = list(default_names)
+        default_tools = True
     payload = {
         "metadata": {
             "endpoint": session.get("endpoint", ""),
             "model": session["model"],
             "session_id": session["session_id"],
+            "default_tools": default_tools,
+            "tools": tool_names,
+            "agentknit_commit": _agentknit_commit(),
         },
         "messages": annotated,
     }

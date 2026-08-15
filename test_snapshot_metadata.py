@@ -24,7 +24,13 @@ def _make_session(messages, model="test-model", endpoint="https://api.example.co
     }
 
 
-def test_save_messages_snapshot_includes_metadata():
+def _patched_commit(monkeypatch, value="deadbeef"):
+    from agentknit import _core as core_mod
+    monkeypatch.setattr(core_mod, "_agentknit_commit", lambda: value)
+    return core_mod
+
+
+def test_save_messages_snapshot_includes_metadata(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
         session = _make_session(
@@ -40,6 +46,7 @@ def test_save_messages_snapshot_includes_metadata():
         from agentknit import _core as core_mod
         orig_log_base = core_mod.LOG_BASE
         core_mod.LOG_BASE = base
+        core_mod = _patched_commit(monkeypatch)
         try:
             _save_messages_snapshot(session)
             path = base / safe_model_name("my/model") / "sess-abc_messages.json"
@@ -51,6 +58,14 @@ def test_save_messages_snapshot_includes_metadata():
             assert data["metadata"]["session_id"] == "sess-abc"
             assert "messages" in data
             assert len(data["messages"]) == 2
+
+            # Tool provenance: absent "tools" in the session → default set,
+            # named explicitly, plus the agentknit commit id.
+            assert data["metadata"]["default_tools"] is True
+            assert data["metadata"]["tools"] == [
+                "read_file", "write_file", "str_replace", "execute_shell_command",
+            ]
+            assert data["metadata"]["agentknit_commit"] == "deadbeef"
         finally:
             core_mod.LOG_BASE = orig_log_base
 
@@ -148,6 +163,33 @@ def test_find_snapshot_in_other_models_reads_legacy_format():
             loaded, source = _find_snapshot_in_other_models("my/model", "sess-legacy")
             assert loaded == legacy
             assert source == safe_model_name("other-model")
+        finally:
+            core_mod.LOG_BASE = orig_log_base
+
+
+def test_save_snapshot_records_custom_tools(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        core_mod = _patched_commit(monkeypatch, "cafebabe")
+        orig_log_base = core_mod.LOG_BASE
+        core_mod.LOG_BASE = base
+        try:
+            session = _make_session(
+                messages=[{"role": "user", "content": "hi"}],
+                model="m",
+                session_id="sess-custom",
+            )
+            session["tools"] = [
+                {"type": "function", "function": {
+                    "name": "custom_tool", "description": "d",
+                    "parameters": {"type": "object", "properties": {}}}},
+            ]
+            _save_messages_snapshot(session)
+            data = json.loads(
+                (base / safe_model_name("m") / "sess-custom_messages.json").read_text())
+            assert data["metadata"]["default_tools"] is False
+            assert data["metadata"]["tools"] == ["custom_tool"]
+            assert data["metadata"]["agentknit_commit"] == "cafebabe"
         finally:
             core_mod.LOG_BASE = orig_log_base
 

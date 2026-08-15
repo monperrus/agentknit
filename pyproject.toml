@@ -32,9 +32,6 @@ agentknit = "agentknit:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agentknit"]
-# hatchling>=1.31 emits Metadata-Version 2.5 (PEP 794), which twine and
-# warehouse reject; 2.4 is the newest version the upload path accepts.
-core-metadata-version = "2.4"
 
 [tool.pytest.ini_options]
 testpaths = ["."]

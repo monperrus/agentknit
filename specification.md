@@ -20,7 +20,7 @@ An agent spec is a JSON file that describes how agentknit should connect to a mo
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `tool_specs` | array | yes | OpenAI-compatible tool definitions — the list of `{"type": "function", "function": {...}}` objects sent to the model. |
+| `tool_specs` | array | yes | OpenAI-compatible tool definitions — the list of `{"type": "function", "function": {...}}` objects sent to the model.  Entries of type `"custom"` (custom/freeform tools, see [Custom tool calls](#custom-tool-calls)) are forwarded verbatim. |
 | `tools` | array of strings | no | Ordered list of Python function names from `tool_library.TOOL_LIBRARY`. Each entry is paired with the tool spec at the same index. |
 | `tool_dispatch` | object | no | Legacy explicit dispatch mapping (see [Tool dispatch](#tool-dispatch) below).  Prefer `tools` for new specs. |
 | `aliases` | object | no | Maps alias names to canonical tool names already present in `tool_dispatch`.  Both the tool schema and dispatch table are expanded at session start so aliases behave identically to the original tool. |
@@ -119,6 +119,31 @@ def t_grammar(input: str) -> tuple[str, dict]:
 
 Custom calls are re-serialized in their original shape in the assistant
 history, so multi-turn conversations with grammar tools round-trip.
+
+### Declaring custom tools in Python
+
+Custom tools can be declared with `Tool(custom_format=...)` instead of
+hand-writing specs. No JSON Schema is synthesized; the format object is
+forwarded verbatim (both the flat Responses form and the chat-completions
+`{"type": "grammar", "grammar": {...}}` nesting work):
+
+```python
+from agentknit import Tool, build_tool_spec, register_tools_in_library
+
+tools = [Tool(
+    name="apply_patch",
+    description="Apply a patch that adds, updates, moves or deletes files.",
+    fn=t_apply_patch,                      # fn(input: str) -> (str, dict)
+    custom_format={"type": "grammar", "syntax": "lark", "definition": GRAMMAR},
+)]
+register_tools_in_library(tools)
+schema, dispatch = build_tool_spec(tools)
+# schema[0] == {"type": "custom", "name": "apply_patch", "description": ...,
+#               "format": {...}}
+```
+
+With `format: {"type": "grammar"}` the endpoint does constrained decoding —
+malformed tool calls become structurally impossible.
 
 ---
 

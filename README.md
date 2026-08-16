@@ -146,6 +146,25 @@ register_tools_in_library(tools)
 # Now schema and dispatch can be used with init_session / run_task
 ```
 
+#### Custom (grammar-constrained) tools
+
+`Tool(custom_format=...)` declares an OpenAI **custom tool**: the argument is
+raw text, optionally constrained by a grammar for endpoint-side constrained
+decoding — no JSON Schema is synthesized:
+
+```python
+tools = [Tool(
+    "apply_patch",
+    "Apply a patch that adds, updates, moves or deletes files.",
+    t_apply_patch,                # fn(input: str) -> (str, dict)
+    custom_format={"type": "grammar", "syntax": "lark", "definition": GRAMMAR},
+)]
+schema, dispatch = build_tool_spec(tools)
+# schema[0] == {"type": "custom", "name": "apply_patch", ..., "format": {...}}
+```
+
+The model's raw text arrives as the single `input` keyword argument.
+
 The `Tool` dataclass also supports `param_map` for translating model-facing
 argument names to Python keyword argument names:
 

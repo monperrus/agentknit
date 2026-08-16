@@ -583,13 +583,25 @@ class FatalToolDispatchError(RuntimeError):
 
 
 def _tool_name_from_spec(tool_spec: dict) -> str:
-    """Return the model-facing tool name from an OpenAI-compatible tool spec."""
+    """Return the model-facing tool name from an OpenAI-compatible tool spec.
+
+    Handles function specs (``{"type": "function", "function": {"name"}}``)
+    and custom specs (``{"type": "custom", "name"}``).
+    """
+    if tool_spec.get("type") == "custom":
+        return tool_spec.get("name", "")
     fn = tool_spec.get("function") or tool_spec
     return fn.get("name", "")
 
 
 def _tool_param_names(tool_spec: dict) -> list[str]:
-    """Return the model-facing parameter names from *tool_spec* in declaration order."""
+    """Return the model-facing parameter names from *tool_spec* in declaration order.
+
+    Custom tools (``type == "custom"``) take a single raw-text argument and
+    report no JSON-Schema properties.
+    """
+    if tool_spec.get("type") == "custom":
+        return []
     fn = tool_spec.get("function") or tool_spec
     params = ((fn.get("parameters") or {}).get("properties") or {})
     return list(params.keys())
@@ -621,6 +633,11 @@ def _derive_param_map(tool_spec: dict, fn_name: str) -> dict[str, str]:
             f"Tool function {fn_name!r} not found in TOOL_LIBRARY.",
             model=fn_name,
         )
+
+    if tool_spec.get("type") == "custom":
+        # Custom tool: the model's argument is raw text delivered as the
+        # single `input` kwarg (see Tool(custom_format=...)).
+        return {"input": "input"}
 
     spec_params = _tool_param_names(tool_spec)
     sig_params = _callable_param_names(fn)
@@ -760,6 +777,9 @@ def dispatch(tool_name: str, args: dict, tool_dispatch: dict) -> tuple[str, dict
 # ── schema helpers ────────────────────────────────────────────────────────────
 
 def schema_props(tool: dict) -> dict:
+    if tool.get("type") == "custom":
+        # Custom tools have a single raw-text `input` argument.
+        return {"input": {"type": "string"}}
     fn = tool.get("function") or tool
     params = fn.get("parameters") or {}
     props = params.get("properties")
@@ -944,6 +964,12 @@ def fmt_read_result_with_command(command: str, text: str, streamed: bool = False
 def inline_system_prompt(tools: list[dict]) -> str:
     examples = []
     for tool in tools:
+        if tool.get("type") == "custom":
+            # Custom tools have a raw-text argument; the inline JSON
+            # protocol carries it as the "input" string.
+            examples.append(json.dumps(
+                {"name": tool.get("name", "?"), "arguments": {"input": "<text>"}}))
+            continue
         fn = tool.get("function") or tool
         name = fn.get("name", "?")
         arg_obj = {k: f"<{k}>" for k in schema_props(tool)}
@@ -1359,8 +1385,13 @@ def _expand_aliases(
         # Tool schema (structured mode): clone canonical spec under alias name
         if canonical_name in schema_by_name and alias_name not in schema_by_name:
             alias_tool = copy.deepcopy(schema_by_name[canonical_name])
-            fn = alias_tool.get("function") or alias_tool
-            fn["name"] = alias_name
+            # Custom tools carry their name at the top level; function tools
+            # nest it under "function".
+            if alias_tool.get("type") == "custom":
+                alias_tool["name"] = alias_name
+            else:
+                fn = alias_tool.get("function") or alias_tool
+                fn["name"] = alias_name
             tools.append(alias_tool)
             schema_by_name[alias_name] = alias_tool
 

@@ -52,6 +52,20 @@ class Tool:
         An optional mapping from model-facing argument names to the Python
         keyword argument names of *fn*.  When ``None`` (the default) the
         identity mapping is used (model names match Python names exactly).
+    custom_format
+        When set, the tool is declared as an OpenAI **custom tool** instead
+        of a JSON-Schema function tool: ``build_tool_spec`` emits
+        ``{"type": "custom", "name": ..., "description": ..., "format": ...}``
+        with **no** synthesized JSON Schema and no ``parameters`` key.  The
+        endpoint then does constrained decoding against the format (e.g.
+        ``{"type": "grammar", "syntax": "lark", "definition": "..."}``) and
+        the model's argument is raw text.  *fn* must take a single
+        ``input: str`` argument; the agent loop dispatches
+        ``{"input": "<raw text>"}`` so the default identity ``param_map``
+        delivers it directly.  Both wire shapes are accepted — the flat
+        Responses form and the chat-completions nesting
+        ``{"type": "grammar", "grammar": {...}}`` — and are re-emitted
+        exactly as given.
     """
 
     name: str
@@ -59,6 +73,7 @@ class Tool:
     fn: Callable
     parameters: dict | None = None
     param_map: dict | None = None
+    custom_format: dict | None = None
 
     @property
     def python_function_name(self) -> str:
@@ -77,6 +92,9 @@ class Tool:
         """Return *param_map* if set, otherwise the identity mapping."""
         if self.param_map is not None:
             return self.param_map
+        if self.custom_format is not None:
+            # Custom tools receive a single raw `input` string.
+            return {"input": "input"}
         # Identity: each parameter name maps to itself.
         params = self.resolved_parameters
         props = params.get("properties", {})
@@ -193,15 +211,28 @@ def build_tool_spec(
 
     for tool in tools:
         # ── schema entry ─────────────────────────────────────────────────
-        params = tool.resolved_parameters
-        schema.append({
-            "type": "function",
-            "function": {
+        if tool.custom_format is not None:
+            # Custom (freeform/grammar) tool: raw-text argument, no JSON
+            # Schema.  Re-emit the format exactly as given so both the flat
+            # Responses form ({"type": "grammar", "syntax": ...}) and the
+            # chat-completions nesting ({"type": "grammar", "grammar": {...}})
+            # reach the endpoint unchanged.
+            schema.append({
+                "type": "custom",
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": params,
-            },
-        })
+                "format": tool.custom_format,
+            })
+        else:
+            params = tool.resolved_parameters
+            schema.append({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": params,
+                },
+            })
 
         # ── dispatch entry ───────────────────────────────────────────────
         dispatch[tool.name] = {

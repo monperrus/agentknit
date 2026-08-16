@@ -252,6 +252,7 @@ generic `on_event` handler.
 | `provider_pinned` | OpenRouter provider was locked for the session | `provider`, `fmt` |
 | `compaction` | Context was compacted into a summary | `summary`, `compacted_turns`, `fmt` |
 | `cache_cold` | Resumed turn missed the (expired) prefix cache | `age`, `fmt` |
+| `journal_recovered` | A resumed session was rebuilt from the durable journal | `entries_replayed`, `messages_loaded`, `pending`, `mid_turn`, `fmt` |
 
 Every event data dict includes a `"fmt"` key containing a pre-formatted ANSI
 string suitable for direct printing to a terminal — this is what the default
@@ -312,6 +313,55 @@ Or in the agent spec JSON:
 The summary message is tagged with `"compacted_summary": true` so consumers
 can distinguish compacted state from raw conversation turns. Compaction events
 are emitted as `"compaction"` events and logged to the session trace.
+
+## Durable Recovery
+
+Snapshots alone only persist the conversation at *turn boundaries* — a crash
+mid-turn loses the whole turn from the transcript, including tool calls whose
+side effects (file writes, shell commands, deploys) already happened. Resuming
+from the snapshot then makes the model blindly re-run those tools.
+
+By default (`durable=True`) agentknit keeps an append-only, fsync-per-record
+write-ahead journal next to the snapshot:
+
+```
+~/.local/share/agent_probe/<model>/<session_id>_journal.jsonl
+```
+
+Every state transition inside a turn is journaled *as it happens*:
+
+| Record | Written | Meaning on recovery |
+|---|---|---|
+| `message` | when a message joins the history | the conversation is rebuildable past the last snapshot |
+| `tool_start` | **before** a tool executes | crash before `tool_end` → side effects unknown |
+| `tool_end` | **after** the tool returns | result is known; never re-run it |
+| `turn_start` / `turn_end` | around each turn | `turn_start` without `turn_end` → crashed mid-turn |
+| `reset_messages` | compaction, `/clear` | history replacement is replayed, not lost |
+
+On resume (`--session <id>`) the journal is replayed and takes precedence over
+a stale snapshot:
+
+- messages the snapshot never saw are recovered;
+- a tool that finished but whose result the model never saw is **not re-run** —
+  the recorded result is re-injected into the conversation as a recovery note;
+- a tool that was in flight when the process died has *unknown* side effects —
+  a recovery note tells the model to verify state (inspect files, read-only
+  checks) before re-running anything.
+
+A torn tail write (crash mid-line) is ignored: an incomplete record was never
+acknowledged.
+
+Disable with `durable=False` (programmatic), `"durable": false` in the agent
+spec JSON, or `--no-durable` on the CLI:
+
+```python
+from agentknit import run_task
+
+result = run_task(schema, task, durable=False)
+```
+
+A `journal_recovered` event is emitted whenever a resume rebuilt state from
+the journal.
 
 ## rtk Integration (optional token savings)
 

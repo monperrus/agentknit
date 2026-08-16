@@ -124,6 +124,9 @@ def _handle_clear(session: dict, client: Any, model: str, args: str) -> None:
         # Fallback: keep at least the first message.
         system_msgs = [session["messages"][0]] if session["messages"] else []
     session["messages"] = system_msgs
+    journal = session.get("_journal")
+    if journal is not None:
+        journal.reset_messages(session["messages"], reason="clear")
     # Reset usage totals.
     session["usage_totals"] = {"prompt": 0, "completion": 0, "total": 0,
                                "cached": 0, "cache_write": 0}

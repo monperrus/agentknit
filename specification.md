@@ -59,6 +59,12 @@ Key resolution order: `keyring_service`+`keyring_username` → `key_env` → `OP
 |---|---|---|---|
 | `max_rpm` | integer | no | Client-side requests-per-minute cap passed to the OpenAI client constructor (e.g. `40` for NVIDIA NIM free tier). |
 
+### Durability
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `durable` | boolean | no | Enable the write-ahead journal (default `true`). Every message append, tool call and tool result inside a turn is fsync'd to `<session_id>_journal.jsonl` as it happens, so a crashed session recovers to the exact point of failure: completed tool results are re-injected instead of re-run, and in-flight tool calls with unknown side effects are flagged for verification. `false` falls back to turn-boundary snapshots only. |
+
 ---
 
 ## Behaviour object

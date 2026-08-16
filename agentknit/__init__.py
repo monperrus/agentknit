@@ -58,6 +58,16 @@ from ._core import (
     compact_session,
     _compact_session,
     _maybe_compact,
+    _journal_path,
+)
+
+from ._journal import (
+    SessionJournal,
+    JournalState,
+    PendingToolCall,
+    KnownToolResult,
+    new_call_id,
+    replay_journal,
 )
 
 from .tool import (
@@ -120,6 +130,10 @@ __all__ = [
     "_save_messages_snapshot", "_load_messages_snapshot",
     "_find_snapshot_in_other_models", "_handle_tool_call", "_complete",
     "compact_session", "_compact_session", "_maybe_compact",
+    "_journal_path",
+    # durable recovery
+    "SessionJournal", "JournalState", "PendingToolCall", "KnownToolResult",
+    "new_call_id", "replay_journal",
     "Tool",
     "build_tool_spec",
     "register_tools_in_library",

@@ -111,11 +111,26 @@ from .exceptions import (
     RateLimitError,
 )
 from .slash_commands import REGISTRY as _slash_registry
+from ._journal import (
+    SessionJournal,
+    new_call_id,
+    replay_journal,
+)
 
 
 DEFAULT_ENDPOINT = "https://openrouter.ai/api/v1"
 DEFAULT_MAX_TOKENS = 3_000_000
 LOG_BASE = Path.home() / ".local" / "share" / "agent_probe"
+
+# Recovery note injected into the conversation when a resumed session's
+# journal shows tool calls that started but never finished (crash mid-tool).
+# Their side effects are unknown, so the model must verify rather than redo.
+_PENDING_TOOL_NOTE = (
+    "SYSTEM RECOVERY NOTE: The previous session crashed while these tool "
+    "calls were in flight; their side effects are UNKNOWN:\n{calls}\n"
+    "Verify the resulting state (inspect files, re-run read-only checks) "
+    "before re-running any of them."
+)
 
 
 def _agentknit_commit() -> str:
@@ -1026,6 +1041,10 @@ def _snapshot_path(model: str, session_id: str) -> Path:
     return LOG_BASE / safe_model_name(model) / f"{session_id}_messages.json"
 
 
+def _journal_path(model: str, session_id: str) -> Path:
+    return LOG_BASE / safe_model_name(model) / f"{session_id}_journal.jsonl"
+
+
 def _save_messages_snapshot(session: dict) -> None:
     # Only save if there is at least one non-system message worth resuming.
     if not any(m.get("role") != "system" for m in session["messages"]):
@@ -1070,15 +1089,13 @@ def _save_messages_snapshot(session: dict) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def _load_messages_snapshot(model: str, session_id: str) -> list | None:
-    path = _snapshot_path(model, session_id)
-    if not path.exists():
-        return None
-    with path.open() as f:
-        data = json.load(f)
-    msgs = data["messages"] if isinstance(data, dict) and "messages" in data else data
-    if not isinstance(msgs, list):
-        return None
+def _normalise_for_resume(msgs: list) -> list:
+    """Normalise resumed messages into an API-safe user/assistant transcript.
+
+    Merges consecutive same-role messages and flattens ``tool_calls`` /
+    ``tool`` results into plain assistant text: some providers reject tool
+    call IDs minted in a previous API session.
+    """
     # Normalise: merge consecutive user messages so the API's strict
     # user/assistant alternation is preserved.
     normalised: list = []
@@ -1126,6 +1143,18 @@ def _load_messages_snapshot(model: str, session_id: str) -> list | None:
         else:
             merged.append(dict(m))
     return merged
+
+
+def _load_messages_snapshot(model: str, session_id: str) -> list | None:
+    path = _snapshot_path(model, session_id)
+    if not path.exists():
+        return None
+    with path.open() as f:
+        data = json.load(f)
+    msgs = data["messages"] if isinstance(data, dict) and "messages" in data else data
+    if not isinstance(msgs, list):
+        return None
+    return _normalise_for_resume(msgs)
 
     # If session_id looks like a trajectoriz short ID (e.g. "ap-<hex8>"),
     # resolve it by hashing each snapshot's actual session ID.
@@ -1326,6 +1355,7 @@ def init_session(schema: dict, non_interactive: bool = False,
                  compaction_policy: "str | Callable[..., bool] | None" = None,
                  compaction_min_chars: int | None = None,
                  min_cacheable_tokens: int | None = None,
+                 durable: bool | None = None,
                  ) -> dict:
     """Build a stateful session dict.
 
@@ -1378,6 +1408,15 @@ def init_session(schema: dict, non_interactive: bool = False,
     than a failure when the prompt is below this floor. Defaults to the
     schema's ``min_cacheable_tokens`` or ``0`` (no minimum — any zero-cache
     call after the first is treated as a genuine miss).
+
+    ``durable`` — enable durable recovery (default ``True``).  Every message
+    append, tool call and tool result inside a turn is written to an
+    append-only, fsync-per-record journal
+    (``<session_id>_journal.jsonl``) *as it happens*, so a crashed session
+    can be recovered to the exact point of failure: completed tool results
+    are re-injected instead of re-run, and in-flight tool calls whose
+    outcome is unknown are flagged for verification.  Set to ``False`` to
+    fall back to turn-boundary snapshots only.
     """
     schema = _normalize_schema(schema)
     tools         = schema.get("inferred_tool_schema") or []
@@ -1435,6 +1474,14 @@ def init_session(schema: dict, non_interactive: bool = False,
             restored["compaction_min_chars"] = compaction_min_chars
         if min_cacheable_tokens is not None:
             restored["min_cacheable_tokens"] = min_cacheable_tokens
+        if durable is not None:
+            restored["durable"] = durable
+        # Reopen (or start) the session journal on restore.
+        restored["_journal"] = (
+            SessionJournal(_journal_path(restored.get("model", "unknown"),
+                                         restored.get("session_id", "")))
+            if restored.get("durable", True) else None
+        )
         # Log the restoration event.
         _log(restored, {"type": "session_restored",
                         "session_id": restored.get("session_id"),
@@ -1534,6 +1581,14 @@ def init_session(schema: dict, non_interactive: bool = False,
             min_cacheable_tokens if min_cacheable_tokens is not None
             else schema.get("min_cacheable_tokens", DEFAULT_MIN_CACHEABLE_TOKENS)
         ),
+        # Durable recovery: append-only WAL of every in-turn state change.
+        "durable": (
+            schema.get("durable", True) if durable is None else durable
+        ),
+        "_journal": SessionJournal(
+            _journal_path(model, session_id)) if (
+                durable if durable is not None else schema.get("durable", True)
+        ) else None,
     }
     _log(session, {"type": "session_start", "model": model,
                    "endpoint": schema.get("endpoint", ""),
@@ -1575,6 +1630,58 @@ def init_session(schema: dict, non_interactive: bool = False,
                       session_id=resumed_from, messages_loaded=0,
                       fmt=(f"{YEL}Warning: no snapshot found for session {resumed_from!r} "
                            f"in this or other model trajectories — starting fresh{RESET}"))
+        # ── durable recovery ─────────────────────────────────────────────
+        # The journal records state changes the turn-boundary snapshot cannot:
+        # messages appended after the last snapshot and the outcome of every
+        # tool call.  Prefer it whenever it knows at least as much.
+        journal_state = replay_journal(_journal_path(model, resumed_from))
+        if journal_state.entries_replayed and (
+            not session["messages"] or journal_state.mid_turn
+            or len(journal_state.messages) > 1
+        ):
+            snap_count = len(session["messages"])
+            # Reuse the snapshot normalisation (merge same-role messages,
+            # flatten stale tool-call IDs) so the recovered history is
+            # API-safe, then layer the pending-tool recovery note on top.
+            session["messages"] = _normalise_for_resume(journal_state.messages)
+            _log(session, {"type": "journal_recovered", "resumed_from": resumed_from,
+                           "entries_replayed": journal_state.entries_replayed,
+                           "messages_loaded": len(journal_state.messages),
+                           "pending_tool_calls": [
+                               {"call_id": p.call_id, "name": p.name}
+                               for p in journal_state.pending_tool_calls],
+                           "mid_turn": journal_state.mid_turn,
+                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+            _emit(session, "journal_recovered",
+                  entries_replayed=journal_state.entries_replayed,
+                  messages_loaded=len(journal_state.messages),
+                  pending=len(journal_state.pending_tool_calls),
+                  mid_turn=journal_state.mid_turn,
+                  fmt=(f"{DIM}Recovered {len(journal_state.messages)} messages from the "
+                       f"durable journal (snapshot had {snap_count}){RESET}"))
+            if journal_state.pending_tool_calls:
+                calls = "\n".join(
+                    f"- {p.name}({json.dumps(p.args, ensure_ascii=False)})"
+                    for p in journal_state.pending_tool_calls)
+                session["messages"].append({
+                    "role": "user",
+                    "content": _PENDING_TOOL_NOTE.format(calls=calls),
+                    "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                })
+            if journal_state.unreceived_results:
+                results = "\n".join(
+                    f"- {r.name or r.call_id}: {r.result}"
+                    for r in journal_state.unreceived_results)
+                session["messages"].append({
+                    "role": "user",
+                    "content": (
+                        "SYSTEM RECOVERY NOTE: These tool calls completed just "
+                        "before the crash but their results were never shown "
+                        "to you. Do NOT re-run them; treat these results as "
+                        f"observed:\n{results}"
+                    ),
+                    "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                })
     return session
 
 
@@ -1753,6 +1860,9 @@ def compact_session(
         "ts": datetime.datetime.now().isoformat(timespec="seconds"),
     }
     session["messages"] = system_msgs + [summary_msg] + suffix
+    journal = session.get("_journal")
+    if journal is not None:
+        journal.reset_messages(session["messages"], reason="compaction")
 
     compacted_turns = len(prefix) - len(system_msgs)
     compacted_chars = sum(
@@ -1845,16 +1955,31 @@ def _handle_tool_call(
     name: str,
     args: dict,
     session: dict,
+    *,
+    call_id: str | None = None,
 ) -> str:
-    """Dispatch one tool call, log it, print it, return the result string."""
+    """Dispatch one tool call, log it, print it, return the result string.
+
+    ``call_id`` identifies the call in the durable journal; when omitted a
+    fresh id is generated (used by inline mode, which has no API tool ids).
+    """
     tool_dispatch   = session["tool_dispatch"]
     non_interactive = session["non_interactive"]
+    call_id = call_id or new_call_id()
 
     entry = tool_dispatch.get(name) or {}
     is_ask = entry.get("python_function") in _ASK_USER_FNS
 
+    journal = session.get("_journal")
+    if journal is not None:
+        # Write-ahead: persisted before the tool runs, so a crash between
+        # here and tool_end marks the side effects as unknown on recovery.
+        journal.tool_start(call_id, name, args)
+
+    pf_name = getattr(entry.get("python_function"), "__name__",
+                      entry.get("python_function"))
     _log(session, {"type": "tool_call", "name": name,
-                   "python_function": entry.get("python_function"), "args": args,
+                   "python_function": pf_name, "args": args,
                    "ts": datetime.datetime.now().isoformat(timespec="seconds")})
     _emit(session, "tool_call", name=name, args=args, fmt=fmt_call(name, args))
 
@@ -1879,7 +2004,7 @@ def _handle_tool_call(
             _emit(session, "tool_result", name=name, result=result, streamed=False,
                   fmt=fmt_result(result))
             _log(session, {"type": "fatal_error", "name": name,
-                           "python_function": entry.get("python_function"),
+                           "python_function": pf_name,
                            "result": result,
                            "ts": datetime.datetime.now().isoformat(timespec="seconds")})
             raise SystemExit(2) from e
@@ -1892,6 +2017,12 @@ def _handle_tool_call(
             if command:
                 fmt = fmt_read_result_with_command(command, result, streamed=streamed)
 
+    if journal is not None:
+        # Persisted only after the side effects have happened: a tool_end
+        # without a later assistant message tells recovery the result is
+        # known and must be re-used, not re-computed.
+        journal.tool_end(call_id, result, name=name)
+
     # Pass file-change metadata from log_data to the event payload
     # so consumers (e.g. Telegram controller) can show "Changed path +5 -2".
     _emit(session, "tool_result",
@@ -1900,7 +2031,7 @@ def _handle_tool_call(
           diff_summary=log_data.get("diff_summary"),
           fmt=fmt)
     _log(session, {"type": "tool_result", "name": name,
-                   "python_function": entry.get("python_function"),
+                   "python_function": pf_name,
                    "result": result, **log_data,
                    "ts": datetime.datetime.now().isoformat(timespec="seconds")})
     return result
@@ -2035,6 +2166,16 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
     messages   = session["messages"]
     tools      = session["tools"]
     structured = session["structured"]
+    journal    = session.get("_journal")
+
+    if journal is not None:
+        journal.turn_start(task)
+
+    def _append_message(msg: dict) -> None:
+        """Append a message to the history and durably journal it."""
+        messages.append(msg)
+        if journal is not None:
+            journal.message(msg)
 
     now_ts = datetime.datetime.now().isoformat(timespec="seconds")
     if messages and messages[-1].get("role") == "user":
@@ -2043,8 +2184,11 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
         old = messages[-1]["content"]
         messages[-1]["content"] = f"{old}\n\n{task}" if old else task
         messages[-1]["ts"] = now_ts
+        if journal is not None:
+            # Republish the merged message durably.
+            journal.message(messages[-1])
     else:
-        messages.append({"role": "user", "content": task, "ts": now_ts})
+        _append_message({"role": "user", "content": task, "ts": now_ts})
     _log(session, {"type": "user", "content": task, "ts": now_ts})
 
     total_tokens = 0
@@ -2155,7 +2299,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
             # ── structured tool_calls ────────────────────────────────────────────
             if structured and msg.tool_calls:
                 now_ts = datetime.datetime.now().isoformat(timespec="seconds")
-                messages.append({
+                _append_message({
                     "role": "assistant",
                     "tool_calls": [
                         {"id": tc.id, "type": "function",
@@ -2172,8 +2316,9 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
                         args = {}
                     if not isinstance(args, dict):
                         args = {}
-                    result = _handle_tool_call(tc.function.name, args, session)
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": result,
+                    result = _handle_tool_call(tc.function.name, args, session,
+                                               call_id=tc.id)
+                    _append_message({"role": "tool", "tool_call_id": tc.id, "content": result,
                                      "ts": datetime.datetime.now().isoformat(timespec="seconds")})
                 continue
 
@@ -2182,14 +2327,14 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
             # ── inline JSON tool calls ───────────────────────────────────────────
             if not structured:
                 now_ts = datetime.datetime.now().isoformat(timespec="seconds")
-                messages.append({"role": "assistant", "content": text, "ts": now_ts})
+                _append_message({"role": "assistant", "content": text, "ts": now_ts})
                 calls = extract_inline_calls(text)
                 if calls:
                     results = []
                     for name, args in calls:
                         result = _handle_tool_call(name, args, session)
                         results.append(f"[{name}] {result}")
-                    messages.append({"role": "user",
+                    _append_message({"role": "user",
                                      "content": "Tool results:\n" + "\n\n".join(results),
                                      "ts": datetime.datetime.now().isoformat(timespec="seconds")})
                     continue
@@ -2197,7 +2342,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
             # ── final answer ─────────────────────────────────────────────────────
             # In structured mode the assistant message wasn't appended above.
             if structured:
-                messages.append({"role": "assistant", "content": text,
+                _append_message({"role": "assistant", "content": text,
                                  "ts": datetime.datetime.now().isoformat(timespec="seconds")})
             _log(session, {"type": "assistant", "content": text,
                        "ts": datetime.datetime.now().isoformat(timespec="seconds")})
@@ -2220,6 +2365,11 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
         _log(session, {"type": "error", "error": err,
                        "ts": datetime.datetime.now().isoformat(timespec="seconds")})
         return _session_result(session)
+    finally:
+        # Durable: every exit path (final answer, error, interrupt) closes the
+        # turn in the journal so replay knows where the turn ended.
+        if journal is not None:
+            journal.turn_end()
 
 
 # ── pricing check ─────────────────────────────────────────────────────────────
@@ -2544,6 +2694,7 @@ def run_task(
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
+    durable: bool | None = None,
 ) -> SessionResult:
     """Run a single task against the agent and return a :class:`SessionResult`.
 
@@ -2561,6 +2712,10 @@ def run_task(
     provider has a minimum cacheable prompt size, so small prompts that
     legitimately miss the cache don't trip strict cache-proof mode. See
     :func:`init_session` for details.
+
+    Pass ``durable=False`` (or set ``"durable": false`` in the schema) to
+    disable the write-ahead journal and fall back to turn-boundary
+    snapshots only.
     """
     validate_schema(schema)
     client  = create_client(schema)
@@ -2581,6 +2736,7 @@ def run_task(
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
+        durable=durable,
     )
     try:
         return run_turn(client, schema["model"], session, task)
@@ -2611,6 +2767,7 @@ def run(
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
+    durable: bool | None = None,
 ) -> SessionResult:
     """Backward-compatible helper for :func:`run_task`.
 
@@ -2643,6 +2800,7 @@ def run(
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
+        durable=durable,
     )
 
 
@@ -2713,6 +2871,7 @@ def _repl_setup(
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
+    durable: bool | None = None,
 ) -> tuple:
     """Common REPL setup: validate, create client, init session, return (client, session, model, hist_file)."""
     validate_schema(schema)
@@ -2733,6 +2892,7 @@ def _repl_setup(
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
+        durable=durable,
     )
     model = schema["model"]
 
@@ -2877,6 +3037,7 @@ def run_repl(
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
+    durable: bool | None = None,
 ) -> None:
     """Start an interactive REPL session against the agent (sync, no background thread).
 
@@ -2906,6 +3067,7 @@ def run_repl(
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
+        durable=durable,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
 
@@ -2947,6 +3109,7 @@ def run_async_repl(
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
+    durable: bool | None = None,
 ) -> None:
     """Start an interactive REPL session with a background input queue.
 
@@ -2975,6 +3138,7 @@ def run_async_repl(
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
+        durable=durable,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
 
@@ -3030,6 +3194,12 @@ def parse_args() -> argparse.Namespace:
                         "size, a zero-cache-hit response under strict cache-proof mode is "
                         "treated as expected rather than a failure. Overrides the spec's "
                         "min_cacheable_tokens.")
+    p.add_argument("--no-durable", action="store_false", dest="durable", default=None,
+                   help="Disable the write-ahead journal; fall back to turn-boundary "
+                        "snapshots only. With durability on (default), every message, tool "
+                        "call and tool result inside a turn is fsync'd to disk as it "
+                        "happens, so a crashed session recovers to the exact point of "
+                        "failure instead of losing the whole turn.")
     return p.parse_args()
 
 
@@ -3065,6 +3235,7 @@ def main() -> None:
         max_output_tokens        = args.max_tokens,
         strict_cache_proof       = not args.no_strict_cache_proof,
         min_cacheable_tokens     = args.min_cacheable_tokens,
+        durable                  = args.durable,
     )
 
     # Print the session header once, before any task runs.

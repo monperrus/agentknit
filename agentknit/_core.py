@@ -2706,6 +2706,7 @@ def run_task(
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
     durable: bool | None = None,
+    client: "openai.OpenAI | SubprocessOpenAI | None" = None,
 ) -> SessionResult:
     """Run a single task against the agent and return a :class:`SessionResult`.
 
@@ -2727,9 +2728,15 @@ def run_task(
     Pass ``durable=False`` (or set ``"durable": false`` in the schema) to
     disable the write-ahead journal and fall back to turn-boundary
     snapshots only.
+
+    Pass ``client=`` to inject a custom or wrapped client (e.g. a sandbox
+    client or an instrumented subclass of
+    :class:`~agentknit.openai_compat.SubprocessOpenAI`) instead of the one
+    :func:`create_client` would build from the schema.  The schema is still
+    validated and used for tools, prompts and session state.
     """
     validate_schema(schema)
-    client  = create_client(schema)
+    client = client or create_client(schema)
     session = init_session(
         schema,
         non_interactive=non_interactive,
@@ -2779,6 +2786,7 @@ def run(
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
     durable: bool | None = None,
+    client: "openai.OpenAI | SubprocessOpenAI | None" = None,
 ) -> SessionResult:
     """Backward-compatible helper for :func:`run_task`.
 
@@ -2812,6 +2820,7 @@ def run(
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
         durable=durable,
+        client=client,
     )
 
 
@@ -2883,10 +2892,11 @@ def _repl_setup(
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
     durable: bool | None = None,
+    client: "openai.OpenAI | SubprocessOpenAI | None" = None,
 ) -> tuple:
     """Common REPL setup: validate, create client, init session, return (client, session, model, hist_file)."""
     validate_schema(schema)
-    client = create_client(schema)
+    client = client or create_client(schema)
     session = init_session(
         schema,
         non_interactive=non_interactive,
@@ -3049,6 +3059,7 @@ def run_repl(
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
     durable: bool | None = None,
+    client: "openai.OpenAI | SubprocessOpenAI | None" = None,
 ) -> None:
     """Start an interactive REPL session against the agent (sync, no background thread).
 
@@ -3079,6 +3090,7 @@ def run_repl(
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
         durable=durable,
+        client=client,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
 
@@ -3121,6 +3133,7 @@ def run_async_repl(
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
     durable: bool | None = None,
+    client: "openai.OpenAI | SubprocessOpenAI | None" = None,
 ) -> None:
     """Start an interactive REPL session with a background input queue.
 
@@ -3150,6 +3163,7 @@ def run_async_repl(
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
         durable=durable,
+        client=client,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
 

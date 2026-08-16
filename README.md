@@ -20,6 +20,25 @@ result = run_task(schema, "List the files in /tmp")
 print(result.final_reply)
 ```
 
+### Injecting a custom client
+
+All entry points — `run_task`, `run` and `run_repl`/`run_async_repl` — accept
+an optional `client=`. Pass your own `OpenAI`- or `SubprocessOpenAI`-compatible
+object (sandbox client, wrapper, instrumented subclass) instead of the one
+`create_client` builds from the spec:
+
+```python
+from agentknit import load_specification, run_repl
+from mybridge import GrammarOpenAI   # subclass of SubprocessOpenAI
+
+client = GrammarOpenAI("./completions.sh")
+agentknit.run_repl(load_specification("run://grammar"), client=client)
+```
+
+The same client can be reused for `init_session` + `run_turn` one-shot calls
+in the same script — no monkey-patching of `create_client`.
+
+
 ## Strict Cache Proof
 
 `agentknit` now runs in strict cache-proof mode by default.

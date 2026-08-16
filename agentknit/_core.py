@@ -95,6 +95,7 @@ import select
 import signal
 import sys
 import threading
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -2702,37 +2703,86 @@ def _session_result(session: dict) -> SessionResult:
     )
 
 
+def _endpoint_is_openrouter(endpoint: str | None) -> bool:
+    """True if *endpoint* points at openrouter.ai."""
+    try:
+        host = urllib.parse.urlparse(endpoint or "").hostname or ""
+    except ValueError:
+        return False
+    return "openrouter.ai" in host
+
+
 def _get_key_for_schema(schema: dict) -> str:
     """Return the API key appropriate for this schema.
 
     Priority:
-      1. keyring_service + keyring_username in the spec → keyring lookup
+      1. keyring_service + keyring_username in the spec → keyring lookup,
+         then the env var named by the uppercased username
       2. key_env in the spec → read that env variable
-      3. Default OPENROUTER_API_KEY via ensure_api_key()
+      3. Default: OPENROUTER_API_KEY.  For OpenRouter endpoints this goes
+         through ensure_api_key() (balance check + rotation); for any other
+         endpoint it is read as a plain key (env → keyring) without the
+         OpenRouter management machinery.  Wrappers targeting third-party
+         endpoints may export OPENROUTER_API_KEY as a generic channel.
+
+    A configured-but-unresolvable source (1 or 2) raises AuthenticationError
+    naming that source — an OpenRouter key is never silently substituted.
     """
     ks = schema.get("keyring_service")
     ku = schema.get("keyring_username")
     if ks and ku:
+        import_error: Exception | None = None
+        val: str | None = None
         try:
             import keyring as _kr
-            val = _kr.get_password(ks, ku)
-            if val:
-                return val
-        except Exception:
-            pass
+        except Exception as e:  # optional dependency may be missing
+            import_error = e
+        else:
+            try:
+                val = _kr.get_password(ks, ku)
+            except Exception:
+                val = None
+        if val:
+            return val
         # Fall back to env var named by keyring_username uppercased
         env_name = ku.upper().replace("-", "_")
         val = os.environ.get(env_name)
         if val:
             return val
+        if import_error is not None:
+            raise AuthenticationError(
+                f"Cannot obtain API key from keyring ({ks}/{ku}): the keyring "
+                f"package is unavailable ({import_error}). Install it with "
+                f"pip install 'agentknit[keyring]' or set {env_name}."
+            )
+        raise AuthenticationError(
+            f"Cannot obtain API key from keyring ({ks}/{ku}) or "
+            f"environment variable {env_name}."
+        )
 
     key_env = schema.get("key_env")
     if key_env:
         val = os.environ.get(key_env)
         if val:
             return val
+        raise AuthenticationError(
+            f"Cannot obtain API key: environment variable {key_env} is not set."
+        )
 
-    return get_api_key()
+    endpoint = schema.get("endpoint") or DEFAULT_ENDPOINT
+    if _endpoint_is_openrouter(endpoint):
+        return get_api_key()
+
+    # Non-OpenRouter endpoint with no configured key source: accept a plain
+    # OPENROUTER_API_KEY (env → keyring) without balance checks or rotation.
+    from .keys import _get_raw_key
+    val = _get_raw_key("OPENROUTER_API_KEY")
+    if val:
+        return val
+    raise AuthenticationError(
+        f"No API key source configured for non-OpenRouter endpoint {endpoint!r}. "
+        "Set 'key_env' or 'keyring_service'+'keyring_username' in the spec."
+    )
 
 
 def create_client(schema: dict) -> "openai.OpenAI | SubprocessOpenAI":

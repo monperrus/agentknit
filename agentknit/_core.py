@@ -893,7 +893,8 @@ def _enforce_cache_proof(session: dict, usage) -> None:
             "Strict cache mode requires explicit cache accounting from the server "
             "after the first LLM call, but this response exposed no cache-proof field."
         )
-    if cached_tokens <= 0:
+    cache_creation = getattr(usage, "cache_creation_tokens", 0) or 0
+    if cached_tokens <= 0 and cache_creation <= 0:
         min_cacheable = session.get("min_cacheable_tokens", DEFAULT_MIN_CACHEABLE_TOKENS) or 0
         if min_cacheable and prompt_tokens < min_cacheable:
             notice = (
@@ -912,6 +913,16 @@ def _enforce_cache_proof(session: dict, usage) -> None:
             "Strict cache mode requires cached_tokens > 0 after the first LLM call, "
             "but the server reported no cache hit."
         )
+    if cached_tokens <= 0 and cache_creation > 0:
+        # A cache WRITE is just as much proof that prefix caching works: this is
+        # the first call whose prefix crossed the provider's minimum cacheable
+        # size, so the cache is being populated rather than read. The next call
+        # in the same session will read it back.
+        notice = (
+            f"{DIM}Prefix cache written this call ({cache_creation:,} tokens); "
+            f"the next call will read it back.{RESET}"
+        )
+        _emit(session, "cache_written", cache_creation_tokens=cache_creation, fmt=notice)
 
 
 def fmt_result(text: str, streamed: bool = False) -> str:

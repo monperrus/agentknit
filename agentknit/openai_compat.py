@@ -254,7 +254,10 @@ class _Completions:
                         "— stopping instead of retrying blindly.",
                         headers=dict(resp.headers),
                     )
-                print(f"  [rate-limited] waiting {delay:.1f}s …", flush=True)
+                resume_at = _dt.datetime.now().astimezone() + _dt.timedelta(seconds=delay)
+                print(f"  [rate-limited] waiting {delay:.1f}s "
+                      f"(resuming at {resume_at.strftime('%H:%M:%S %Z')}) …",
+                      flush=True)
                 time.sleep(delay)
                 continue
             return resp

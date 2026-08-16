@@ -103,6 +103,23 @@ Each key in `tool_dispatch` is a tool name matching an entry in `tool_specs`.
 | `python_function` | string | Name of the Python callable in `tool_library.TOOL_LIBRARY` to invoke. |
 | `param_map` | object | Maps model-facing argument names to Python keyword argument names.  Use `{}` for identity. |
 
+### Custom tool calls
+
+Responses may carry custom tool calls
+(`{"type": "custom", "custom": {"name": ..., "input": "<raw text>"}}` —
+OpenAI custom tools / grammar-constrained output). These are dispatched
+**without JSON decoding**: the Python function receives a single `input: str`
+keyword argument holding the raw text. Function calls (`type == "function"`)
+are unaffected.
+
+```python
+def t_grammar(input: str) -> tuple[str, dict]:
+    ...
+```
+
+Custom calls are re-serialized in their original shape in the assistant
+history, so multi-turn conversations with grammar tools round-trip.
+
 ---
 
 ## Options

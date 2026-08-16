@@ -152,12 +152,23 @@ class _Function:
 
 
 class _ToolCall:
-    __slots__ = ("id", "type", "function")
+    """One tool call as returned by the provider.
 
-    def __init__(self, id: str, function: _Function) -> None:
+    ``type`` is ``"function"`` for standard JSON tool calls and ``"custom"``
+    for OpenAI custom tool calls (``{"type": "custom", "custom": {...}}``),
+    whose raw text input is kept in :data:`custom_input` (and mirrored into
+    ``function.arguments`` so legacy readers still see it).
+    """
+
+    __slots__ = ("id", "type", "function", "custom_input")
+
+    def __init__(self, id: str, function: _Function,
+                 type: str = "function", custom_input: str | None = None) -> None:
         self.id = id
-        self.type = "function"
+        self.type = type
         self.function = function
+        # Raw text input for custom tool calls; None for function calls.
+        self.custom_input = custom_input
 
 
 class _Message:
@@ -351,6 +362,17 @@ class _Completions:
                         entry = assembled_tool_calls[idx]
                         if tc_delta.get("id"):
                             entry["id"] += tc_delta["id"]
+                        custom_delta = tc_delta.get("custom") or {}
+                        if custom_delta:
+                            # Custom tool call streamed as deltas: input
+                            # fragments arrive under custom.input.
+                            entry["type"] = "custom"
+                            entry.setdefault("custom", {"name": "", "input": ""})
+                            if custom_delta.get("name"):
+                                entry["custom"]["name"] += custom_delta["name"]
+                            if custom_delta.get("input"):
+                                entry["custom"]["input"] += custom_delta["input"]
+                            continue
                         fn = tc_delta.get("function") or {}
                         if fn.get("name"):
                             entry["function"]["name"] += fn["name"]
@@ -374,6 +396,39 @@ class _Completions:
         return resp
 
 
+def _parse_tool_call(tc: dict) -> _ToolCall:
+    """Build a _ToolCall from one raw chat-completions tool_call dict.
+
+    Supports both shapes:
+
+    - function call: ``{"type": "function", "function": {"name", "arguments"}}``
+    - custom call:   ``{"type": "custom", "custom": {"name", "input": "<raw text>"}}``
+
+    For custom calls the raw input is kept in ``custom_input`` and mirrored
+    into ``function.arguments`` so readers that only look at ``function``
+    still see the payload.
+    """
+    fn = tc.get("function") or {}
+    custom = tc.get("custom") or {}
+    if custom:
+        raw_input = custom.get("input", "")
+        if not isinstance(raw_input, str):
+            raw_input = json.dumps(raw_input, ensure_ascii=False)
+        return _ToolCall(
+            id=tc.get("id", ""),
+            function=_Function(name=custom.get("name", ""), arguments=raw_input),
+            type="custom",
+            custom_input=raw_input,
+        )
+    return _ToolCall(
+        id=tc.get("id", ""),
+        function=_Function(
+            name=fn.get("name", ""),
+            arguments=fn.get("arguments", "{}"),
+        ),
+    )
+
+
 def _parse_response(data: dict) -> _Response:
     """Build a _Response from a parsed OpenAI-format dict (shared by HTTP and subprocess)."""
     choices = []
@@ -382,16 +437,7 @@ def _parse_response(data: dict) -> _Response:
         raw_tcs = m.get("tool_calls")
         tool_calls = None
         if raw_tcs:
-            tool_calls = [
-                _ToolCall(
-                    id=tc.get("id", ""),
-                    function=_Function(
-                        name=(tc.get("function") or {}).get("name", ""),
-                        arguments=(tc.get("function") or {}).get("arguments", "{}"),
-                    ),
-                )
-                for tc in raw_tcs
-            ]
+            tool_calls = [_parse_tool_call(tc) for tc in raw_tcs]
         choices.append(_Choice(_Message(
             role=m.get("role", "assistant"),
             content=m.get("content"),

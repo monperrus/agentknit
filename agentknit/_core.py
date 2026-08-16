@@ -1006,6 +1006,12 @@ def print_session_history(session: dict) -> None:
             tool_calls = msg.get("tool_calls") or []
             if tool_calls:
                 for tc in tool_calls:
+                    custom = tc.get("custom")
+                    if custom:
+                        # Custom tool call: raw text input, no JSON args.
+                        print(fmt_call(custom.get("name", "?"),
+                                       {"input": custom.get("input", "")}))
+                        continue
                     fn   = tc.get("function") or {}
                     name = fn.get("name", "?")
                     try:
@@ -1128,10 +1134,19 @@ def _normalise_for_resume(msgs: list) -> list:
     for m in normalised:
         if m.get("role") == "assistant" and "tool_calls" in m:
             for tc in m["tool_calls"]:
-                fn = tc["function"]
+                custom = tc.get("custom")
+                if custom:
+                    converted.append({
+                        "role": "assistant",
+                        "content": (f"[Tool call: {custom.get('name', '?')}"
+                                    f"({custom.get('input', '')})]"),
+                        "ts": m.get("ts"),
+                    })
+                    continue
+                fn = tc.get("function") or {}
                 converted.append({
                     "role": "assistant",
-                    "content": f"[Tool call: {fn['name']}({fn['arguments']})]",
+                    "content": f"[Tool call: {fn.get('name', '?')}({fn.get('arguments', '')})]",
                     "ts": m.get("ts"),
                 })
         elif m.get("role") == "tool":
@@ -1244,6 +1259,15 @@ def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list | 
     for m in normalised:
         if m.get("role") == "assistant" and "tool_calls" in m:
             for tc in m["tool_calls"]:
+                custom = tc.get("custom")
+                if custom:
+                    converted.append({
+                        "role": "assistant",
+                        "content": (f"[Tool call: {custom.get('name', '?')}"
+                                    f"({custom.get('input', '')})]"),
+                        "ts": m.get("ts"),
+                    })
+                    continue
                 fn = tc["function"]
                 converted.append({
                     "role": "assistant",
@@ -1273,6 +1297,23 @@ def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list | 
 
 
 # ── agent loop ────────────────────────────────────────────────────────────────
+
+def _tool_call_history_item(tc) -> dict:
+    """Serialize a tool call for the assistant history message.
+
+    Function calls round-trip as ``{"type": "function", "function": {...}}``.
+    Custom calls are re-emitted in their original shape
+    (``{"type": "custom", "custom": {"name", "input"}}``) so grammar-tool
+    conversations survive multi-turn replay.
+    """
+    if tc.type == "custom":
+        raw = tc.custom_input if tc.custom_input is not None else tc.function.arguments
+        return {"id": tc.id, "type": "custom",
+                "custom": {"name": tc.function.name, "input": raw}}
+    return {"id": tc.id, "type": "function",
+            "function": {"name": tc.function.name,
+                         "arguments": tc.function.arguments}}
+
 
 def _expand_aliases(
     tools: list,
@@ -2313,20 +2354,24 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
                 _append_message({
                     "role": "assistant",
                     "tool_calls": [
-                        {"id": tc.id, "type": "function",
-                         "function": {"name": tc.function.name,
-                                      "arguments": tc.function.arguments}}
-                        for tc in msg.tool_calls
+                        (_tool_call_history_item(tc)) for tc in msg.tool_calls
                     ],
                     "ts": now_ts,
                 })
                 for tc in msg.tool_calls:
-                    try:
-                        args = json.loads(tc.function.arguments)
-                    except json.JSONDecodeError:
-                        args = {}
-                    if not isinstance(args, dict):
-                        args = {}
+                    if tc.type == "custom":
+                        # Custom tool call: the raw text input is dispatched
+                        # as a single `input` kwarg — no JSON decoding.
+                        args = {"input": tc.custom_input
+                                if tc.custom_input is not None
+                                else tc.function.arguments}
+                    else:
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError:
+                            args = {}
+                        if not isinstance(args, dict):
+                            args = {}
                     result = _handle_tool_call(tc.function.name, args, session,
                                                call_id=tc.id)
                     _append_message({"role": "tool", "tool_call_id": tc.id, "content": result,

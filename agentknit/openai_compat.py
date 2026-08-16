@@ -14,7 +14,9 @@ SubprocessOpenAI(binary_path)  — same interface but pipes JSON to a binary's
   stdin and reads the OpenAI-format JSON response from its stdout.
 """
 
+import datetime as _dt
 import json
+import re
 import subprocess
 import time
 import urllib.parse
@@ -23,6 +25,23 @@ import threading
 import collections
 
 from .exceptions import RateLimitError
+
+# Zhipu (Z.ai / BigModel) endpoints never send Retry-After or X-RateLimit-*
+# headers on a 429. Instead the reset timestamp is embedded in the JSON body:
+#   {"error":{"code":"1308","message":"Usage limit reached for 5 hour.
+#    Your limit will reset at 2026-08-16 05:42:29"}}
+# (the Anthropic-style /api/anthropic/v1/messages variant wraps the same
+# sentence in brackets). The timestamp is Beijing time (UTC+8): a request at
+# 18:52 UTC got "reset at 05:42:29", i.e. 21:42 UTC — ~2.8h into a 5-hour
+# window. Read as UTC it would be 11h away, which the window forbids.
+_ZHIPU_HOSTS = ("z.ai", "bigmodel.cn")
+_BEIJING_TZ = _dt.timezone(_dt.timedelta(hours=8))  # no DST in China
+_RESET_AT_RE = re.compile(
+    r"reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", re.IGNORECASE
+)
+# Zhipu's longest quota window is 5 hours; anything beyond this margin means
+# the body parse (or its timezone assumption) went wrong.
+_MAX_AUTO_RETRY_SECONDS = 6 * 3600
 
 
 # ── rate limiter (token-bucket) ───────────────────────────────────────────────
@@ -60,13 +79,39 @@ class RateLimiter:
             self._timestamps.append(now)
 
 
+def _retry_delay_for_z_ai(text) -> float | None:  # type: ignore[no-untyped-def]
+    """Return the retry delay (seconds) parsed from a Z.ai 429 JSON body, or None.
+
+    Zhipu (Z.ai / BigModel) reports the quota reset time only in the error
+    body — ``"Your limit will reset at 2026-08-16 05:42:29"`` — with no
+    ``Retry-After`` header. The naive timestamp is Beijing time (UTC+8).
+    Returns ``None`` when no timestamp is found or it is implausibly far
+    in the future (guards against a misparsed date).
+    """
+    if not text:
+        return None
+    match = _RESET_AT_RE.search(text)
+    if not match:
+        return None
+    try:
+        reset = _dt.datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    reset = reset.replace(tzinfo=_BEIJING_TZ)
+    delay = (reset - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+    if delay > _MAX_AUTO_RETRY_SECONDS:
+        return None
+    return max(0.0, delay)
+
+
 def _retry_delay_seconds(headers) -> float | None:  # type: ignore[no-untyped-def]
     """Return the retry delay (seconds) a 429 response tells us to wait, or None.
 
     Checked in order of precedence: ``retry-after-ms``, ``retry-after``
     (RFC 7231 — either delta-seconds or an HTTP-date), then
     ``x-ratelimit-reset-requests``. Returns ``None`` when no header gives
-    a usable, well-formed delay.
+    a usable, well-formed delay. (Z.ai's body-embedded delay is handled
+    separately by :func:`_retry_delay_for_z_ai`.)
     """
     if headers.get("retry-after-ms"):
         try:
@@ -189,17 +234,24 @@ class _Completions:
             resp = requests.post(url, headers=headers, json=payload,
                                  stream=stream, timeout=300)
             if resp.status_code == 429:
+                host = (self._client.base_url.host or "").lower()
+                # Reading the body consumes the stream — only do it for the
+                # one provider family known to hide the reset time there.
+                is_z_ai = any(h in host for h in _ZHIPU_HOSTS)
                 delay = _retry_delay_seconds(resp.headers)
+                if delay is None and is_z_ai:
+                    delay = _retry_delay_for_z_ai(resp.text)
                 if delay is None:
-                    # No header told us when it's safe to retry — guessing a
-                    # delay risks looping forever against a hard block.
-                    # Surface a typed error instead so the caller (CLI/TUI)
-                    # can show a clear message and stop.
+                    # No header or body told us when it's safe to retry —
+                    # guessing a delay risks looping forever against a hard
+                    # block. Surface a typed error instead so the caller
+                    # (CLI/TUI) can show a clear message and stop.
                     raise RateLimitError(
                         "Rate limited (HTTP 429) and the server did not "
                         "specify a retry delay (no Retry-After / "
                         "retry-after-ms / x-ratelimit-reset-requests "
-                        "header) — stopping instead of retrying blindly.",
+                        "header and no reset time in the response body) "
+                        "— stopping instead of retrying blindly.",
                         headers=dict(resp.headers),
                     )
                 print(f"  [rate-limited] waiting {delay:.1f}s …", flush=True)

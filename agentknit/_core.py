@@ -108,6 +108,7 @@ from .openai_compat import SubprocessOpenAI
 
 from . import tool_library as _tool_module
 from .tool_library import TOOL_LIBRARY, _ASK_USER_FNS
+from .tool import Tool, build_tool_spec, register_tools_in_library
 from .exceptions import (
     AgentSpecDisabledError, AgentSpecInvalidError,
     PricingLimitExceededError, AuthenticationError, CacheProofError,
@@ -2979,6 +2980,70 @@ def run_task(
         _save_messages_snapshot(session)
         _log(session, {"type": "session_end", "session_id": session["session_id"],
                        "reason": "run_task_complete"})
+
+
+def run_agent(
+    *,
+    task: str,
+    model: str,
+    endpoint: str,
+    tools: list[Tool],
+    auth: str | None = None,
+    non_interactive: bool = False,
+    session_id: str | None = None,
+    cache_key: str | None = None,
+    system_prompt_supplement: str = "",
+    max_output_tokens: int | None = None,
+    strict_cache_proof: bool = True,
+    on_event: "EventCallback | None" = None,
+    tool_executor: "ToolExecutor | None" = None,
+    compaction_enabled: bool | None = None,
+    compaction_trigger_tokens: int | None = None,
+    compaction_target_tokens: int | None = None,
+    compaction_keep_last_turns: int | None = None,
+    compaction_policy: "str | Callable[..., bool] | None" = None,
+    compaction_min_chars: int | None = None,
+    min_cacheable_tokens: int | None = None,
+    durable: bool | None = None,
+    client: "openai.OpenAI | SubprocessOpenAI | None" = None,
+) -> SessionResult:
+    """Run a one-shot agent from direct tool definitions.
+
+    This scripting-oriented convenience API creates the internal agent schema
+    and registers each :class:`~agentknit.Tool` callable before delegating to
+    :func:`run_task`.  Use :func:`run_task` when a checked-in or probed schema
+    is already available.
+    """
+    tool_schema, tool_dispatch = build_tool_spec(tools)
+    register_tools_in_library(tools)
+    schema = {
+        "model": model,
+        "endpoint": endpoint,
+        "inferred_tool_schema": tool_schema,
+        "tool_dispatch": tool_dispatch,
+    }
+    if auth is not None:
+        schema["auth"] = auth
+    return run_task(
+        schema, task,
+        non_interactive=non_interactive,
+        session_id=session_id,
+        cache_key=cache_key,
+        system_prompt_supplement=system_prompt_supplement,
+        max_output_tokens=max_output_tokens,
+        strict_cache_proof=strict_cache_proof,
+        on_event=on_event,
+        tool_executor=tool_executor,
+        compaction_enabled=compaction_enabled,
+        compaction_trigger_tokens=compaction_trigger_tokens,
+        compaction_target_tokens=compaction_target_tokens,
+        compaction_keep_last_turns=compaction_keep_last_turns,
+        compaction_policy=compaction_policy,
+        compaction_min_chars=compaction_min_chars,
+        min_cacheable_tokens=min_cacheable_tokens,
+        durable=durable,
+        client=client,
+    )
 
 
 def run(

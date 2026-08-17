@@ -27,9 +27,35 @@ result = run_task(schema, "List the files in /tmp")
 print(result.final_reply)
 ```
 
+### Quick scripts with direct tools
+
+For small agents, use `run_agent()` to provide the model connection and
+`Tool` definitions directly. It builds the internal schema and registers the
+tool callables for you:
+
+```python
+from pathlib import Path
+
+from agentknit import Tool, run_agent
+
+
+def list_files(path: str) -> tuple[str, dict]:
+    return ", ".join(p.name for p in Path(path).iterdir()), {"result": "ok"}
+
+
+result = run_agent(
+    task="List the files in /tmp",
+    model="deepseek-v4-flash-free",
+    endpoint="https://opencode.ai/zen/v1",
+    auth="opencode-github-copilot",
+    tools=[Tool("list_files", "List a directory", list_files)],
+)
+print(result.final_reply)
+```
+
 ### Injecting a custom client
 
-All entry points — `run_task`, `run` and `run_repl`/`run_async_repl` — accept
+All entry points — `run_task`, `run_agent`, `run` and `run_repl`/`run_async_repl` — accept
 an optional `client=`. Pass your own `OpenAI`- or `SubprocessOpenAI`-compatible
 object (sandbox client, wrapper, instrumented subclass) instead of the one
 `create_client` builds from the spec:

@@ -1,8 +1,15 @@
 # agentknit
 
-Spec-driven coding agent framework for any OpenAI-compatible endpoint.
+Coding agent framework for any `/chat/completion` endpoint.
 
-Reads a [JSON spec](specification.md) runs an interactive coding agent that dispatches tool calls (read_file, write_file, execute_bash, …) to Python implementations.
+Features:
+* Reads a [JSON spec](specification.md) to dispatches tool calls (read_file, write_file, execute_bash, …) to tool implementations.
+* Grammar-constrained custom tools for endpoint-side constrained decoding
+* Fail-closed strict cache-proof mode for saving your $$$$$
+* Rich event system (`tool_call`, `content_delta`, `usage`, …) for logging/TUI/dashboards
+* Automatic context compaction keeps long sessions inside the token budget
+* Bubblewrap-sandboxed tool execution for untrusted replay workloads
+* `rtk` integration cuts shell tool output tokens by 60–90%
 
 ## Install
 
@@ -15,7 +22,7 @@ pip install agentknit
 ```python
 from agentknit import load_specification, run_task
 
-schema = load_specification("qwen/qwen3-8b", "https://openrouter.ai/api/v1", force=False)
+schema = load_specification("qwen3-8b.json", "https://openrouter.ai/api/v1")
 result = run_task(schema, "List the files in /tmp")
 print(result.final_reply)
 ```

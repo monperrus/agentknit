@@ -108,6 +108,20 @@ def _retry_delay_for_z_ai(text) -> float | None:  # type: ignore[no-untyped-def]
     return max(0.0, delay)
 
 
+def _z_ai_error_details(text) -> tuple[str | None, str | None]:  # type: ignore[no-untyped-def]
+    """Extract Z.ai's business error code and message from an error body."""
+    try:
+        error = json.loads(text).get("error")
+    except (TypeError, ValueError, AttributeError):
+        return None, None
+    if not isinstance(error, dict):
+        return None, None
+    code = error.get("code")
+    message = error.get("message")
+    return (str(code) if code is not None else None,
+            str(message) if message is not None else None)
+
+
 def _retry_delay_seconds(headers) -> float | None:  # type: ignore[no-untyped-def]
     """Return the retry delay (seconds) a 429 response tells us to wait, or None.
 
@@ -275,6 +289,9 @@ class _Completions:
                     # guessing a delay risks looping forever against a hard
                     # block. Surface a typed error instead so the caller
                     # (CLI/TUI) can show a clear message and stop.
+                    error_code, error_message = (
+                        _z_ai_error_details(resp.text) if is_z_ai else (None, None)
+                    )
                     raise RateLimitError(
                         "Rate limited (HTTP 429) and the server did not "
                         "specify a retry delay (no Retry-After / "
@@ -282,6 +299,8 @@ class _Completions:
                         "header and no reset time in the response body) "
                         "— stopping instead of retrying blindly.",
                         headers=dict(resp.headers),
+                        error_code=error_code,
+                        error_message=error_message,
                     )
                 resume_at = _dt.datetime.now().astimezone() + _dt.timedelta(seconds=delay)
                 print(f"  [rate-limited] waiting {delay:.1f}s "

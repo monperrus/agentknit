@@ -61,7 +61,7 @@ Event types
     ``prompt``, ``completion``, ``total``, ``cached``, ``cache_write``, ``fmt``.
 ``error``
     API or dispatch error.  Data: ``text``, ``error_class``, ``http_status``,
-    ``elapsed_s``, ``adapter``, ``fmt``.
+    ``error_code``, ``error_message``, ``elapsed_s``, ``adapter``, ``fmt``.
 ``final_answer``
     The agent produced its final reply.  Data: ``text``, ``fmt``.
 ``token_limit``
@@ -1799,6 +1799,8 @@ def _error_metadata(
     return {
         "error_class": type(exc).__name__,
         "http_status": http_status,
+        "error_code": getattr(exc, "error_code", None),
+        "error_message": getattr(exc, "error_message", None),
         "elapsed_s": elapsed_s,
         "adapter": "subprocess" if is_subprocess else "http",
     }
@@ -2283,6 +2285,7 @@ class _InputCollector:
 
 def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dict, task: str,
              *, cancel: CancelToken | None = None,
+             timeout: float | None = None,
              tool_executor: "ToolExecutor | None" = None) -> SessionResult:
     """Run one agent turn and return a :class:`SessionResult`.
 
@@ -2291,19 +2294,45 @@ def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dict
 
     Pass a :class:`CancelToken` to allow cooperative cancellation from another
     thread (e.g. a TUI stop button).
+
+    ``timeout`` requests cooperative cancellation after the given number of
+    seconds.  It does not interrupt an in-flight LLM request or tool call; a
+    :class:`TimeoutError` is raised when execution next reaches a cancellation
+    boundary.
     """
+    if timeout is not None and timeout < 0:
+        raise ValueError("timeout must be non-negative or None")
+
+    active_cancel = cancel or CancelToken()
+    timeout_expired: threading.Event | None = None
+    timer: threading.Timer | None = None
+    if timeout is not None:
+        timeout_expired = threading.Event()
+
+        def _expire() -> None:
+            timeout_expired.set()
+            active_cancel.cancel()
+
+        timer = threading.Timer(timeout, _expire)
+
     global _in_turn
     _in_turn = True
     try:
         if tool_executor is not None:
             session["tool_executor"] = tool_executor
-        return _run_turn(client, model, session, task, cancel=cancel)
+        if timer is not None:
+            timer.start()
+        return _run_turn(client, model, session, task, cancel=active_cancel,
+                         timeout_expired=timeout_expired)
     finally:
+        if timer is not None:
+            timer.cancel()
         _in_turn = False
 
 
 def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dict, task: str,
-              cancel: CancelToken | None = None) -> SessionResult:
+              cancel: CancelToken | None = None,
+              timeout_expired: threading.Event | None = None) -> SessionResult:
     messages   = session["messages"]
     tools      = session["tools"]
     structured = session["structured"]
@@ -2334,10 +2363,17 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
 
     total_tokens = 0
     max_tokens   = DEFAULT_MAX_TOKENS
+
+    def _check_cancelled() -> None:
+        if cancel is None or not cancel.cancelled:
+            return
+        if timeout_expired is not None and timeout_expired.is_set():
+            raise TimeoutError("run_turn timed out")
+        raise KeyboardInterrupt()
+
     try:
         while True:
-            if cancel is not None and cancel.cancelled:
-                raise KeyboardInterrupt()
+            _check_cancelled()
             kwargs: dict = dict(model=model, messages=messages, temperature=0)
             if structured:
                 kwargs["tools"] = tools
@@ -2357,6 +2393,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
                 _emit_and_log_error(session, exc, err, f"\n{RED}Error: {err}{RESET}",
                                     client=client, request_started_at=request_started_at)
                 return _session_result(session)
+            _check_cancelled()
             msg   = resp.choices[0].message
 
             # Accumulate token usage from the response and surface it to the user.

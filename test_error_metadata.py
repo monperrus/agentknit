@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import requests
 
 from agentknit._core import _run_turn
+from agentknit.exceptions import RateLimitError
 
 
 class _FailingCompletions:
@@ -82,3 +83,18 @@ def test_run_endpoint_errors_are_classified_as_subprocess(tmp_path) -> None:
     assert event["http_status"] is None
     assert event["adapter"] == "subprocess"
     assert isinstance(event["elapsed_s"], float)
+
+
+def test_provider_error_details_are_included_in_error_event(tmp_path) -> None:
+    session, events = _session(tmp_path, endpoint="https://api.z.ai/api/coding/paas/v4")
+    exc = RateLimitError("rate limited", error_code="1305",
+                         error_message="The service may be temporarily overloaded")
+
+    _run_turn(_FailingClient(exc), "model", session, "hello")
+
+    event = next(data for event_type, data in events if event_type == "error")
+    assert event["error_code"] == "1305"
+    assert event["error_message"] == "The service may be temporarily overloaded"
+    record = json.loads(session["log_path"].read_text().splitlines()[-1])
+    assert record["error_code"] == "1305"
+    assert record["error_message"] == "The service may be temporarily overloaded"

@@ -21,6 +21,7 @@ from agentknit.openai_compat import (
     OpenAI,
     _retry_delay_for_z_ai,
     _retry_delay_seconds,
+    _z_ai_error_details,
 )
 
 _ZAI_BODY = ('{"error":{"code":"1308","message":"Usage limit reached for '
@@ -104,6 +105,12 @@ def test_z_ai_delay_none_when_reset_is_too_far_away():
 
 def test_z_ai_delay_zero_when_reset_time_already_passed():
     assert _retry_delay_for_z_ai(_ZAI_BODY + _reset_at_in(-30) + '"}}') == 0.0
+
+
+def test_z_ai_error_details_extracts_business_error_fields():
+    assert _z_ai_error_details(
+        '{"error":{"code":"1305","message":"The service may be temporarily overloaded"}}'
+    ) == ("1305", "The service may be temporarily overloaded")
 
 
 # ── OpenAI._retry_post ───────────────────────────────────────────────────────
@@ -197,6 +204,22 @@ def test_retry_post_ignores_body_on_non_zai_hosts():
     with patch("agentknit.openai_compat.requests.post", return_value=resp_429):
         with pytest.raises(RateLimitError):
             client.chat.completions._retry_post("https://x", {}, {})
+
+
+def test_z_ai_non_retryable_rate_limit_preserves_business_error_details():
+    client = _client("https://api.z.ai/api/coding/paas/v4")
+    resp_429 = _FakeResponse(
+        429, {}, text=(
+            '{"error":{"code":"1305","message":"The service may be temporarily '
+            'overloaded, please try again later"}}'
+        ),
+    )
+    with patch("agentknit.openai_compat.requests.post", return_value=resp_429):
+        with pytest.raises(RateLimitError) as caught:
+            client.chat.completions._retry_post("https://x", {}, {})
+
+    assert caught.value.error_code == "1305"
+    assert caught.value.error_message == "The service may be temporarily overloaded, please try again later"
 
 
 def test_create_raises_rate_limit_error_without_header():

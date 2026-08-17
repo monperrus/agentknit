@@ -60,7 +60,8 @@ Event types
     Cumulative session usage emitted alongside the final answer.  Data:
     ``prompt``, ``completion``, ``total``, ``cached``, ``cache_write``, ``fmt``.
 ``error``
-    API or dispatch error.  Data: ``text``, ``fmt``.
+    API or dispatch error.  Data: ``text``, ``error_class``, ``http_status``,
+    ``elapsed_s``, ``adapter``, ``fmt``.
 ``final_answer``
     The agent produced its final reply.  Data: ``text``, ``fmt``.
 ``token_limit``
@@ -95,6 +96,7 @@ import select
 import signal
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 import uuid
@@ -1769,6 +1771,60 @@ def init_session(schema: dict, non_interactive: bool = False,
     return session
 
 
+def _error_metadata(
+    exc: BaseException,
+    session: dict,
+    client: object | None = None,
+    request_started_at: float | None = None,
+) -> dict:
+    """Return stable, machine-readable fields for an error event/log record."""
+    http_status = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if http_status is None and response is not None:
+        http_status = getattr(response, "status_code", None)
+    if http_status is None:
+        # urllib.error.HTTPError exposes the status as ``code`` rather than
+        # ``status_code``; accepting it also makes wrapped HTTP clients useful.
+        http_status = getattr(exc, "code", None)
+    if not isinstance(http_status, int):
+        http_status = None
+
+    is_subprocess = (
+        isinstance(client, SubprocessOpenAI)
+        or str(session.get("endpoint", "")).startswith("run://")
+    )
+    elapsed_s = None
+    if request_started_at is not None:
+        elapsed_s = round(max(0.0, time.monotonic() - request_started_at), 3)
+    return {
+        "error_class": type(exc).__name__,
+        "http_status": http_status,
+        "elapsed_s": elapsed_s,
+        "adapter": "subprocess" if is_subprocess else "http",
+    }
+
+
+def _emit_and_log_error(
+    session: dict,
+    exc: BaseException,
+    text: str,
+    fmt: str,
+    *,
+    client: object | None = None,
+    request_started_at: float | None = None,
+    log_type: str = "error",
+    error_kind: str | None = None,
+) -> None:
+    """Emit and persist an error with consistent structured diagnostics."""
+    fields = _error_metadata(exc, session, client, request_started_at)
+    _emit(session, "error", text=text, **fields, fmt=fmt)
+    record = {"type": log_type, "error": text, **fields,
+              "ts": datetime.datetime.now().isoformat(timespec="seconds")}
+    if error_kind is not None:
+        record["error_kind"] = error_kind
+    _log(session, record)
+
+
 def _complete(client: openai.OpenAI | SubprocessOpenAI, session: dict, **kwargs) -> object:
     kwargs["user"] = session["cache_key"]
     if session.get("max_output_tokens"):
@@ -1911,6 +1967,7 @@ def compact_session(
     compaction_messages = list(prefix)
     compaction_messages.append({"role": "user", "content": _COMPACTION_PROMPT})
 
+    request_started_at = time.monotonic()
     try:
         resp = client.chat.completions.create(
             model=model,
@@ -1920,15 +1977,15 @@ def compact_session(
         )
     except RateLimitError as exc:
         err = f"Compaction rate limited: {exc}"
-        _emit(session, "error", text=err, fmt=f"\n{RED}{err}{RESET}")
-        _log(session, {"type": "compaction_error", "error": err, "error_kind": "rate_limit",
-                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+        _emit_and_log_error(session, exc, err, f"\n{RED}{err}{RESET}",
+                            client=client, request_started_at=request_started_at,
+                            log_type="compaction_error", error_kind="rate_limit")
         return False
     except Exception as exc:
-        _emit(session, "error", text=f"Compaction failed: {exc}",
-              fmt=f"\n{RED}Compaction failed: {exc}{RESET}")
-        _log(session, {"type": "compaction_error", "error": str(exc),
-                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+        err = f"Compaction failed: {exc}"
+        _emit_and_log_error(session, exc, err, f"\n{RED}{err}{RESET}",
+                            client=client, request_started_at=request_started_at,
+                            log_type="compaction_error")
         return False
 
     summary = (resp.choices[0].message.content or "").strip()
@@ -2285,21 +2342,20 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
             if structured:
                 kwargs["tools"] = tools
                 kwargs["tool_choice"] = "auto"
+            request_started_at = time.monotonic()
             try:
                 resp  = _complete(client, session, **kwargs)
             except RateLimitError as exc:
                 err = str(exc)
-                _emit(session, "error", text=err,
-                      fmt=f"\n{RED}Rate limited: {err}{RESET}")
-                _log(session, {"type": "error", "error": err, "error_kind": "rate_limit",
-                               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                _emit_and_log_error(session, exc, err,
+                                    f"\n{RED}Rate limited: {err}{RESET}",
+                                    client=client, request_started_at=request_started_at,
+                                    error_kind="rate_limit")
                 return _session_result(session)
             except Exception as exc:
                 err = f"API error: {exc}"
-                _emit(session, "error", text=err,
-                      fmt=f"\n{RED}Error: {err}{RESET}")
-                _log(session, {"type": "error", "error": err,
-                               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                _emit_and_log_error(session, exc, err, f"\n{RED}Error: {err}{RESET}",
+                                    client=client, request_started_at=request_started_at)
                 return _session_result(session)
             msg   = resp.choices[0].message
 
@@ -2353,9 +2409,8 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
                 else:
                     err = ("Strict cache mode requires usage metadata on every LLM call after the first, "
                            "but the server returned no usage block.")
-                    _emit(session, "error", text=err, fmt=f"\n{RED}Error: {err}{RESET}")
-                    _log(session, {"type": "error", "error": err,
-                                   "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                    _emit_and_log_error(session, RuntimeError(err), err,
+                                        f"\n{RED}Error: {err}{RESET}", client=client)
                     return _session_result(session)
             _apply_compaction_policy(client, model, session, usage, phase="mid_turn")
 
@@ -2449,9 +2504,8 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dic
             return result
     except CacheProofError as exc:
         err = str(exc)
-        _emit(session, "error", text=err, fmt=f"\n{RED}Error: {err}{RESET}")
-        _log(session, {"type": "error", "error": err,
-                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+        _emit_and_log_error(session, exc, err, f"\n{RED}Error: {err}{RESET}",
+                            client=client)
         return _session_result(session)
     finally:
         # Durable: every exit path (final answer, error, interrupt) closes the
@@ -3118,10 +3172,8 @@ def _sync_repl_turn(
     except KeyboardInterrupt:
         print(f"\n{DIM}[interrupted]{RESET}")
     except Exception as exc:
-        _emit(session, "error", text=str(exc),
-              fmt=f"\n{RED}Error: {exc}{RESET}")
-        _log(session, {"type": "error", "error": str(exc),
-               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+        _emit_and_log_error(session, exc, str(exc), f"\n{RED}Error: {exc}{RESET}",
+                            client=client)
     _save_messages_snapshot(session)
 
 
@@ -3146,10 +3198,8 @@ def _async_repl_turn(
                 print(f"\n{DIM}[interrupted]{RESET}")
                 _interrupted = True
             except Exception as exc:
-                _emit(session, "error", text=str(exc),
-                      fmt=f"\n{RED}Error: {exc}{RESET}")
-                _log(session, {"type": "error", "error": str(exc),
-                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                _emit_and_log_error(session, exc, str(exc), f"\n{RED}Error: {exc}{RESET}",
+                                    client=client)
             finally:
                 _collector.stop()
             _save_messages_snapshot(session)

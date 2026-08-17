@@ -14,6 +14,7 @@ import datetime
 from unittest.mock import patch
 
 import pytest
+import requests
 
 from agentknit.exceptions import RateLimitError
 from agentknit.openai_compat import (
@@ -145,6 +146,31 @@ def test_retry_post_retries_then_succeeds_with_header():
         with patch("agentknit.openai_compat.time.sleep"):
             resp = client.chat.completions._retry_post("https://x", {}, {})
     assert resp is resp_ok
+
+
+def test_retry_post_retries_read_timeouts_with_exponential_backoff():
+    client = _client()
+    resp_ok = _FakeResponse(200, {}, {"choices": []})
+    calls = [requests.exceptions.ReadTimeout("read timed out")] * 5 + [resp_ok]
+
+    with patch("agentknit.openai_compat.requests.post", side_effect=calls):
+        with patch("agentknit.openai_compat.time.sleep") as sleep:
+            resp = client.chat.completions._retry_post("https://x", {}, {})
+
+    assert resp is resp_ok
+    assert [call.args[0] for call in sleep.call_args_list] == [60, 120, 240, 480, 960]
+
+
+def test_retry_post_reraises_after_five_read_timeout_retries():
+    client = _client()
+    timeout = requests.exceptions.ReadTimeout("read timed out")
+
+    with patch("agentknit.openai_compat.requests.post", side_effect=[timeout] * 6):
+        with patch("agentknit.openai_compat.time.sleep") as sleep:
+            with pytest.raises(requests.exceptions.ReadTimeout):
+                client.chat.completions._retry_post("https://x", {}, {})
+
+    assert [call.args[0] for call in sleep.call_args_list] == [60, 120, 240, 480, 960]
 
 
 def test_retry_post_parses_z_ai_body_and_retries():

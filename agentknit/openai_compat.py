@@ -42,6 +42,10 @@ _RESET_AT_RE = re.compile(
 # Zhipu's longest quota window is 5 hours; anything beyond this margin means
 # the body parse (or its timezone assumption) went wrong.
 _MAX_AUTO_RETRY_SECONDS = 6 * 3600
+# Transient read timeouts are common on long-running inference proxies. Retry
+# five times after the initial attempt, waiting 1, 2, 4, 8, then 16 minutes.
+_MAX_READ_TIMEOUT_RETRIES = 5
+_READ_TIMEOUT_INITIAL_DELAY_SECONDS = 60
 
 
 # ── rate limiter (token-bucket) ───────────────────────────────────────────────
@@ -240,10 +244,24 @@ class _Completions:
 
     def _retry_post(self, url: str, headers: dict, payload: dict,
                     stream: bool = False) -> requests.Response:
+        read_timeout_retries = 0
         while True:
             self._client._rate_limiter.acquire()
-            resp = requests.post(url, headers=headers, json=payload,
-                                 stream=stream, timeout=300)
+            try:
+                resp = requests.post(url, headers=headers, json=payload,
+                                     stream=stream, timeout=300)
+            except requests.exceptions.ReadTimeout:
+                if read_timeout_retries >= _MAX_READ_TIMEOUT_RETRIES:
+                    raise
+                delay = _READ_TIMEOUT_INITIAL_DELAY_SECONDS * (2 ** read_timeout_retries)
+                read_timeout_retries += 1
+                print(
+                    f"  [read-timeout] request timed out — retry "
+                    f"{read_timeout_retries}/{_MAX_READ_TIMEOUT_RETRIES} in {delay // 60}m …",
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
             if resp.status_code == 429:
                 host = (self._client.base_url.host or "").lower()
                 # Reading the body consumes the stream — only do it for the

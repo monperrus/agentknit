@@ -29,12 +29,13 @@ jobs:
 
       - name: Lint with ruff
         run: |
-          pip install ruff
+          # Pinned: ruff 0.16 widens the default rule set (UP/BLE/DTZ/…)
+          pip install "ruff~=0.15.12"
           ruff check agentknit/
 
       - name: Type-check with mypy (strict)
         run: |
-          pip install mypy types-requests
+          pip install "mypy~=2.1.0" types-requests
           python -m mypy agentknit/
 
       - name: Run tests with pytest

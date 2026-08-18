@@ -1178,12 +1178,58 @@ def _save_messages_snapshot(session: Session) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def _normalise_for_resume(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+_MAX_ARGS_PREVIEW = 200
+
+
+def _compact_tool_args(raw: Any) -> str:
+    """Return a short, single-line preview of tool-call arguments."""
+    text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+    text = " ".join(text.split())
+    if len(text) > _MAX_ARGS_PREVIEW:
+        text = text[:_MAX_ARGS_PREVIEW] + "…"
+    return text
+
+
+def _summarise_tool_outcome(content: Any) -> str:
+    """Classify a tool result as 'ok' or 'error' without echoing its payload.
+
+    Heuristic only (the raw content string carries no structured status
+    field); used purely to give the flattened history a compact outcome
+    marker, never to reproduce believable result payloads.
+    """
+    text = str(content).strip()
+    if not text:
+        return "ok"
+    low = text.lower()
+    if low.startswith(("error", "traceback")) or "exception" in low:
+        return "error"
+    return "ok"
+
+
+def _normalise_for_resume(
+    msgs: list[dict[str, Any]], *, flatten: bool = False,
+) -> list[dict[str, Any]]:
     """Normalise resumed messages into an API-safe user/assistant transcript.
 
-    Merges consecutive same-role messages and flattens ``tool_calls`` /
-    ``tool`` results into plain assistant text: some providers reject tool
-    call IDs minted in a previous API session.
+    Always merges consecutive same-role user messages so the API's strict
+    user/assistant alternation is preserved.
+
+    ``flatten`` controls whether structured ``tool_calls`` / ``tool``
+    results are converted into plain assistant text.  Most providers accept
+    tool-call IDs minted in a previous API session and should keep the real
+    structured history — passing real tool calls back is what disambiguates
+    "the tool ran" from "the model is narrating a call" in the model's own
+    context.  Set ``flatten=True`` only for providers that reject stale
+    tool-call IDs on resume (400 "Upstream request failed" — seen on
+    opencode.ai / deepseek-v4-flash-free), via the agent spec's
+    ``behaviour.resume_rejects_stale_tool_call_ids``.
+
+    When flattening, results are rendered as a compact ``name(args) ->
+    outcome`` line with no bracket/callable syntax and no raw result
+    payload: a transcript that shows the model writing out full
+    ``[Tool result: {...}]`` JSON teaches it that producing tool-result
+    payloads is its own job, and it will start fabricating them (see
+    issue #25).
     """
     # Normalise: merge consecutive user messages so the API's strict
     # user/assistant alternation is preserved.
@@ -1196,39 +1242,52 @@ def _normalise_for_resume(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             normalised[-1]["ts"] = m.get("ts")
         else:
             normalised.append(dict(m))
-    # Convert tool calls to text descriptions.  Some providers (e.g.
-    # opencode.ai / deepseek-v4-flash-free) reject tool_call IDs that were
-    # generated in a previous API session.  Re-sending stale IDs produces a
-    # 400 "Upstream request failed" error.  We therefore flatten the tool
-    # call / result pairs into plain assistant text so the conversation
-    # history remains readable while being API-safe on resume.
+    if not flatten:
+        return normalised
+    # Flatten tool call / result pairs into a single neutral summary line
+    # per call, keyed on tool_call_id so the call and its outcome merge
+    # even though they arrive as separate messages.
+    pending: dict[str, tuple[str, str, Any]] = {}
     converted: list[dict[str, Any]] = []
     for m in normalised:
         if m.get("role") == "assistant" and "tool_calls" in m:
             for tc in m["tool_calls"]:
                 custom = tc.get("custom")
                 if custom:
+                    name = custom.get("name", "?")
+                    args = _compact_tool_args(custom.get("input", ""))
+                else:
+                    fn = tc.get("function") or {}
+                    name = fn.get("name", "?")
+                    args = _compact_tool_args(fn.get("arguments", ""))
+                call_id = tc.get("id")
+                if call_id:
+                    pending[call_id] = (name, args, m.get("ts"))
+                else:
                     converted.append({
                         "role": "assistant",
-                        "content": (f"[Tool call: {custom.get('name', '?')}"
-                                    f"({custom.get('input', '')})]"),
+                        "content": f"prior tool use: {name}({args}) -> unknown",
                         "ts": m.get("ts"),
                     })
-                    continue
-                fn = tc.get("function") or {}
-                converted.append({
-                    "role": "assistant",
-                    "content": f"[Tool call: {fn.get('name', '?')}({fn.get('arguments', '')})]",
-                    "ts": m.get("ts"),
-                })
         elif m.get("role") == "tool":
+            call_id = str(m.get("tool_call_id") or "")
+            name, args, ts = pending.pop(call_id, ("?", "", m.get("ts")))
+            outcome = _summarise_tool_outcome(m.get("content", ""))
             converted.append({
                 "role": "assistant",
-                "content": f"[Tool result: {m.get('content', '')}]",
-                "ts": m.get("ts"),
+                "content": f"prior tool use: {name}({args}) -> {outcome}",
+                "ts": m.get("ts") or ts,
             })
         else:
             converted.append(m)
+    # Any call left without a matching result (shouldn't happen in a
+    # well-formed snapshot, but don't silently drop it).
+    for name, args, ts in pending.values():
+        converted.append({
+            "role": "assistant",
+            "content": f"prior tool use: {name}({args}) -> unknown",
+            "ts": ts,
+        })
     # Merge consecutive assistant messages to preserve user/assistant
     # alternation required by the API.
     merged: list[dict[str, Any]] = []
@@ -1243,7 +1302,9 @@ def _normalise_for_resume(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return merged
 
 
-def _load_messages_snapshot(model: str, session_id: str) -> list[dict[str, Any]] | None:
+def _load_messages_snapshot(
+    model: str, session_id: str, *, flatten: bool = False,
+) -> list[dict[str, Any]] | None:
     path = _snapshot_path(model, session_id)
     if not path.exists():
         return None
@@ -1252,7 +1313,7 @@ def _load_messages_snapshot(model: str, session_id: str) -> list[dict[str, Any]]
     msgs = data["messages"] if isinstance(data, dict) and "messages" in data else data
     if not isinstance(msgs, list):
         return None
-    return _normalise_for_resume(msgs)
+    return _normalise_for_resume(msgs, flatten=flatten)
 
     # If session_id looks like a trajectoriz short ID (e.g. "ap-<hex8>"),
     # resolve it by hashing each snapshot's actual session ID.
@@ -1275,7 +1336,9 @@ def _load_messages_snapshot(model: str, session_id: str) -> list[dict[str, Any]]
     return None
 
 
-def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list[dict[str, Any]] | None, str | None]:
+def _find_snapshot_in_other_models(
+    model: str, session_id: str, *, flatten: bool = False,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
     """Find a snapshot for session_id in model folders other than `model`."""
     current = safe_model_name(model)
     filename = f"{session_id}_messages.json"
@@ -1310,62 +1373,7 @@ def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list[di
     msgs = data["messages"] if isinstance(data, dict) and "messages" in data else data
     if not isinstance(msgs, list):
         return None, None
-    # Normalise: merge consecutive user messages so the API's strict
-    # user/assistant alternation is preserved.
-    normalised: list[dict[str, Any]] = []
-    for m in msgs:
-        if normalised and m.get("role") == "user" and normalised[-1].get("role") == "user":
-            old = normalised[-1].get("content", "")
-            new = m.get("content", "")
-            normalised[-1]["content"] = f"{old}\n\n{new}" if old else new
-            normalised[-1]["ts"] = m.get("ts")
-        else:
-            normalised.append(dict(m))
-    # Convert tool calls to text descriptions.  Some providers (e.g.
-    # opencode.ai / deepseek-v4-flash-free) reject tool_call IDs that were
-    # generated in a previous API session.  Re-sending stale IDs produces a
-    # 400 "Upstream request failed" error.  We therefore flatten the tool
-    # call / result pairs into plain assistant text so the conversation
-    # history remains readable while being API-safe on resume.
-    converted: list[dict[str, Any]] = []
-    for m in normalised:
-        if m.get("role") == "assistant" and "tool_calls" in m:
-            for tc in m["tool_calls"]:
-                custom = tc.get("custom")
-                if custom:
-                    converted.append({
-                        "role": "assistant",
-                        "content": (f"[Tool call: {custom.get('name', '?')}"
-                                    f"({custom.get('input', '')})]"),
-                        "ts": m.get("ts"),
-                    })
-                    continue
-                fn = tc["function"]
-                converted.append({
-                    "role": "assistant",
-                    "content": f"[Tool call: {fn['name']}({fn['arguments']})]",
-                    "ts": m.get("ts"),
-                })
-        elif m.get("role") == "tool":
-            converted.append({
-                "role": "assistant",
-                "content": f"[Tool result: {m.get('content', '')}]",
-                "ts": m.get("ts"),
-            })
-        else:
-            converted.append(m)
-    # Merge consecutive assistant messages to preserve user/assistant
-    # alternation required by the API.
-    merged: list[dict[str, Any]] = []
-    for m in converted:
-        if merged and m.get("role") == "assistant" and merged[-1].get("role") == "assistant":
-            old = merged[-1].get("content", "")
-            new = m.get("content", "")
-            merged[-1]["content"] = f"{old}\n\n{new}" if old else new
-            merged[-1]["ts"] = m.get("ts")
-        else:
-            merged.append(dict(m))
-    return merged, best.parent.name
+    return _normalise_for_resume(msgs, flatten=flatten), best.parent.name
 
 
 # ── agent loop ────────────────────────────────────────────────────────────────
@@ -1789,7 +1797,8 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                                       if getattr(tool_executor, "policy", None) else None),
                    "ts": session_start_ts})
     if resumed_from:
-        loaded = _load_messages_snapshot(model, resumed_from)
+        flatten_resume = bool(behaviour.get("resume_rejects_stale_tool_call_ids"))
+        loaded = _load_messages_snapshot(model, resumed_from, flatten=flatten_resume)
         if loaded:
             session["messages"] = loaded
             _log(session, {"type": "session_resumed", "resumed_from": resumed_from,
@@ -1800,7 +1809,8 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                   fmt=f"{DIM}Resumed session {resumed_from} "
                       f"({len(loaded)} messages in context){RESET}")
         else:
-            loaded_other, source_model = _find_snapshot_in_other_models(model, resumed_from)
+            loaded_other, source_model = _find_snapshot_in_other_models(
+                model, resumed_from, flatten=flatten_resume)
             if loaded_other:
                 session["messages"] = loaded_other
                 _log(session, {"type": "session_resumed", "resumed_from": resumed_from,
@@ -1830,9 +1840,11 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         ):
             snap_count = len(session["messages"])
             # Reuse the snapshot normalisation (merge same-role messages,
-            # flatten stale tool-call IDs) so the recovered history is
-            # API-safe, then layer the pending-tool recovery note on top.
-            session["messages"] = _normalise_for_resume(journal_state.messages)
+            # optionally flatten stale tool-call IDs) so the recovered
+            # history is API-safe, then layer the pending-tool recovery
+            # note on top.
+            session["messages"] = _normalise_for_resume(
+                journal_state.messages, flatten=flatten_resume)
             _log(session, {"type": "journal_recovered", "resumed_from": resumed_from,
                            "entries_replayed": journal_state.entries_replayed,
                            "messages_loaded": len(journal_state.messages),

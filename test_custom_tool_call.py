@@ -92,8 +92,8 @@ def test_history_item_function_unchanged() -> None:
     }
 
 
-def test_normalise_for_resume_flattens_custom_calls() -> None:
-    """Resume flattening renders custom calls as readable text."""
+def test_normalise_for_resume_preserves_structured_calls_by_default() -> None:
+    """Without flatten=True, structured tool_calls/tool messages pass through unchanged."""
     from agentknit._core import _normalise_for_resume
     msgs = [
         {"role": "assistant",
@@ -102,11 +102,44 @@ def test_normalise_for_resume_flattens_custom_calls() -> None:
         {"role": "tool", "tool_call_id": "c", "content": "42"},
     ]
     out = _normalise_for_resume(msgs)
+    assert out == msgs
+
+
+def test_normalise_for_resume_flattens_custom_calls_when_requested() -> None:
+    """flatten=True renders custom calls as a neutral, non-bracket summary line."""
+    from agentknit._core import _normalise_for_resume
+    msgs = [
+        {"role": "assistant",
+         "tool_calls": [{"id": "c", "type": "custom",
+                         "custom": {"name": "t_g", "input": "raw text"}}]},
+        {"role": "tool", "tool_call_id": "c", "content": "42"},
+    ]
+    out = _normalise_for_resume(msgs, flatten=True)
     assert out == [
         {"role": "assistant",
-         "content": "[Tool call: t_g(raw text)]\n\n[Tool result: 42]",
+         "content": "prior tool use: t_g(raw text) -> ok",
          "ts": None},
     ]
+
+
+def test_normalise_for_resume_flatten_never_leaks_raw_result_json() -> None:
+    """flatten=True must not reproduce raw tool-result payloads (issue #25)."""
+    from agentknit._core import _normalise_for_resume
+    msgs = [
+        {"role": "assistant",
+         "tool_calls": [{"id": "c", "type": "function",
+                         "function": {"name": "write_file",
+                                      "arguments": "{\"path\": \"/tmp/x\"}"}}]},
+        {"role": "tool", "tool_call_id": "c",
+         "content": "{\"stdout\": \"secret payload\", \"returncode\": 0}"},
+    ]
+    out = _normalise_for_resume(msgs, flatten=True)
+    assert len(out) == 1
+    content = out[0]["content"]
+    assert "[Tool call:" not in content
+    assert "[Tool result:" not in content
+    assert "secret payload" not in content
+    assert content == "prior tool use: write_file({\"path\": \"/tmp/x\"}) -> ok"
 
 
 def test_run_turn_dispatches_custom_call_without_json(monkeypatch) -> None:

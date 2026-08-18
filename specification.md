@@ -78,6 +78,7 @@ Key resolution order: `keyring_service`+`keyring_username` → `key_env` → `OP
 | Key | Values | Description |
 |---|---|---|
 | `call_delivery_mode` | `"structured_tool_calls"` (default) / `"inline"` | `"structured_tool_calls"` uses the API's native function-calling mechanism.  `"inline"` injects a text-based tool schema into the system prompt and parses tool calls from the model's plain-text output. |
+| `resume_rejects_stale_tool_call_ids` | boolean, default `false` | Set `true` only for providers that reject tool-call IDs minted in a previous API session on resume (HTTP 400 "Upstream request failed" — seen on opencode.ai / deepseek-v4-flash-free). When `true`, resumed history has its `tool_calls` / tool results flattened into a neutral `prior tool use: name(args) -> ok` summary line instead of being replayed as structured messages. Leave `false` (the default) so resumed history keeps real structured tool calls — flattening unconditionally teaches the model that tool results are plain text it can write itself, which it will then fabricate (see [issue #25](https://github.com/monperrus/agentknit/issues/25)). |
 
 ---
 

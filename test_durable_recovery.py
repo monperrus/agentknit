@@ -172,6 +172,69 @@ def test_resume_flags_pending_tool_calls(tmp_path, monkeypatch):
     assert "verify" in last["content"].lower()
 
 
+def test_resume_keeps_structured_tool_calls_by_default(tmp_path, monkeypatch):
+    """Default resume must not flatten tool calls into imitable prose (issue #25).
+
+    Feeding the model a transcript where every prior tool call/result is
+    plain assistant text — while tools are still declared for the request —
+    teaches it to write tool calls as text and fabricate the results itself.
+    """
+    monkeypatch.setattr(core, "LOG_BASE", tmp_path)
+    schema = _schema(tmp_path)
+
+    session = init_session(schema)
+    sid = session["session_id"]
+    j = SessionJournal(_journal_path("test/model", sid))
+    j.turn_start("deploy")
+    j.message({"role": "user", "content": "deploy"})
+    j.message({"role": "assistant", "tool_calls": [
+        {"id": "c1", "type": "function",
+         "function": {"name": "t_run", "arguments": '{"command": "deploy.sh"}'}}]})
+    j.tool_start("c1", "t_run", {"command": "deploy.sh"})
+    j.tool_end("c1", "deploy ok", name="t_run")
+
+    session2 = init_session(schema, resumed_from=sid)
+
+    assert any("tool_calls" in m for m in session2["messages"])
+    for m in session2["messages"]:
+        content = m.get("content") or ""
+        assert "[Tool call:" not in content
+        assert "[Tool result:" not in content
+        assert "prior tool use:" not in content
+
+
+def test_resume_flattens_tool_calls_when_provider_opts_in(tmp_path, monkeypatch):
+    """behaviour.resume_rejects_stale_tool_call_ids=True still flattens, safely."""
+    monkeypatch.setattr(core, "LOG_BASE", tmp_path)
+    schema = _schema(
+        tmp_path,
+        behaviour={"resume_rejects_stale_tool_call_ids": True},
+    )
+
+    session = init_session(schema)
+    sid = session["session_id"]
+    j = SessionJournal(_journal_path("test/model", sid))
+    j.turn_start("deploy")
+    j.message({"role": "user", "content": "deploy"})
+    j.message({"role": "assistant", "tool_calls": [
+        {"id": "c1", "type": "function",
+         "function": {"name": "t_run", "arguments": '{"command": "deploy.sh"}'}}]})
+    j.tool_start("c1", "t_run", {"command": "deploy.sh"})
+    j.tool_end("c1", "deploy ok", name="t_run")
+
+    session2 = init_session(schema, resumed_from=sid)
+
+    assert not any("tool_calls" in m for m in session2["messages"])
+    assistant_contents = [m.get("content") or "" for m in session2["messages"]
+                          if m.get("role") == "assistant"]
+    assert any("prior tool use: t_run" in c for c in assistant_contents)
+    assert not any("[Tool call:" in c or "[Tool result:" in c
+                  for c in assistant_contents)
+    # The raw tool result must never appear inside assistant-authored text —
+    # that's exactly what teaches the model to fabricate results (issue #25).
+    assert not any("deploy ok" in c for c in assistant_contents)
+
+
 def test_resume_without_journal_falls_back_to_snapshot(tmp_path, monkeypatch):
     """No journal (old session or durable=False) → snapshot resume, unchanged."""
     monkeypatch.setattr(core, "LOG_BASE", tmp_path)

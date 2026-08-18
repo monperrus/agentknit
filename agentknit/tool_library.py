@@ -6,8 +6,11 @@ tool_dispatch.  New functions added by the probe's code-generation path land
 here too (appended via _register_generated).
 """
 
+from __future__ import annotations
+
 import json
 import os
+import queue as _queue
 import signal
 import subprocess
 import sys
@@ -15,6 +18,13 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
+    from typing import BinaryIO, Protocol, TypedDict
+else:
+    from typing import BinaryIO, Protocol, TypedDict
 
 
 # ── async shell execution ─────────────────────────────────────────────────────
@@ -29,13 +39,30 @@ ASYNC_FAST_THRESHOLD_S = 0.100
 ASYNC_INLINE_MAX_BYTES = 4096
 
 # exec_id → {"proc": Popen, "stdout_file": str, "stderr_file": str, "start": float}
-_async_executions: dict[str, dict] = {}
+class _AsyncExecEntry(TypedDict):
+    proc: subprocess.Popen[bytes]
+    stdout_file: str
+    stderr_file: str
+    stdin_file: str
+    start: float
+    started_at: str
+    cwd: str
+    command: str
+
+_async_executions: dict[str, _AsyncExecEntry] = {}
 _async_exec_lock = threading.Lock()
 
 # Completed processes push here so the REPL can trigger a new LLM turn.
 # Each entry: {"tool_exec_id", "returncode", "stdout_file", "stderr_file", "duration"}
-import queue as _queue
-async_completion_queue: _queue.Queue = _queue.Queue()
+class _AsyncCompletion(TypedDict):
+    tool_exec_id: str
+    returncode: int | None
+    stdout_file: str
+    stderr_file: str
+    duration: float
+    cwd: str
+
+async_completion_queue: "_queue.Queue[_AsyncCompletion]" = _queue.Queue()
 
 # Thread-local set by _core._handle_tool_call before each dispatch so tools
 # can access the current session without being passed the session dict.
@@ -44,7 +71,11 @@ _tool_context = threading.local()
 # Optional reference to the active _InputCollector (set by _core REPL loop).
 # When set, t_ask_user_question pauses it before calling input() so the
 # background reader thread doesn't steal keystrokes.
-_input_collector: object | None = None
+class _InputCollectorProtocol(Protocol):
+    def pause(self) -> None: ...
+    def resume(self) -> None: ...
+
+_input_collector: _InputCollectorProtocol | None = None
 
 
 def get_async_command_for_output_path(path: str) -> str | None:
@@ -52,8 +83,8 @@ def get_async_command_for_output_path(path: str) -> str | None:
     expanded = os.path.expanduser(path)
     with _async_exec_lock:
         for entry in _async_executions.values():
-            if expanded in {entry.get("stdout_file"), entry.get("stderr_file")}:
-                return entry.get("command")
+            if expanded in {entry["stdout_file"], entry["stderr_file"]}:
+                return entry["command"]
     return None
 
 
@@ -77,7 +108,7 @@ def _async_last_lines(path: str, n: int = 3) -> str:
         return ""
 
 
-def _async_add_inline(result: dict, stdout_path: str, stderr_path: str) -> None:
+def _async_add_inline(result: dict[str, object], stdout_path: str, stderr_path: str) -> None:
     """Append stdout/stderr content to *result* when both files are small enough."""
     out = _async_try_inline(stdout_path)
     err = _async_try_inline(stderr_path)
@@ -87,7 +118,7 @@ def _async_add_inline(result: dict, stdout_path: str, stderr_path: str) -> None:
         result["stderr"] = err
 
 
-def t_execute_async(command: str, when: int = 0) -> tuple[str, dict]:
+def t_execute_async(command: str, when: int = 0) -> tuple[str, dict[str, object]]:
     """Start a shell command asynchronously, capturing stdout/stderr to files.
 
     *when* (minutes, default 0) delays the start; use it to schedule a command
@@ -117,7 +148,7 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict]:
 
     # Open the FIFO write-end in a background thread (open() on a FIFO blocks
     # until a reader appears). The read-end is handed to the process.
-    stdin_write_fh: list = []   # populated by the thread once the process opens it
+    stdin_write_fh: "list[BinaryIO]" = []   # populated by the thread once the process opens it
 
     def _open_fifo_write() -> None:
         fh = open(stdin_path, "wb", buffering=0)
@@ -191,13 +222,12 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict]:
             "stdout_file": stdout_path,
             "stderr_file": stderr_path,
             "stdin_file":  stdin_path,
-            "stdin_write_fh": stdin_write_fh,
             "start": t0,
             "started_at": started_at,
             "cwd": cwd,
         }
 
-    result: dict = {
+    result: dict[str, object] = {
         "tool_exec_id": exec_id,
         "started_at":       started_at,
         "cwd":              cwd,
@@ -215,7 +245,7 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict]:
     return r, {"result": r}
 
 
-def t_query_exec(tool_exec_id: str) -> tuple[str, dict]:
+def t_query_exec(tool_exec_id: str) -> tuple[str, dict[str, object]]:
     """Poll the status of a command started with t_execute_async.
 
     When completed, returncode is included and stdout/stderr are inlined if
@@ -228,7 +258,7 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict]:
         r = json.dumps({"error": f"unknown tool_exec_id: {tool_exec_id}"})
         return r, {"result": r}
 
-    proc: subprocess.Popen = entry["proc"]
+    proc = entry["proc"]
     returncode = proc.poll()
     completed = returncode is not None
     duration = round(time.monotonic() - entry["start"], 3)
@@ -243,7 +273,7 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict]:
     except OSError:
         pass
 
-    result: dict = {
+    result: dict[str, object] = {
         "completed": completed,
         "returncode": returncode,  # None while running, int when done
         "started_at": entry["started_at"],
@@ -270,10 +300,10 @@ _RL_RESET = "\x01\033[0m\x02"
 
 # Tracks the subprocess currently executing inside a tool, so the SIGINT
 # handler in _core.py can SIGKILL it immediately on Ctrl-C.
-_active_proc: "subprocess.Popen | None" = None
+_active_proc: "subprocess.Popen[str] | None" = None
 
 
-def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tuple[str, dict]:
+def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tuple[str, dict[str, object]]:
     """Read and return the contents of a file at the specified path.
 
     Tool spec:
@@ -329,7 +359,7 @@ def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tu
         r = f"ERROR: {e}"
         return r, {"result": r}
 
-def t_write(path: str, content: str) -> tuple[str, dict]:
+def t_write(path: str, content: str) -> tuple[str, dict[str, object]]:
     """Write (or overwrite) a file at the specified path with the given content.
 
     Tool spec:
@@ -358,7 +388,7 @@ def t_write(path: str, content: str) -> tuple[str, dict]:
         r = f"ERROR: {e}"
         return r, {"result": r}
 
-def _apply_patch_format(patch: str) -> tuple[str, dict]:
+def _apply_patch_format(patch: str) -> tuple[str, dict[str, object]]:
     """Handle OpenAI-style apply_patch format.
 
     Expected shape:
@@ -406,7 +436,7 @@ def _apply_patch_format(patch: str) -> tuple[str, dict]:
     return t_update(path=path, old=old, new=new)
 
 
-def t_update(path: str = "", old: str = "", new: str = "", patch: str = "") -> tuple[str, dict]:
+def t_update(path: str = "", old: str = "", new: str = "", patch: str = "") -> tuple[str, dict[str, object]]:
     """Edit an existing file by replacing a specific substring.
 
     Tool spec:
@@ -449,7 +479,7 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "") -> t
         r = f"ERROR: {e}"
         return r, {"result": r}
 
-def t_run(command: str) -> tuple[str, dict]:
+def t_run(command: str) -> tuple[str, dict[str, object]]:
     """Execute a shell command and return its stdout, stderr, and exit code.
 
     Tool spec:
@@ -477,7 +507,7 @@ def t_run(command: str) -> tuple[str, dict]:
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
 
-        def _drain(stream, sink):
+        def _drain(stream: Iterable[str], sink: list[str]) -> None:
             for line in stream:
                 sink.append(line)
                 print(line, end="", flush=True)
@@ -552,7 +582,7 @@ def t_run(command: str) -> tuple[str, dict]:
     finally:
         _active_proc = None
 
-def t_ask_user(question: str) -> tuple[str, dict]:
+def t_ask_user(question: str) -> tuple[str, dict[str, object]]:
     """Prompt the user interactively and return their answer."""
     print(f"\n{_YEL}{_BOLD}? {question}{_RESET}")
     try:
@@ -580,19 +610,19 @@ def _play_ask_sound() -> None:
             )
         elif system == "Windows":
             import winsound
-            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)  # type: ignore[attr-defined]
         else:
             print("\a", end="", flush=True)
     except Exception:
         print("\a", end="", flush=True)
 
 
-def t_ask_user_question(question: str = '', options: str = '') -> tuple[str, dict]:
+def t_ask_user_question(question: str = '', options: str = '') -> tuple[str, dict[str, object]]:
     """Prompt the user with an optional numbered list of choices."""
     if not question:
         return 'ERROR: No question provided', {'result': 'error'}
 
-    parsed_options: list = []
+    parsed_options: list[object] = []
     if options:
         if isinstance(options, list):
             parsed_options = options
@@ -631,7 +661,7 @@ def t_ask_user_question(question: str = '', options: str = '') -> tuple[str, dic
     return r, {'result': answer, 'question': question, 'options': parsed_options}
 
 
-def t_list_dir(path: str) -> tuple[str, dict]:
+def t_list_dir(path: str) -> tuple[str, dict[str, object]]:
     try:
         entries = sorted(Path(os.path.expanduser(path)).iterdir(), key=lambda p: (p.is_file(), p.name))
         lines = [("d  " if e.is_dir() else "f  ") + e.name for e in entries]
@@ -641,7 +671,7 @@ def t_list_dir(path: str) -> tuple[str, dict]:
         r = f"ERROR: {e}"
         return r, {"result": r}
 
-def t_search(path: str = ".", pattern: str = "") -> tuple[str, dict]:
+def t_search(path: str = ".", pattern: str = "") -> tuple[str, dict[str, object]]:
     global _active_proc
     proc: subprocess.Popen[str] | None = None
     try:
@@ -657,7 +687,7 @@ def t_search(path: str = ".", pattern: str = "") -> tuple[str, dict]:
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
 
-        def _drain(stream, sink):
+        def _drain(stream: Iterable[str], sink: list[str]) -> None:
             for line in stream:
                 sink.append(line)
                 print(line, end="", flush=True)
@@ -686,7 +716,7 @@ def t_search(path: str = ".", pattern: str = "") -> tuple[str, dict]:
         t_err.join(timeout=5)
 
         out = "".join(stdout_lines)
-        matches: list[dict] = []
+        matches: list[dict[str, object]] = []
         for line in out.splitlines():
             # grep -n output:  file:line:text
             parts = line.split(":", 2)
@@ -716,7 +746,7 @@ def t_search(path: str = ".", pattern: str = "") -> tuple[str, dict]:
     finally:
         _active_proc = None
 
-def t_glob(pattern: str) -> tuple[str, dict]:
+def t_glob(pattern: str) -> tuple[str, dict[str, object]]:
     import glob as _glob
     try:
         matches = sorted(_glob.glob(pattern, recursive=True))
@@ -731,7 +761,12 @@ def t_glob(pattern: str) -> tuple[str, dict]:
 _ASK_USER_FNS = {"t_ask_user", "t_ask_user_question"}
 
 # Registry: function name (str) → callable.
-TOOL_LIBRARY: dict[str, callable] = {
+if TYPE_CHECKING:
+    ToolFn = Callable[..., tuple[str, dict[str, object]]]
+else:
+    ToolFn: Any
+
+TOOL_LIBRARY: "dict[str, ToolFn]" = {
     "t_read":               t_read,
     "t_write":              t_write,
     "t_update":             t_update,
@@ -768,12 +803,12 @@ def enable_rtk_rewrite() -> None:
         return command
 
     _orig_t_run = TOOL_LIBRARY["t_run"]
-    def _rtk_t_run(command: str, **kw):
+    def _rtk_t_run(command: str, **kw: Any) -> tuple[str, dict[str, object]]:
         return _orig_t_run(_rewrite(command), **kw)
     TOOL_LIBRARY["t_run"] = _rtk_t_run
 
     _orig_t_execute_async = TOOL_LIBRARY["t_execute_async"]
-    def _rtk_t_execute_async(command: str, **kw):
+    def _rtk_t_execute_async(command: str, **kw: Any) -> tuple[str, dict[str, object]]:
         return _orig_t_execute_async(_rewrite(command), **kw)
     TOOL_LIBRARY["t_execute_async"] = _rtk_t_execute_async
 
@@ -783,7 +818,7 @@ def _register_generated(fn_name: str, source: str) -> bool:
 
     Returns True on success, False if compilation/exec fails.
     """
-    ns: dict = {}
+    ns: dict[str, object] = {}
     try:
         exec(compile(source, "<generated>", "exec"), ns)  # noqa: S102
     except Exception as e:
@@ -798,8 +833,8 @@ def _register_generated(fn_name: str, source: str) -> bool:
 
 
 # --- generated: t_update_file ---
-def t_update_file(new_str: str = '', file_path: str = '', old_str: str = '') -> tuple[str, dict]:
-    result_dict = {'result': 'success'}
+def t_update_file(new_str: str = '', file_path: str = '', old_str: str = '') -> tuple[str, dict[str, object]]:
+    result_dict: dict[str, object] = {'result': 'success'}
     if not file_path:
         return ("ERROR: File path is required.", {'result': 'error'})
     try:
@@ -816,13 +851,13 @@ TOOL_LIBRARY['t_update_file'] = t_update_file
 
 
 # --- generated: t_list_directory ---
-def t_list_directory(path: str = '') -> tuple[str, dict]:
+def t_list_directory(path: str = '') -> tuple[str, dict[str, object]]:
     try:
         p = Path(os.path.expanduser(path))
         if not p.exists() or not p.is_dir():
             return ("ERROR: Path does not exist or is not a directory", {'result': 'error'})
         items = [str(item.name) for item in p.iterdir()]
-        result_dict = {
+        result_dict: dict[str, object] = {
             'result': 'success',
             'files': items
         }
@@ -834,7 +869,7 @@ TOOL_LIBRARY['t_list_directory'] = t_list_directory
 
 
 # --- generated: t_search_files ---
-def t_search_files(command: str = '') -> tuple[str, dict]:
+def t_search_files(command: str = '') -> tuple[str, dict[str, object]]:
     try:
         if not command:
             return "ERROR: command is required", {"result": "ERROR: command is required"}
@@ -874,7 +909,7 @@ TOOL_LIBRARY['t_search_files'] = t_search_files
 
 
 # --- generated: t_find_files ---
-def t_find_files(pattern: str = '', recursive: str = '') -> tuple[str, dict]:
+def t_find_files(pattern: str = '', recursive: str = '') -> tuple[str, dict[str, object]]:
     try:
         rec = str(recursive).strip().lower() in ('true', '1', 'yes', 'on')
         if not pattern:

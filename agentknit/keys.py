@@ -83,7 +83,7 @@ def _create_key(mgmt_key: str, name: str, limit: float) -> str | None:
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read().decode())
-        return result["key"]
+        return str(result["key"])
     except urllib.error.HTTPError as e:
         print(f"Warning: failed to create OpenRouter key: HTTP {e.code} {e.read().decode()}", file=sys.stderr)
         return None

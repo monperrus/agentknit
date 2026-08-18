@@ -62,7 +62,7 @@ class SlashCommand:
 
     name: str
     description: str
-    handler: Callable[[dict, Any, str, str], None]
+    handler: Callable[["Session", Any, str, str], None]
 
 
 class SlashCommandRegistry:
@@ -150,7 +150,7 @@ def _handle_compact(session: Session, client: Any, model: str, args: str) -> Non
         print(f"{YEL}Nothing to compact.{RESET}")
 
 
-def _fetch_models_from_endpoint(endpoint: str, api_key: str) -> list[dict]:
+def _fetch_models_from_endpoint(endpoint: str, api_key: str) -> list[dict[str, object]]:
     """Query the ``/models`` endpoint and return the list of model objects.
 
     Works for any OpenAI-compatible API that exposes GET ``/models``
@@ -317,9 +317,9 @@ REGISTRY.register(SlashCommand(
 
 # Shared context populated by the agent at startup so t_slash_command can
 # forward calls to handlers that need session + client.
-slash_tool_ctx: dict = {"session": None, "client": None, "model": None}
+slash_tool_ctx: dict[str, object] = {"session": None, "client": None, "model": None}
 
-_HANDLERS: dict[str, Callable] = {
+_HANDLERS: dict[str, Callable[..., object]] = {
     "clear":   _handle_clear,
     "compact": _handle_compact,
     "model":   _handle_model,
@@ -328,7 +328,7 @@ _HANDLERS: dict[str, Callable] = {
 }
 
 
-def t_slash_command(command: str, args: str = "") -> tuple[str, dict]:
+def t_slash_command(command: str, args: str = "") -> tuple[str, dict[str, object]]:
     """Run a slash command and return its output as a tool result.
 
     command must be one of: clear, compact, model, usage, help.

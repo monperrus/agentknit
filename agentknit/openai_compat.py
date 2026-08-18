@@ -14,6 +14,8 @@ SubprocessOpenAI(binary_path)  — same interface but pipes JSON to a binary's
   stdin and reads the OpenAI-format JSON response from its stdout.
 """
 
+from __future__ import annotations
+
 import datetime as _dt
 import json
 import re
@@ -23,6 +25,10 @@ import urllib.parse
 import requests
 import threading
 import collections
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from .exceptions import RateLimitError
 
@@ -83,7 +89,7 @@ class RateLimiter:
             self._timestamps.append(now)
 
 
-def _retry_delay_for_z_ai(text) -> float | None:  # type: ignore[no-untyped-def]
+def _retry_delay_for_z_ai(text: str) -> float | None:
     """Return the retry delay (seconds) parsed from a Z.ai 429 JSON body, or None.
 
     Zhipu (Z.ai / BigModel) reports the quota reset time only in the error
@@ -108,7 +114,7 @@ def _retry_delay_for_z_ai(text) -> float | None:  # type: ignore[no-untyped-def]
     return max(0.0, delay)
 
 
-def _z_ai_error_details(text) -> tuple[str | None, str | None]:  # type: ignore[no-untyped-def]
+def _z_ai_error_details(text: str) -> tuple[str | None, str | None]:
     """Extract Z.ai's business error code and message from an error body."""
     try:
         error = json.loads(text).get("error")
@@ -122,7 +128,7 @@ def _z_ai_error_details(text) -> tuple[str | None, str | None]:  # type: ignore[
             str(message) if message is not None else None)
 
 
-def _retry_delay_seconds(headers) -> float | None:  # type: ignore[no-untyped-def]
+def _retry_delay_seconds(headers: collections.abc.Mapping[str, str]) -> float | None:
     """Return the retry delay (seconds) a 429 response tells us to wait, or None.
 
     Checked in order of precedence: ``retry-after-ms``, ``retry-after``
@@ -244,7 +250,7 @@ class _Completions:
     def __init__(self, client: "OpenAI") -> None:
         self._client = client
 
-    def _build_url_and_headers(self) -> tuple[str, dict]:
+    def _build_url_and_headers(self) -> tuple[str, dict[str, str]]:
         base = self._client._base_url.rstrip("/")
         if "?" in base:
             _path, _qs = base.split("?", 1)
@@ -256,8 +262,8 @@ class _Completions:
                     else f"Bearer {self._client._api_key}")
         return url, {auth_hdr: auth_val, "Content-Type": "application/json"}
 
-    def _retry_post(self, url: str, headers: dict, payload: dict,
-                    stream: bool = False, on_rate_limit_wait=None) -> requests.Response:
+    def _retry_post(self, url: str, headers: dict[str, str], payload: dict[str, Any],
+                    stream: bool = False, on_rate_limit_wait: "Callable[..., None] | None" = None) -> requests.Response:
         read_timeout_retries = 0
         while True:
             self._client._rate_limiter.acquire()
@@ -312,14 +318,14 @@ class _Completions:
                 continue
             return resp
 
-    def create(self, *, model: str, messages: list, temperature: float = 0,
-               tools: list | None = None, tool_choice: str | None = None,
-               user: str | None = None, extra_body: dict | None = None,
+    def create(self, *, model: str, messages: list[dict[str, Any]], temperature: float = 0,
+               tools: list[dict[str, Any]] | None = None, tool_choice: str | None = None,
+               user: str | None = None, extra_body: dict[str, Any] | None = None,
                max_tokens: int | None = None,
-               on_content_delta=None,
-               on_reasoning_delta=None,
-               on_rate_limit_wait=None) -> _Response:
-        payload: dict = {"model": model, "messages": messages,
+               on_content_delta: "Callable[[str], None] | None" = None,
+               on_reasoning_delta: "Callable[[str], None] | None" = None,
+               on_rate_limit_wait: "Callable[..., None] | None" = None) -> _Response:
+        payload: dict[str, Any] = {"model": model, "messages": messages,
                          "temperature": temperature}
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
@@ -345,14 +351,15 @@ class _Completions:
         resp.raise_for_status()
         return _parse_response(resp.json())
 
-    def _create_streaming(self, url: str, headers: dict, payload: dict,
-                          on_content_delta, on_reasoning_delta=None,
-                          on_rate_limit_wait=None) -> _Response:
+    def _create_streaming(self, url: str, headers: dict[str, str], payload: dict[str, Any],
+                          on_content_delta: "Callable[[str], None] | None" = None,
+                          on_reasoning_delta: "Callable[[str], None] | None" = None,
+                          on_rate_limit_wait: "Callable[..., None] | None" = None) -> _Response:
         payload = {**payload, "stream": True}
         assembled_content = ""
         assembled_reasoning = ""
-        assembled_tool_calls: dict[int, dict] = {}
-        usage_data: dict = {}
+        assembled_tool_calls: dict[int, dict[str, Any]] = {}
+        usage_data: dict[str, Any] = {}
 
         # _retry_post loops internally while a retryable 429 is seen, and
         # raises RateLimitError for a non-retryable one — it never returns
@@ -393,7 +400,8 @@ class _Completions:
                     content_piece = delta.get("content") or ""
                     if content_piece:
                         assembled_content += content_piece
-                        on_content_delta(content_piece)
+                        if on_content_delta:
+                            on_content_delta(content_piece)
 
                     for tc_delta in delta.get("tool_calls") or []:
                         idx = tc_delta.get("index", 0)
@@ -434,12 +442,12 @@ class _Completions:
             }],
             "usage": usage_data,
         }
-        resp = _parse_response(data)
-        resp.reasoning = assembled_reasoning or None
-        return resp
+        parsed = _parse_response(data)
+        parsed.reasoning = assembled_reasoning or None
+        return parsed
 
 
-def _parse_tool_call(tc: dict) -> _ToolCall:
+def _parse_tool_call(tc: dict[str, Any]) -> _ToolCall:
     """Build a _ToolCall from one raw chat-completions tool_call dict.
 
     Supports both shapes:
@@ -472,7 +480,7 @@ def _parse_tool_call(tc: dict) -> _ToolCall:
     )
 
 
-def _parse_response(data: dict) -> _Response:
+def _parse_response(data: dict[str, Any]) -> _Response:
     """Build a _Response from a parsed OpenAI-format dict (shared by HTTP and subprocess)."""
     choices = []
     for c in data.get("choices", []):
@@ -557,16 +565,16 @@ class _SubprocessCompletions:
     def __init__(self, client: "SubprocessOpenAI") -> None:
         self._client = client
 
-    def create(self, *, model: str, messages: list, temperature: float = 0,
-               tools: list | None = None, tool_choice: str | None = None,
-               user: str | None = None, extra_body: dict | None = None,
+    def create(self, *, model: str, messages: list[dict[str, Any]], temperature: float = 0,
+               tools: list[dict[str, Any]] | None = None, tool_choice: str | None = None,
+               user: str | None = None, extra_body: dict[str, Any] | None = None,
                max_tokens: int | None = None,
-               on_content_delta=None,
-               on_reasoning_delta=None,
-               on_rate_limit_wait=None) -> _Response:
+               on_content_delta: "Callable[[str], None] | None" = None,
+               on_reasoning_delta: "Callable[[str], None] | None" = None,
+               on_rate_limit_wait: "Callable[..., None] | None" = None) -> _Response:
         # No HTTP retry loop here — the subprocess binary owns its own
         # rate-limit handling, so on_rate_limit_wait is accepted but unused.
-        payload: dict = {"messages": messages, "temperature": temperature}
+        payload: dict[str, Any] = {"messages": messages, "temperature": temperature}
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
         # Strip run:// model identifiers so the binary uses its own default.

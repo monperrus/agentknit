@@ -70,10 +70,10 @@ class Tool:
 
     name: str
     description: str
-    fn: Callable
-    parameters: dict | None = None
-    param_map: dict | None = None
-    custom_format: dict | None = None
+    fn: Callable[..., object]
+    parameters: dict[str, object] | None = None
+    param_map: dict[str, str] | None = None
+    custom_format: dict[str, object] | None = None
 
     @property
     def python_function_name(self) -> str:
@@ -81,14 +81,14 @@ class Tool:
         return self.fn.__name__
 
     @property
-    def resolved_parameters(self) -> dict:
+    def resolved_parameters(self) -> dict[str, object]:
         """Return *parameters* if set, otherwise infer from *fn*'s signature."""
         if self.parameters is not None:
             return self.parameters
         return _infer_parameters(self.fn)
 
     @property
-    def resolved_param_map(self) -> dict:
+    def resolved_param_map(self) -> dict[str, str]:
         """Return *param_map* if set, otherwise the identity mapping."""
         if self.param_map is not None:
             return self.param_map
@@ -98,10 +98,12 @@ class Tool:
         # Identity: each parameter name maps to itself.
         params = self.resolved_parameters
         props = params.get("properties", {})
-        return {k: k for k in props}
+        if not isinstance(props, dict):
+            return {}
+        return {str(k): str(k) for k in props}
 
 
-def _infer_parameters(fn: Callable) -> dict:
+def _infer_parameters(fn: Callable[..., object]) -> dict[str, object]:
     """Infer a JSON Schema ``parameters`` object from *fn*'s signature.
 
     Only positional-or-keyword parameters are included (``*args``, ``**kwargs``
@@ -129,7 +131,7 @@ def _infer_parameters(fn: Callable) -> dict:
         bool: "boolean",
     }
 
-    properties: dict[str, dict] = {}
+    properties: dict[str, dict[str, object]] = {}
     required: list[str] = []
 
     for name, param in sig.parameters.items():
@@ -172,7 +174,7 @@ def _infer_parameters(fn: Callable) -> dict:
 
 def build_tool_spec(
     tools: list[Tool],
-) -> tuple[list[dict], dict[str, dict]]:
+) -> tuple[list[dict[str, object]], dict[str, dict[str, object]]]:
     """Convert a list of :class:`Tool` objects into the schema + dispatch pair.
 
     Parameters
@@ -206,8 +208,8 @@ def build_tool_spec(
     >>> dispatch["read_file"]["python_function"]
     't_read'
     """
-    schema: list[dict] = []
-    dispatch: dict[str, dict] = {}
+    schema: list[dict[str, object]] = []
+    dispatch: dict[str, dict[str, object]] = {}
 
     for tool in tools:
         # ── schema entry ─────────────────────────────────────────────────
@@ -255,4 +257,4 @@ def register_tools_in_library(tools: list[Tool]) -> None:
     from .tool_library import TOOL_LIBRARY
 
     for tool in tools:
-        TOOL_LIBRARY[tool.python_function_name] = tool.fn
+        TOOL_LIBRARY[tool.python_function_name] = tool.fn  # type: ignore[assignment]

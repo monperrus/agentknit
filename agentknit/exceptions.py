@@ -52,7 +52,7 @@ class RateLimitError(AgentProbeError):
     """
 
     def __init__(self, message: str, *, status_code: int = 429,
-                 headers: dict | None = None, error_code: str | None = None,
+                 headers: "dict[str, str] | None" = None, error_code: str | None = None,
                  error_message: str | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code

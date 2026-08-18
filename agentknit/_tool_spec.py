@@ -120,17 +120,17 @@ def parse_tool_spec_from_docstring(doc: str) -> dict[str, Any] | None:
     return result
 
 
-def extract_tool_specs_from_module(module) -> dict[str, dict[str, Any]]:
+def extract_tool_specs_from_module(module: object) -> dict[str, dict[str, Any]]:
     """Extract tool specs from all functions in a module that have a ``Tool spec:`` block.
 
     Returns a dict mapping function name → parsed spec dict.
     """
     import inspect
 
-    specs = {}
+    specs: dict[str, dict[str, Any]] = {}
     for name, obj in inspect.getmembers(module, inspect.isfunction):
         doc = inspect.getdoc(obj)
-        spec = parse_tool_spec_from_docstring(doc)
+        spec = parse_tool_spec_from_docstring(doc or "")
         if spec is not None:
             specs[name] = spec
     return specs

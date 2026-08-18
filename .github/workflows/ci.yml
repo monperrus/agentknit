@@ -27,6 +27,16 @@ jobs:
           pip install .[keyring]
           pip install pytest pytest-cov
 
+      - name: Lint with ruff
+        run: |
+          pip install ruff
+          ruff check agentknit/
+
+      - name: Type-check with mypy (strict)
+        run: |
+          pip install mypy types-requests
+          python -m mypy agentknit/
+
       - name: Run tests with pytest
         run: |
           python -m pytest --cov=agentknit --cov-report=term-missing -v

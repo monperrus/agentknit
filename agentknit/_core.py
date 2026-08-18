@@ -104,10 +104,10 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, TypeAlias, TypedDict, cast
 
 if TYPE_CHECKING:
-    from typing import NotRequired
+    from typing import NotRequired, TextIO
     from .sandbox import ToolExecutor
 
 from . import openai_compat as openai
@@ -235,7 +235,7 @@ def _osc8_url(url: str) -> str:
 class _Osc8StdoutWrapper:
     """Line-buffered stdout wrapper that rewrites bare URLs as OSC 8 hyperlinks."""
 
-    def __init__(self, wrapped):
+    def __init__(self, wrapped: "TextIO") -> None:
         self._w = wrapped
         self._buf = ""
 
@@ -255,7 +255,7 @@ class _Osc8StdoutWrapper:
             self._buf = ""
         self._w.flush()
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> object:
         return getattr(self._w, name)
 
 
@@ -298,10 +298,10 @@ signal.signal(signal.SIGINT, _sigint_handler)
 
 # EventCallback(event_type, data) — the data dict always contains a "fmt" key
 # with a pre-formatted ANSI string so simple handlers can just print it.
-EventCallback = Callable[[str, dict], None]
+EventCallback: TypeAlias = Callable[[str, "dict[str, Any]"], None]
 
 
-def _default_event_handler(event_type: str, data: dict) -> None:
+def _default_event_handler(event_type: str, data: dict[str, Any]) -> None:
     """Print the pre-formatted ANSI string from *data["fmt"]* to stdout/stderr.
 
     Events with ``no_newline=True`` are printed without a trailing newline
@@ -318,7 +318,7 @@ def _default_event_handler(event_type: str, data: dict) -> None:
         print(fmt)
 
 
-def _emit(session: Session, event_type: str, **data) -> None:
+def _emit(session: Session, event_type: str, **data: Any) -> None:
     """Fire *event_type* through the session's registered event handlers.
 
     First calls any per-event-type handlers registered via :func:`subscribe`,
@@ -337,7 +337,7 @@ def _emit(session: Session, event_type: str, **data) -> None:
     handler(event_type, data)
 
 
-def _rate_limit_wait_callback(session: Session):
+def _rate_limit_wait_callback(session: Session) -> "Callable[[float, datetime.datetime, str], None]":
     """Build an ``on_rate_limit_wait`` callback that emits a ``rate_limit_wait`` event."""
     def _on_rate_limit_wait(delay: float, resume_at: datetime.datetime, fmt: str) -> None:
         _emit(session, "rate_limit_wait", delay=delay, resume_at=resume_at.isoformat(), fmt=fmt)
@@ -391,8 +391,9 @@ def get_api_key() -> str:
 def _get_opencode_token() -> str:
     auth_json = Path.home() / ".local/share/opencode/auth.json"
     import json as _json
-    creds = _json.loads(auth_json.read_text())
-    token = creds.get("github-copilot", {}).get("access")
+    creds = cast(dict[str, Any], _json.loads(auth_json.read_text()))
+    gh = creds.get("github-copilot")
+    token = str(gh.get("access")) if isinstance(gh, dict) and gh.get("access") else None
     if not token:
         raise AuthenticationError(
             f"No github-copilot.access token found in {auth_json}"
@@ -411,7 +412,7 @@ def _parse_run_uri(endpoint: str) -> str | None:
     return None
 
 
-_DEFAULT_TOOL_SCHEMA = [
+_DEFAULT_TOOL_SCHEMA: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
@@ -491,11 +492,11 @@ _DEFAULT_TOOLS = [
 
 # ── spec loading ──────────────────────────────────────────────────────────────
 
-def _load_spec_file(path: Path) -> dict:
+def _load_spec_file(path: Path) -> "dict[str, Any]":
     """Read a spec JSON *path*, raising a typed error if unreadable."""
     try:
         with path.open() as f:
-            data = json.load(f)
+            data = cast(dict[str, Any], json.load(f))
     except FileNotFoundError:
         raise AgentSpecInvalidError(
             f"Spec file not found: {path}", model=path.name,
@@ -508,7 +509,7 @@ def _load_spec_file(path: Path) -> dict:
     return data
 
 
-def load_specification(model: str, endpoint: str, spec_path: str | None = None) -> dict:
+def load_specification(model: str, endpoint: str, spec_path: str | None = None) -> "dict[str, Any]":
     """Load an agent spec for `model`, without ever probing the model itself.
 
     agentknit only consumes specs — it does not generate them by talking to a
@@ -566,7 +567,7 @@ def load_specification(model: str, endpoint: str, spec_path: str | None = None) 
         if path.exists():
             print(f"{DIM}Using specification from {path.name}{RESET}")
             with path.open() as f:
-                return json.load(f)
+                return cast(dict[str, Any], json.load(f))
         return {
             "model":       model,
             "endpoint":    endpoint,
@@ -592,14 +593,14 @@ def load_specification(model: str, endpoint: str, spec_path: str | None = None) 
         if candidate.exists():
             print(f"{DIM}Using cached probe at {candidate.name}{RESET}")
             with candidate.open() as f:
-                return json.load(f)
+                return cast(dict[str, Any], json.load(f))
 
     # Also check the working directory for a user-created spec.
     cwd_path = Path.cwd() / f"agent_spec_{safe_model_name(model)}.json"
     if cwd_path.exists():
         print(f"{DIM}Using specification from {cwd_path.name}{RESET}")
         with cwd_path.open() as f:
-            return json.load(f)
+            return cast(dict[str, Any], json.load(f))
 
     if endpoint:
         return {
@@ -625,19 +626,21 @@ class FatalToolDispatchError(RuntimeError):
     """Raised when the agent requests a tool that cannot be dispatched."""
 
 
-def _tool_name_from_spec(tool_spec: dict) -> str:
+def _tool_name_from_spec(tool_spec: dict[str, Any]) -> str:
     """Return the model-facing tool name from an OpenAI-compatible tool spec.
 
     Handles function specs (``{"type": "function", "function": {"name"}}``)
     and custom specs (``{"type": "custom", "name"}``).
     """
     if tool_spec.get("type") == "custom":
-        return tool_spec.get("name", "")
+        return str(tool_spec.get("name", ""))
     fn = tool_spec.get("function") or tool_spec
-    return fn.get("name", "")
+    if not isinstance(fn, dict):
+        return ""
+    return str(fn.get("name", ""))
 
 
-def _tool_param_names(tool_spec: dict) -> list[str]:
+def _tool_param_names(tool_spec: "dict[str, Any]") -> list[str]:
     """Return the model-facing parameter names from *tool_spec* in declaration order.
 
     Custom tools (``type == "custom"``) take a single raw-text argument and
@@ -650,7 +653,7 @@ def _tool_param_names(tool_spec: dict) -> list[str]:
     return list(params.keys())
 
 
-def _callable_param_names(fn: Callable) -> list[str]:
+def _callable_param_names(fn: Callable[..., object]) -> list[str]:
     """Return positional/keyword parameter names for *fn* in signature order."""
     import inspect
 
@@ -668,7 +671,7 @@ def _callable_param_names(fn: Callable) -> list[str]:
     return result
 
 
-def _derive_param_map(tool_spec: dict, fn_name: str) -> dict[str, str]:
+def _derive_param_map(tool_spec: "dict[str, Any]", fn_name: str) -> dict[str, str]:
     """Infer model-arg -> Python-kwarg mapping for *fn_name* and *tool_spec*."""
     fn = TOOL_LIBRARY.get(fn_name)
     if fn is None:
@@ -698,14 +701,14 @@ def _derive_param_map(tool_spec: dict, fn_name: str) -> dict[str, str]:
     }
 
 
-def _build_dispatch_from_tools(tool_specs: list[dict], tools: list[str]) -> dict[str, dict]:
+def _build_dispatch_from_tools(tool_specs: list[dict[str, Any]], tools: list[str]) -> dict[str, dict[str, Any]]:
     """Build a tool_dispatch dict from ordered tool specs and TOOL_LIBRARY names."""
     if len(tool_specs) != len(tools):
         raise AgentSpecInvalidError(
             f"'tool_specs' has {len(tool_specs)} entries but 'tools' has {len(tools)}.",
         )
 
-    dispatch: dict[str, dict] = {}
+    dispatch: dict[str, dict[str, Any]] = {}
     for tool_spec, fn_name in zip(tool_specs, tools, strict=False):
         if not isinstance(fn_name, str):
             raise AgentSpecInvalidError("'tools' must be a list of TOOL_LIBRARY function names.")
@@ -721,9 +724,9 @@ def _build_dispatch_from_tools(tool_specs: list[dict], tools: list[str]) -> dict
     return dispatch
 
 
-def _default_dispatch_for_tool_specs(tool_specs: list[dict]) -> dict[str, dict]:
+def _default_dispatch_for_tool_specs(tool_specs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Return built-in dispatch entries for tool specs whose names are known defaults."""
-    dispatch: dict[str, dict] = {}
+    dispatch: dict[str, dict[str, Any]] = {}
     for tool_spec in tool_specs:
         tool_name = _tool_name_from_spec(tool_spec)
         entry = _DEFAULT_TOOL_DISPATCH.get(tool_name)
@@ -732,7 +735,7 @@ def _default_dispatch_for_tool_specs(tool_specs: list[dict]) -> dict[str, dict]:
     return dispatch
 
 
-def _normalize_schema(schema: dict) -> dict:
+def _normalize_schema(schema: "dict[str, Any]") -> "dict[str, Any]":
     """Return a schema copy with public tool fields normalized for runtime use."""
     normalized = copy.deepcopy(schema)
     tool_specs = normalized.get("tool_specs")
@@ -754,7 +757,7 @@ def _normalize_schema(schema: dict) -> dict:
     return normalized
 
 
-def _resolve_fn(entry: dict) -> Callable | None:
+def _resolve_fn(entry: dict[str, Any]) -> Callable[..., Any] | None:
     """Return the callable from a dispatch entry.
 
     Supports two shapes:
@@ -769,12 +772,12 @@ def _resolve_fn(entry: dict) -> Callable | None:
     if pf is None:
         return None
     if callable(pf):
-        return pf
+        return cast(Callable[..., Any], pf)
     # string name → look up in TOOL_LIBRARY
-    return TOOL_LIBRARY.get(pf)
+    return TOOL_LIBRARY.get(str(pf))
 
 
-def dispatch(tool_name: str, args: dict, tool_dispatch: dict) -> tuple[str, dict]:
+def dispatch(tool_name: str, args: dict[str, Any], tool_dispatch: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     """Call the Python function mapped to *tool_name* via *tool_dispatch*.
 
     tool_dispatch entry shape:
@@ -819,7 +822,7 @@ def dispatch(tool_name: str, args: dict, tool_dispatch: dict) -> tuple[str, dict
 
 # ── schema helpers ────────────────────────────────────────────────────────────
 
-def schema_props(tool: dict) -> dict:
+def schema_props(tool: dict[str, Any]) -> dict[str, Any]:
     if tool.get("type") == "custom":
         # Custom tools have a single raw-text `input` argument.
         return {"input": {"type": "string"}}
@@ -836,8 +839,8 @@ def schema_props(tool: dict) -> dict:
 
 _decoder = json.JSONDecoder()
 
-def extract_inline_calls(text: str) -> list[tuple[str, dict]]:
-    out: list[tuple[str, dict]] = []
+def extract_inline_calls(text: str) -> list[tuple[str, dict[str, Any]]]:
+    out: list[tuple[str, dict[str, Any]]] = []
     pos = 0
     while pos < len(text):
         idx = text.find("{", pos)
@@ -859,13 +862,13 @@ def extract_inline_calls(text: str) -> list[tuple[str, dict]]:
 
 # ── prompts & display ─────────────────────────────────────────────────────────
 
-def fmt_call(name: str, args: dict) -> str:
+def fmt_call(name: str, args: dict[str, Any]) -> str:
     pretty = ", ".join(f"{k}={v!r}" for k, v in args.items())
     if len(pretty) > 200:
         pretty = pretty[:200] + "…"
     return f"{CYAN}{BOLD}▶ {name}({pretty}){RESET}"
 
-def fmt_usage(usage, *, compaction_trigger: int | None = None) -> str:
+def fmt_usage(usage: object, *, compaction_trigger: int | None = None) -> str:
     """One-line, human-readable token/cache breakdown for a single completion."""
     prompt      = getattr(usage, "prompt_tokens", 0) or 0
     completion  = getattr(usage, "completion_tokens", 0) or 0
@@ -912,7 +915,7 @@ def _last_message_age_seconds(session: Session) -> float | None:
     return (now - last_dt).total_seconds()
 
 
-def _enforce_cache_proof(session: Session, usage) -> None:
+def _enforce_cache_proof(session: Session, usage: object) -> None:
     """Fail closed when strict cache mode does not observe a cache hit.
 
     A resumed session whose last message is older than
@@ -944,10 +947,10 @@ def _enforce_cache_proof(session: Session, usage) -> None:
     cold_resume = age is not None and age > CACHE_COLD_GAP_SECONDS
     if cold_resume and not (has_cache_proof and cached_tokens > 0):
         notice = (
-            f"{DIM}Prefix cache expired (last message {int(age)}s old); "
+            f"{DIM}Prefix cache expired (last message {int(age or 0)}s old); "
             f"this turn was not served from cache and will re-process the prompt.{RESET}"
         )
-        _emit(session, "cache_cold", age=int(age), fmt=notice)
+        _emit(session, "cache_cold", age=int(age or 0), fmt=notice)
         session["_cache_cold_warned"] = True
         return
 
@@ -1004,7 +1007,7 @@ def fmt_read_result_with_command(command: str, text: str, streamed: bool = False
     return reminder + fmt_result(text, streamed=streamed)
 
 
-def inline_system_prompt(tools: list[dict]) -> str:
+def inline_system_prompt(tools: list[dict[str, Any]]) -> str:
     examples = []
     for tool in tools:
         if tool.get("type") == "custom":
@@ -1116,7 +1119,7 @@ def _open_log(model: str, session_id: str) -> Path:
     return path
 
 
-def _log(session: Session, record: dict) -> None:
+def _log(session: Session, record: "dict[str, Any]") -> None:
     record["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
     record["cwd"] = os.getcwd()
     with session["log_path"].open("a") as f:
@@ -1149,7 +1152,7 @@ def _save_messages_snapshot(session: Session) -> None:
     # tools given) plus the resolved tool-name list, so a snapshot records
     # exactly which tools the model had.  Traceability of their definitions
     # is provided by the agentknit commit id below.
-    tool_specs = session.get("tools")
+    tool_specs: Any = session.get("tools")
     default_names = [t["function"]["name"] for t in _DEFAULT_TOOL_SCHEMA]
     if tool_specs:
         tool_names = [((t.get("function") or t).get("name") or "?") for t in tool_specs]
@@ -1175,7 +1178,7 @@ def _save_messages_snapshot(session: Session) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def _normalise_for_resume(msgs: list) -> list:
+def _normalise_for_resume(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalise resumed messages into an API-safe user/assistant transcript.
 
     Merges consecutive same-role messages and flattens ``tool_calls`` /
@@ -1184,7 +1187,7 @@ def _normalise_for_resume(msgs: list) -> list:
     """
     # Normalise: merge consecutive user messages so the API's strict
     # user/assistant alternation is preserved.
-    normalised: list = []
+    normalised: list[dict[str, Any]] = []
     for m in msgs:
         if normalised and m.get("role") == "user" and normalised[-1].get("role") == "user":
             old = normalised[-1].get("content", "")
@@ -1199,7 +1202,7 @@ def _normalise_for_resume(msgs: list) -> list:
     # 400 "Upstream request failed" error.  We therefore flatten the tool
     # call / result pairs into plain assistant text so the conversation
     # history remains readable while being API-safe on resume.
-    converted: list = []
+    converted: list[dict[str, Any]] = []
     for m in normalised:
         if m.get("role") == "assistant" and "tool_calls" in m:
             for tc in m["tool_calls"]:
@@ -1228,7 +1231,7 @@ def _normalise_for_resume(msgs: list) -> list:
             converted.append(m)
     # Merge consecutive assistant messages to preserve user/assistant
     # alternation required by the API.
-    merged: list = []
+    merged: list[dict[str, Any]] = []
     for m in converted:
         if merged and m.get("role") == "assistant" and merged[-1].get("role") == "assistant":
             old = merged[-1].get("content", "")
@@ -1240,7 +1243,7 @@ def _normalise_for_resume(msgs: list) -> list:
     return merged
 
 
-def _load_messages_snapshot(model: str, session_id: str) -> list | None:
+def _load_messages_snapshot(model: str, session_id: str) -> list[dict[str, Any]] | None:
     path = _snapshot_path(model, session_id)
     if not path.exists():
         return None
@@ -1272,7 +1275,7 @@ def _load_messages_snapshot(model: str, session_id: str) -> list | None:
     return None
 
 
-def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list | None, str | None]:
+def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list[dict[str, Any]] | None, str | None]:
     """Find a snapshot for session_id in model folders other than `model`."""
     current = safe_model_name(model)
     filename = f"{session_id}_messages.json"
@@ -1309,7 +1312,7 @@ def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list | 
         return None, None
     # Normalise: merge consecutive user messages so the API's strict
     # user/assistant alternation is preserved.
-    normalised: list = []
+    normalised: list[dict[str, Any]] = []
     for m in msgs:
         if normalised and m.get("role") == "user" and normalised[-1].get("role") == "user":
             old = normalised[-1].get("content", "")
@@ -1324,7 +1327,7 @@ def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list | 
     # 400 "Upstream request failed" error.  We therefore flatten the tool
     # call / result pairs into plain assistant text so the conversation
     # history remains readable while being API-safe on resume.
-    converted: list = []
+    converted: list[dict[str, Any]] = []
     for m in normalised:
         if m.get("role") == "assistant" and "tool_calls" in m:
             for tc in m["tool_calls"]:
@@ -1353,7 +1356,7 @@ def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list | 
             converted.append(m)
     # Merge consecutive assistant messages to preserve user/assistant
     # alternation required by the API.
-    merged: list = []
+    merged: list[dict[str, Any]] = []
     for m in converted:
         if merged and m.get("role") == "assistant" and merged[-1].get("role") == "assistant":
             old = merged[-1].get("content", "")
@@ -1367,7 +1370,7 @@ def _find_snapshot_in_other_models(model: str, session_id: str) -> tuple[list | 
 
 # ── agent loop ────────────────────────────────────────────────────────────────
 
-def _tool_call_history_item(tc) -> dict:
+def _tool_call_history_item(tc: Any) -> "dict[str, Any]":
     """Serialize a tool call for the assistant history message.
 
     Function calls round-trip as ``{"type": "function", "function": {...}}``.
@@ -1385,10 +1388,10 @@ def _tool_call_history_item(tc) -> dict:
 
 
 def _expand_aliases(
-    tools: list,
-    tool_dispatch: dict,
-    aliases: dict,
-) -> tuple[list, dict]:
+    tools: list[dict[str, Any]],
+    tool_dispatch: dict[str, Any],
+    aliases: dict[str, str],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Expand alias → canonical mappings into the tool schema and dispatch table.
 
     For each ``alias_name: canonical_name`` pair:
@@ -1405,7 +1408,7 @@ def _expand_aliases(
     tool_dispatch = dict(tool_dispatch)
 
     # Fast lookup: tool name → index in tools list
-    schema_by_name: dict[str, dict] = {}
+    schema_by_name: dict[str, dict[str, Any]] = {}
     for t in tools:
         fn   = t.get("function") or t
         name = fn.get("name")
@@ -1478,9 +1481,9 @@ class Session(TypedDict):
     are ``NotRequired``.
     """
     # conversation & tools
-    messages: list[dict]             # role/content dicts; [0] is the system prompt
-    tools: list[dict]                # model-facing tool specs (OpenAI format)
-    tool_dispatch: dict              # tool name → {python_function, param_map}
+    messages: list[dict[str, Any]]             # role/content dicts; [0] is the system prompt
+    tools: list[dict[str, Any]]                # model-facing tool specs (OpenAI format)
+    tool_dispatch: dict[str, Any]              # tool name → {python_function, param_map}
     structured: bool                 # structured tool calls (vs inline text)
     # identity
     session_id: str
@@ -1489,11 +1492,11 @@ class Session(TypedDict):
     endpoint: str                    # base URL or run:// URI ("" if unknown)
     non_interactive: bool
     # accounting
-    usage_totals: dict               # {prompt, completion, total, cached, cache_write}
+    usage_totals: dict[str, int]               # {prompt, completion, total, cached, cache_write}
     llm_call_count: int
     session_start_ts: str            # ISO timestamp
     # provider & limits
-    provider: dict | None            # OpenRouter routing hints
+    provider: dict[str, Any] | None            # OpenRouter routing hints
     max_output_tokens: int | None
     strict_cache_proof: bool
     min_cacheable_tokens: int
@@ -1515,7 +1518,7 @@ class Session(TypedDict):
     durable: NotRequired[bool]
     # ── runtime-only state (set after construction) ──────────────────
     log_path: NotRequired[Path]      # JSONL transcript path (always set in practice)
-    auth: NotRequired[dict]          # auth *configuration* (never the key itself)
+    auth: NotRequired[dict[str, Any]]          # auth *configuration* (never the key itself)
     tool_executor: NotRequired["ToolExecutor | None"]
     _journal: NotRequired["SessionJournal | None"]
     _event_handlers: NotRequired[dict[str, list[EventCallback]]]
@@ -1523,7 +1526,7 @@ class Session(TypedDict):
     _cache_cold_warned: NotRequired[bool]
 
 
-def init_session(schema: dict, non_interactive: bool = False,
+def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                  resumed_from: str | None = None,
                  session: "Session | None" = None,
                  system_prompt_supplement: str = "",
@@ -1781,7 +1784,7 @@ def init_session(schema: dict, non_interactive: bool = False,
                    "mode": behaviour.get("call_delivery_mode"),
                    "non_interactive": non_interactive,
                    "cwd": os.getcwd(),
-                   "sandbox_policy": (tool_executor.policy.metadata()
+                   "sandbox_policy": (tool_executor.policy.metadata()  # type: ignore[union-attr]
                                       if getattr(tool_executor, "policy", None) else None),
                    "ts": session_start_ts})
     if resumed_from:
@@ -1875,7 +1878,7 @@ def _error_metadata(
     session: Session,
     client: object | None = None,
     request_started_at: float | None = None,
-) -> dict:
+) -> "dict[str, Any]":
     """Return stable, machine-readable fields for an error event/log record."""
     http_status = getattr(exc, "status_code", None)
     response = getattr(exc, "response", None)
@@ -1926,7 +1929,7 @@ def _emit_and_log_error(
     _log(session, record)
 
 
-def _complete(client: openai.OpenAI | SubprocessOpenAI, session: Session, **kwargs) -> object:
+def _complete(client: openai.OpenAI | SubprocessOpenAI, session: Session, **kwargs: Any) -> Any:
     kwargs["user"] = session["cache_key"]
     if session.get("max_output_tokens"):
         kwargs.setdefault("max_tokens", session["max_output_tokens"])
@@ -2139,7 +2142,7 @@ def _maybe_compact(
     client: openai.OpenAI | SubprocessOpenAI,
     model: str,
     session: Session,
-    usage,
+    usage: object,
 ) -> None:
     """Trigger compaction if the session's prompt tokens exceed the threshold.
 
@@ -2166,7 +2169,7 @@ def _apply_compaction_policy(
     client: openai.OpenAI | SubprocessOpenAI,
     model: str,
     session: Session,
-    usage,
+    usage: object,
     phase: str,
 ) -> None:
     """Run the session's compaction policy at *phase*.
@@ -2197,7 +2200,7 @@ def _apply_compaction_policy(
 
 def _handle_tool_call(
     name: str,
-    args: dict,
+    args: dict[str, Any],
     session: Session,
     *,
     call_id: str | None = None,
@@ -2232,7 +2235,7 @@ def _handle_tool_call(
 
     if is_ask and non_interactive:
         result = "ERROR: user interaction is disabled (--non-interactive)"
-        log_data: dict = {"result": result}
+        log_data: dict[str, Any] = {"result": result}
         streamed = False
     else:
         try:
@@ -2242,7 +2245,7 @@ def _handle_tool_call(
             else:
                 result, log_data = executor.execute(
                     name, args, entry, session={"session_id": session.get("session_id", "")})
-            streamed = log_data.pop("streamed", False)
+            streamed = bool(log_data.pop("streamed", False))
         except FatalToolDispatchError as e:
             result = str(e)
             _emit(session, "tool_result", name=name, result=result, streamed=False,
@@ -2442,7 +2445,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
     if journal is not None:
         journal.turn_start(task)
 
-    def _append_message(msg: dict) -> None:
+    def _append_message(msg: dict[str, Any]) -> None:
         """Append a message to the history and durably journal it."""
         messages.append(msg)
         if journal is not None:
@@ -2475,7 +2478,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
     try:
         while True:
             _check_cancelled()
-            kwargs: dict = dict(model=model, messages=messages, temperature=0)
+            kwargs: dict[str, Any] = dict(model=model, messages=messages, temperature=0)
             if structured:
                 kwargs["tools"] = tools
                 kwargs["tool_choice"] = "auto"
@@ -2539,10 +2542,10 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                     # Cold resume: cache has expired; a missing usage block on
                     # the first post-resume call is not a hard violation.
                     notice = (
-                        f"{DIM}Prefix cache expired (last message {int(age)}s old); "
+                        f"{DIM}Prefix cache expired (last message {int(age or 0)}s old); "
                         f"usage metadata unavailable this turn.{RESET}"
                     )
-                    _emit(session, "cache_cold", age=int(age), fmt=notice)
+                    _emit(session, "cache_cold", age=int(age or 0), fmt=notice)
                     session["_cache_cold_warned"] = True
                 else:
                     err = ("Strict cache mode requires usage metadata on every LLM call after the first, "
@@ -2571,7 +2574,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                         max_tokens *= 2
                         print(f"{DIM}Token budget doubled to {max_tokens:,}{RESET}", file=sys.stderr)
                         continue
-                return
+                return _session_result(session)
 
             # ── structured tool_calls ────────────────────────────────────────────
             if structured and msg.tool_calls:
@@ -2637,9 +2640,9 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                        f"completion {t['completion']:,}{RESET}\n"))
             # Build the result before turn-end compaction so final_reply
             # survives even when the policy summarizes the whole history away.
-            result = _session_result(session)
+            session_result = _session_result(session)
             _apply_compaction_policy(client, model, session, usage, phase="turn_end")
-            return result
+            return session_result
     except CacheProofError as exc:
         err = str(exc)
         _emit_and_log_error(session, exc, err, f"\n{RED}Error: {err}{RESET}",
@@ -2679,14 +2682,14 @@ def _azure_price_cache_path() -> Path:
     return cache_dir / "prices.json"
 
 
-def _load_azure_price_cache() -> dict | None:
+def _load_azure_price_cache() -> "dict[str, Any]" | None:
     """Load cached Azure pricing data if it is less than 7 days old."""
     path = _azure_price_cache_path()
     if not path.exists():
         return None
     try:
         with path.open() as f:
-            cache = json.load(f)
+            cache = cast(dict[str, Any], json.load(f))
         cached_at = cache.get("cached_at")
         if cached_at is None:
             return None
@@ -2698,7 +2701,7 @@ def _load_azure_price_cache() -> dict | None:
         return None
 
 
-def _save_azure_price_cache(items: list[dict]) -> None:
+def _save_azure_price_cache(items: list[dict[str, Any]]) -> None:
     """Save Azure pricing data to the cache file with a timestamp."""
     cache = {
         "cached_at": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -2740,8 +2743,9 @@ def _fetch_azure_price(model: str) -> tuple[float | None, float | None]:
         norm_model = re.sub(r"[^a-z0-9]", "", model.lower())
 
         # Collect all matching entries, tagged by zone type
-        global_entries: list[tuple[bool, float]] = []  # (is_input, price_per_mtok)
-        dz_entries: list[tuple[bool, float]] = []
+        # (is_input, price_per_mtok, is_cache)
+        global_entries: list[tuple[bool, float, bool]] = []
+        dz_entries: list[tuple[bool, float, bool]] = []
 
         for item in items:
             meter_name = item.get("meterName", "")
@@ -2773,7 +2777,7 @@ def _fetch_azure_price(model: str) -> tuple[float | None, float | None]:
             direction = m.group(2).lower()
             is_input = direction.startswith(("inp", "input", "in"))
 
-            entry = (is_input, price_per_mtok, is_cache)
+            entry: "tuple[bool, float, bool]" = (is_input, price_per_mtok, is_cache)
             if is_global:
                 global_entries.append(entry)
             elif is_dz:
@@ -2797,7 +2801,7 @@ def _fetch_azure_price(model: str) -> tuple[float | None, float | None]:
     return None, None
 
 
-def check_and_display_pricing(schema: dict) -> None:
+def check_and_display_pricing(schema: "dict[str, Any]") -> None:
     """Fetch current pricing, display it, and exit if it exceeds spec limits."""
     model    = schema.get("model", "")
     endpoint = schema.get("endpoint", "")
@@ -2852,7 +2856,7 @@ def check_and_display_pricing(schema: dict) -> None:
 
 # ── public library API ────────────────────────────────────────────────────────
 
-def validate_schema(schema: dict) -> None:
+def validate_schema(schema: "dict[str, Any]") -> None:
     """Raise a typed exception if *schema* cannot be used to run an agent.
 
     Raises:
@@ -2876,8 +2880,8 @@ class SessionResult:
     """Structured result returned by :func:`run_turn` and :func:`run_task`."""
     session_id:  str
     final_reply: str | None
-    usage:       dict
-    messages:    list[dict]
+    usage:       dict[str, Any]
+    messages:    list[dict[str, Any]]
 
 
 def _session_result(session: Session) -> SessionResult:
@@ -2904,7 +2908,7 @@ def _endpoint_is_openrouter(endpoint: str | None) -> bool:
     return "openrouter.ai" in host
 
 
-def _get_key_for_schema(schema: dict) -> str:
+def _get_key_for_schema(schema: "dict[str, Any]") -> str:
     """Return the API key appropriate for this schema.
 
     Priority:
@@ -2977,7 +2981,7 @@ def _get_key_for_schema(schema: dict) -> str:
     )
 
 
-def create_client(schema: dict) -> "openai.OpenAI | SubprocessOpenAI":
+def create_client(schema: "dict[str, Any]") -> "openai.OpenAI | SubprocessOpenAI":
     """Create an API client from a loaded agent spec schema.
 
     Handles subprocess (run://), OpenCode GitHub-Copilot, and standard
@@ -2993,7 +2997,7 @@ def create_client(schema: dict) -> "openai.OpenAI | SubprocessOpenAI":
     binary_path = _parse_run_uri(endpoint) or _parse_run_uri(schema.get("model", ""))
     auth        = schema.get("auth")
     max_rpm     = schema.get("max_rpm")
-    kwargs: dict = {}
+    kwargs: dict[str, Any] = {}
     if max_rpm is not None:
         kwargs["max_rpm"] = max_rpm
     if binary_path is not None:
@@ -3005,7 +3009,7 @@ def create_client(schema: dict) -> "openai.OpenAI | SubprocessOpenAI":
 
 
 def run_task(
-    schema: dict,
+    schema: "dict[str, Any]",
     task: str,
     *,
     non_interactive: bool = False,
@@ -3147,7 +3151,7 @@ def run_agent(
 
 
 def run(
-    schema: dict | None = None,
+    schema: "dict[str, Any]" | None = None,
     task: str | None = None,
     *,
     model: str | None = None,
@@ -3257,7 +3261,7 @@ def _build_resume_cmd(
 
 
 def _repl_setup(
-    schema: dict,
+    schema: "dict[str, Any]",
     *,
     non_interactive: bool = False,
     session_id: str | None = None,
@@ -3275,7 +3279,7 @@ def _repl_setup(
     min_cacheable_tokens: int | None = None,
     durable: bool | None = None,
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
-) -> tuple:
+) -> tuple[Any, ...]:
     """Common REPL setup: validate, create client, init session, return (client, session, model, hist_file)."""
     validate_schema(schema)
     client = client or create_client(schema)
@@ -3420,7 +3424,7 @@ def _async_repl_turn(
 
 
 def run_repl(
-    schema: dict,
+    schema: "dict[str, Any]",
     *,
     non_interactive: bool = False,
     session_id: str | None = None,
@@ -3494,7 +3498,7 @@ def run_repl(
 
 
 def run_async_repl(
-    schema: dict,
+    schema: "dict[str, Any]",
     *,
     non_interactive: bool = False,
     session_id: str | None = None,
@@ -3633,7 +3637,7 @@ def main() -> None:
     mode     = behaviour.get("call_delivery_mode", "structured_tool_calls")
     mode_str = f"  |  mode: {mode}" if mode != "structured_tool_calls" else ""
 
-    opts: dict = dict(
+    opts: dict[str, Any] = dict(
         non_interactive          = args.non_interactive,
         resumed_from             = args.session,
         system_prompt_supplement = args.system_prompt_supplement,

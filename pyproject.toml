@@ -45,3 +45,4 @@ target-version = "py311"
 python_version = "3.11"
 strict = true
 ignore_missing_imports = true
+files = ["agentknit"]

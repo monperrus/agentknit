@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass
@@ -17,15 +16,15 @@ class ToolSessionContext(TypedDict, total=False):
 
 
 class ToolExecutor(Protocol):
-    def execute(self, tool_name: str, args: dict, dispatch_entry: dict, *,
-                session: ToolSessionContext) -> tuple[str, dict]: ...
+    def execute(self, tool_name: str, args: dict[str, object], dispatch_entry: dict[str, object], *,
+                session: ToolSessionContext) -> tuple[str, dict[str, object]]: ...
 
 
 class LocalToolExecutor:
     """The historic in-controller dispatcher, used unless an executor is supplied."""
 
-    def execute(self, tool_name: str, args: dict, dispatch_entry: dict, *,
-                session: ToolSessionContext) -> tuple[str, dict]:
+    def execute(self, tool_name: str, args: dict[str, object], dispatch_entry: dict[str, object], *,
+                session: ToolSessionContext) -> tuple[str, dict[str, object]]:
         # Import lazily to avoid a _core import cycle.
         from ._core import dispatch
         return dispatch(tool_name, args, {tool_name: dispatch_entry})
@@ -49,8 +48,8 @@ class SandboxPolicy:
         if not self.workspace.is_dir():
             raise ValueError(f"workspace is not a directory: {self.workspace}")
 
-    def metadata(self) -> dict:
-        data = asdict(self)
+    def metadata(self) -> dict[str, object]:
+        data: dict[str, object] = dict(asdict(self))
         data["workspace"] = str(self.workspace)
         return data
 
@@ -72,8 +71,8 @@ class BubblewrapToolExecutor:
         if self.binary is None:
             raise RuntimeError("Bubblewrap is unavailable; refusing to fall back to local execution")
 
-    def execute(self, tool_name: str, args: dict, dispatch_entry: dict, *,
-                session: ToolSessionContext) -> tuple[str, dict]:
+    def execute(self, tool_name: str, args: dict[str, object], dispatch_entry: dict[str, object], *,
+                session: ToolSessionContext) -> tuple[str, dict[str, object]]:
         fn = dispatch_entry.get("python_function")
         if fn in self._FILE_TOOLS:
             return self._file_tool(str(fn), args, dispatch_entry)
@@ -97,16 +96,20 @@ class BubblewrapToolExecutor:
             raise ValueError("path escapes the sandbox workspace") from exc
         return candidate
 
-    def _file_tool(self, fn: str, args: dict, entry: dict) -> tuple[str, dict]:
-        mapped = {entry.get("param_map", {}).get(k, k): v for k, v in args.items()}
+    def _file_tool(self, fn: str, args: dict[str, object], entry: dict[str, object]) -> tuple[str, dict[str, object]]:
+        raw_pm = entry.get("param_map")
+        param_map: dict[str, object] = raw_pm if isinstance(raw_pm, dict) else {}
+        mapped = {param_map.get(k, k): v for k, v in args.items()}
         path = self._path(mapped.get("path"))
         if fn == "t_read":
             try:
                 text = path.read_text()
                 offset, limit = mapped.get("offset"), mapped.get("limit")
+                off = offset if isinstance(offset, int) else 0
+                lim = limit if isinstance(limit, int) else None
                 if offset is not None or limit is not None:
                     lines = text.splitlines(keepends=True)
-                    text = "".join(lines[offset or 0:(offset or 0) + limit if limit else None])
+                    text = "".join(lines[off:off + lim if lim else None])
                 return text, {"result": text}
             except OSError as exc:
                 result = f"ERROR: {exc}"
@@ -127,7 +130,8 @@ class BubblewrapToolExecutor:
         return result, {"result": result}
 
     def _bwrap_command(self, command: str) -> list[str]:
-        cmd = [self.binary, "--die-with-parent", "--new-session", "--unshare-net",
+        assert self.binary is not None  # guaranteed by __init__
+        cmd: list[str] = [self.binary, "--die-with-parent", "--new-session", "--unshare-net",
                "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
                "--ro-bind", str(self.policy.workspace), "/workspace"]
         for root in ("/usr", "/bin", "/lib", "/lib64", "/etc"):
@@ -144,8 +148,10 @@ class BubblewrapToolExecutor:
             cmd += ["--setenv", key, value]
         return cmd + ["--chdir", "/workspace", "/bin/bash", "-c", command]
 
-    def _shell_tool(self, args: dict, entry: dict) -> tuple[str, dict]:
-        command = {entry.get("param_map", {}).get(k, k): v for k, v in args.items()}.get("command")
+    def _shell_tool(self, args: dict[str, object], entry: dict[str, object]) -> tuple[str, dict[str, object]]:
+        raw_pm = entry.get("param_map")
+        param_map: dict[str, object] = raw_pm if isinstance(raw_pm, dict) else {}
+        command = {param_map.get(k, k): v for k, v in args.items()}.get("command")
         if not isinstance(command, str):
             raise ValueError("command must be a string")
         try:

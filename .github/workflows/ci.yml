@@ -29,8 +29,9 @@ jobs:
 
       - name: Lint with ruff
         run: |
-          # Pinned: ruff 0.16 widens the default rule set (UP/BLE/DTZ/…)
-          pip install "ruff~=0.15.12"
+          # Rule selection is pinned in pyproject.toml ([tool.ruff.lint] select),
+          # so any recent ruff works; >=0.15 keeps 3.11 target-version support.
+          pip install "ruff>=0.15.12"
           ruff check agentknit/
 
       - name: Type-check with mypy (strict)

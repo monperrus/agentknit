@@ -16,6 +16,7 @@ from unittest.mock import patch
 import pytest
 import requests
 
+from agentknit._core import _rate_limit_wait_callback
 from agentknit.exceptions import RateLimitError
 from agentknit.openai_compat import (
     OpenAI,
@@ -228,3 +229,48 @@ def test_create_raises_rate_limit_error_without_header():
     with patch("agentknit.openai_compat.requests.post", return_value=resp_429):
         with pytest.raises(RateLimitError):
             client.chat.completions.create(model="m", messages=[])
+
+
+def test_retry_post_calls_on_rate_limit_wait_before_sleeping():
+    client = _client()
+    resp_429 = _FakeResponse(429, {"retry-after": "2"})
+    resp_ok = _FakeResponse(200, {}, {"choices": []})
+    calls = [resp_429, resp_ok]
+    seen = []
+
+    def _fake_post(*args, **kwargs):
+        return calls.pop(0)
+
+    with patch("agentknit.openai_compat.requests.post", side_effect=_fake_post):
+        with patch("agentknit.openai_compat.time.sleep") as sleep:
+            resp = client.chat.completions._retry_post(
+                "https://x", {}, {}, on_rate_limit_wait=lambda *a: seen.append(a)
+            )
+
+    assert resp is resp_ok
+    assert sleep.called
+    assert len(seen) == 1
+    delay, resume_at, fmt = seen[0]
+    assert delay == 2.0
+    assert resume_at.tzinfo is not None
+    assert "rate-limited" in fmt and "waiting 2.0s" in fmt
+
+
+# ── _core._rate_limit_wait_callback ──────────────────────────────────────────
+
+def test_rate_limit_wait_callback_emits_session_event():
+    events = []
+    session = {
+        "on_event": lambda et, data: events.append((et, data)),
+        "_event_handlers": {},
+    }
+    resume_at = datetime.datetime.now(datetime.timezone.utc)
+
+    _rate_limit_wait_callback(session)(2.5, resume_at, "  [rate-limited] waiting 2.5s …")
+
+    assert len(events) == 1
+    event_type, data = events[0]
+    assert event_type == "rate_limit_wait"
+    assert data["delay"] == 2.5
+    assert data["resume_at"] == resume_at.isoformat()
+    assert data["fmt"] == "  [rate-limited] waiting 2.5s …"

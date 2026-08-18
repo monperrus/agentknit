@@ -257,7 +257,7 @@ class _Completions:
         return url, {auth_hdr: auth_val, "Content-Type": "application/json"}
 
     def _retry_post(self, url: str, headers: dict, payload: dict,
-                    stream: bool = False) -> requests.Response:
+                    stream: bool = False, on_rate_limit_wait=None) -> requests.Response:
         read_timeout_retries = 0
         while True:
             self._client._rate_limiter.acquire()
@@ -303,9 +303,11 @@ class _Completions:
                         error_message=error_message,
                     )
                 resume_at = _dt.datetime.now().astimezone() + _dt.timedelta(seconds=delay)
-                print(f"  [rate-limited] waiting {delay:.1f}s "
-                      f"(resuming at {resume_at.strftime('%H:%M:%S %Z')}) …",
-                      flush=True)
+                fmt = (f"  [rate-limited] waiting {delay:.1f}s "
+                       f"(resuming at {resume_at.strftime('%H:%M:%S %Z')}) …")
+                if on_rate_limit_wait is not None:
+                    on_rate_limit_wait(delay, resume_at, fmt)
+                print(fmt, flush=True)
                 time.sleep(delay)
                 continue
             return resp
@@ -315,7 +317,8 @@ class _Completions:
                user: str | None = None, extra_body: dict | None = None,
                max_tokens: int | None = None,
                on_content_delta=None,
-               on_reasoning_delta=None) -> _Response:
+               on_reasoning_delta=None,
+               on_rate_limit_wait=None) -> _Response:
         payload: dict = {"model": model, "messages": messages,
                          "temperature": temperature}
         if max_tokens is not None:
@@ -333,16 +336,18 @@ class _Completions:
 
         if on_content_delta is not None:
             return self._create_streaming(url, headers, payload,
-                                          on_content_delta, on_reasoning_delta)
+                                          on_content_delta, on_reasoning_delta,
+                                          on_rate_limit_wait)
 
-        resp = self._retry_post(url, headers, payload)
+        resp = self._retry_post(url, headers, payload, on_rate_limit_wait=on_rate_limit_wait)
         if not resp.ok:
             print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
         resp.raise_for_status()
         return _parse_response(resp.json())
 
     def _create_streaming(self, url: str, headers: dict, payload: dict,
-                          on_content_delta, on_reasoning_delta=None) -> _Response:
+                          on_content_delta, on_reasoning_delta=None,
+                          on_rate_limit_wait=None) -> _Response:
         payload = {**payload, "stream": True}
         assembled_content = ""
         assembled_reasoning = ""
@@ -352,7 +357,8 @@ class _Completions:
         # _retry_post loops internally while a retryable 429 is seen, and
         # raises RateLimitError for a non-retryable one — it never returns
         # a 429 response here.
-        resp = self._retry_post(url, headers, payload, stream=True)
+        resp = self._retry_post(url, headers, payload, stream=True,
+                                on_rate_limit_wait=on_rate_limit_wait)
         if not resp.ok:
             print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
             resp.raise_for_status()
@@ -556,7 +562,10 @@ class _SubprocessCompletions:
                user: str | None = None, extra_body: dict | None = None,
                max_tokens: int | None = None,
                on_content_delta=None,
-               on_reasoning_delta=None) -> _Response:
+               on_reasoning_delta=None,
+               on_rate_limit_wait=None) -> _Response:
+        # No HTTP retry loop here — the subprocess binary owns its own
+        # rate-limit handling, so on_rate_limit_wait is accepted but unused.
         payload: dict = {"messages": messages, "temperature": temperature}
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens

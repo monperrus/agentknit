@@ -345,6 +345,7 @@ generic `on_event` handler.
 | `compaction` | Context was compacted into a summary | `summary`, `compacted_turns`, `fmt` |
 | `cache_cold` | Resumed turn missed the (expired) prefix cache | `age`, `fmt` |
 | `journal_recovered` | A resumed session was rebuilt from the durable journal | `entries_replayed`, `messages_loaded`, `pending`, `mid_turn`, `fmt` |
+| `rate_limit_wait` | Before sleeping through a retryable HTTP 429 | `delay`, `resume_at`, `fmt` |
 
 Every event data dict includes a `"fmt"` key containing a pre-formatted ANSI
 string suitable for direct printing to a terminal — this is what the default

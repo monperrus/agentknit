@@ -77,6 +77,9 @@ Event types
     had expired (last message older than ``CACHE_COLD_GAP_SECONDS``).
     Strict cache-proof enforcement is relaxed for this case.  Data:
     ``age``, ``fmt``.
+``rate_limit_wait``
+    Emitted before sleeping through a retryable HTTP 429.  Data:
+    ``delay`` (seconds), ``resume_at`` (ISO timestamp), ``fmt``.
 
 Every data dict contains a ``\"fmt\"`` key with a pre-formatted ANSI string.
 """
@@ -332,6 +335,13 @@ def _emit(session: Session, event_type: str, **data) -> None:
     # Then call the generic handler
     handler = session.get("on_event") or _default_event_handler  # type: ignore[truthy-function]
     handler(event_type, data)
+
+
+def _rate_limit_wait_callback(session: Session):
+    """Build an ``on_rate_limit_wait`` callback that emits a ``rate_limit_wait`` event."""
+    def _on_rate_limit_wait(delay: float, resume_at: datetime.datetime, fmt: str) -> None:
+        _emit(session, "rate_limit_wait", delay=delay, resume_at=resume_at.isoformat(), fmt=fmt)
+    return _on_rate_limit_wait
 
 
 def subscribe(session: Session, event_type: str, handler: EventCallback) -> None:
@@ -1941,6 +1951,7 @@ def _complete(client: openai.OpenAI | SubprocessOpenAI, session: Session, **kwar
             extra.setdefault("provider", session["provider"])
 
     kwargs["extra_body"] = extra
+    kwargs["on_rate_limit_wait"] = _rate_limit_wait_callback(session)
 
     session["_content_was_streamed"] = False
     if session.get("streaming"):
@@ -2065,6 +2076,7 @@ def compact_session(
             messages=compaction_messages,
             temperature=0,
             max_tokens=session.get("compaction_target_tokens", DEFAULT_COMPACTION_TARGET_TOKENS),
+            on_rate_limit_wait=_rate_limit_wait_callback(session),
         )
     except RateLimitError as exc:
         err = f"Compaction rate limited: {exc}"

@@ -477,37 +477,65 @@ _DEFAULT_TOOLS = [
 
 # ── spec loading ──────────────────────────────────────────────────────────────
 
-def load_specification(model: str, endpoint: str) -> dict:
+def _load_spec_file(path: Path) -> dict:
+    """Read a spec JSON *path*, raising a typed error if unreadable."""
+    try:
+        with path.open() as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise AgentSpecInvalidError(
+            f"Spec file not found: {path}", model=path.name,
+        ) from None
+    except json.JSONDecodeError as e:
+        raise AgentSpecInvalidError(
+            f"Spec file {path} is not valid JSON: {e}", model=path.name,
+        ) from None
+    print(f"{DIM}Using schema file {path.name}{RESET}")
+    return data
+
+
+def load_specification(model: str, endpoint: str, spec_path: str | None = None) -> dict:
     """Load an agent spec for `model`, without ever probing the model itself.
 
     agentknit only consumes specs — it does not generate them by talking to a
     model. This resolves, in order:
 
-    1. A ``run://`` URI (in `endpoint` or `model`): looks for a cached
+    1. An explicit ``spec_path``: that file is read (absolute, or relative
+       to the current working directory) and returned as-is, skipping all
+       name-based lookup. Composes with `run://` endpoints.
+    2. A ``run://`` URI (in `endpoint` or `model`): looks for a cached
        ``agent_spec_<model>.json`` next to the binary; if absent returns an
        in-memory default spec (structured tool calls, default tool set).
-    2. A direct path to a ``.json`` schema file (`model` ending in
-       ``.json``): loaded and returned as-is.
-    3. A cached spec file for `model`, checked in order under the package
+    3. A direct path to a ``.json`` schema file (`model` ending in
+       ``.json``): loaded and returned as-is. Relative paths resolve
+       against the package root, so prefer ``spec_path``.
+    4. A cached spec file for `model`, checked in order under the package
        directory as ``agent_spec_<model>.json``,
        ``inferred_tool_schema_<model>.json``, then
        ``tool_schema_<model>.json``.
-    4. A spec file for `model` in the current working directory.
-    5. If none exists and `endpoint` is given: returns an in-memory default
+    5. A spec file for `model` in the current working directory.
+    6. If none exists and `endpoint` is given: returns an in-memory default
        spec.
-    6. Otherwise: raises `AgentSpecInvalidError` telling the caller to run
+    7. Otherwise: raises `AgentSpecInvalidError` telling the caller to run
        an external probing tool (e.g. `llmprobe`) to generate a real spec.
 
     :param model: Model identifier, a `run://` URI, or a path to a `.json`
         spec file.
     :param endpoint: Base URL of the OpenAI-compatible endpoint, or a
         `run://` URI.
+    :param spec_path: Optional explicit path to a spec JSON file. When set,
+        no API probing or name-based lookup happens.
     :returns: The loaded (or freshly generated default) spec as a dict.
-    :raises AgentSpecInvalidError: If no cached spec exists and `endpoint`
-        is falsy, so no default spec can be generated either.
+    :raises AgentSpecInvalidError: If ``spec_path`` does not exist or is not
+        valid JSON; or if no cached spec exists and `endpoint` is falsy, so
+        no default spec can be generated either.
     """
     # Spec JSON files live in the project root (parent of the package directory).
     here = Path(__file__).resolve().parent.parent
+
+    # Explicit spec path: read it, skip every other resolution step.
+    if spec_path:
+        return _load_spec_file(Path(spec_path).expanduser())
 
     # run:// URI → subprocess binary; use cached spec or return in-memory default.
     # Accept run:// in either endpoint or model (CLI convenience).
@@ -539,10 +567,7 @@ def load_specification(model: str, endpoint: str) -> dict:
         path = Path(model)
         if not path.is_absolute():
             path = here / path
-        with path.open() as f:
-            data = json.load(f)
-        print(f"{DIM}Using schema file {path.name}{RESET}")
-        return data
+        return _load_spec_file(path)
 
     # Check known shipped spec-files in the package directory first.
     for candidate in (
@@ -3473,6 +3498,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("model", help="Model ID, e.g. qwen/qwen3-vl-32b-instruct")
     p.add_argument("task", nargs="*", help="Task to run (omit for REPL or stdin)")
     p.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="Endpoint base URL")
+    p.add_argument("--spec-path", metavar="PATH", dest="spec_path", default=None,
+                   help="Load the agent spec from this JSON file, skipping all "
+                        "name-based spec lookup and model probing")
     p.add_argument("--non-interactive", action="store_true", dest="non_interactive",
                    help="Remove ask_user_question from the tool schema; "
                         "return an error if called anyway")
@@ -3511,7 +3539,7 @@ def main() -> None:
         enable_osc8_hyperlinks()
     args   = parse_args()
     try:
-        schema = load_specification(args.model, args.endpoint)
+        schema = load_specification(args.model, args.endpoint, spec_path=args.spec_path)
         validate_schema(schema)
         check_and_display_pricing(schema)
     except AgentSpecDisabledError as e:

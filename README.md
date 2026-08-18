@@ -27,6 +27,17 @@ result = run_task(schema, "List the files in /tmp")
 print(result.final_reply)
 ```
 
+To load a pre-written spec file directly (no name-based lookup, no probing), pass
+`spec_path=`:
+
+```python
+schema = load_specification(
+    "deepseek-v4-flash-free",
+    "run:///home/user/bin/completions.py",
+    spec_path="/home/user/.config/agentknit/agent_spec.json",
+)
+```
+
 ### Quick scripts with direct tools
 
 For small agents, use `run_agent()` to provide the model connection and

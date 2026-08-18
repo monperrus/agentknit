@@ -7,6 +7,7 @@ Provides a registry and built-in commands:
 * ``/compact`` – summarize older history into a compact continuation summary
 * ``/model``   – list / switch models (queries the endpoint's ``/models`` endpoint)
 * ``/usage``   – show token usage for the current session
+* ``/c``       – retry an interrupted turn without adding a user message
 
 Commands are intercepted in the REPL loop before the input is sent to the model.
 
@@ -282,11 +283,21 @@ def _handle_help(session: Session, client: Any, model: str, args: str) -> None:
     print(REGISTRY.help_text())
 
 
+def _handle_continue(session: Session, client: Any, model: str, args: str) -> None:
+    """Request a retry of the current turn without changing its transcript."""
+    session["_continue_requested"] = True
+
+
 # ── global registry ───────────────────────────────────────────────────────────
 
 REGISTRY = SlashCommandRegistry()
 
 # Register built-in commands.
+REGISTRY.register(SlashCommand(
+    name="c",
+    description="Retry an interrupted turn without adding a user message.",
+    handler=_handle_continue,
+))
 REGISTRY.register(SlashCommand(
     name="clear",
     description="Reset the session message history (keep system prompt).",

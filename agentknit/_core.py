@@ -1524,6 +1524,7 @@ class Session(TypedDict):
     _event_handlers: NotRequired[dict[str, list[EventCallback]]]
     _content_was_streamed: NotRequired[bool]
     _cache_cold_warned: NotRequired[bool]
+    _continue_requested: NotRequired[bool]
 
 
 def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
@@ -2387,7 +2388,7 @@ class _InputCollector:
                 sys.stdout.flush()
 
 
-def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Session, task: str,
+def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Session, task: str | None,
              *, cancel: CancelToken | None = None,
              timeout: float | None = None,
              tool_executor: "ToolExecutor | None" = None) -> SessionResult:
@@ -2395,6 +2396,8 @@ def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Sess
 
     The result reflects the session state at the end of the turn.
     ``final_reply`` is ``None`` if the turn was interrupted before a final answer.
+    Pass ``task=None`` to retry the current conversation state without
+    appending a synthetic user message (used by the REPL's ``/c`` command).
 
     Pass a :class:`CancelToken` to allow cooperative cancellation from another
     thread (e.g. a TUI stop button).
@@ -2434,7 +2437,7 @@ def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Sess
         _in_turn = False
 
 
-def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Session, task: str,
+def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Session, task: str | None,
               cancel: CancelToken | None = None,
               timeout_expired: threading.Event | None = None) -> SessionResult:
     messages   = session["messages"]
@@ -2452,7 +2455,12 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             journal.message(msg)
 
     now_ts = datetime.datetime.now().isoformat(timespec="seconds")
-    if messages and messages[-1].get("role") == "user":
+    if task is None:
+        # The prior user message was already journaled before the failed
+        # request.  Send that exact transcript again rather than turning a
+        # retry into a misleading "go" or "proceed" message.
+        pass
+    elif messages and messages[-1].get("role") == "user":
         # Merge consecutive user messages to keep the API-valid
         # user/assistant alternation.
         old = messages[-1]["content"]
@@ -2463,7 +2471,8 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             journal.message(messages[-1])
     else:
         _append_message({"role": "user", "content": task, "ts": now_ts})
-    _log(session, {"type": "user", "content": task, "ts": now_ts})
+    if task is not None:
+        _log(session, {"type": "user", "content": task, "ts": now_ts})
 
     total_tokens = 0
     max_tokens   = DEFAULT_MAX_TOKENS
@@ -3357,6 +3366,12 @@ def _repl_loop_body(
     """
     current_model = session.get("model", model)
     if _slash_registry.dispatch(t, session, client, current_model):
+        if session.pop("_continue_requested", False):
+            if use_async_input:
+                _async_repl_turn(None, client, session, current_model)
+            else:
+                _sync_repl_turn(None, client, session, current_model)
+            return
         _save_messages_snapshot(session)
         return
 
@@ -3367,7 +3382,7 @@ def _repl_loop_body(
 
 
 def _sync_repl_turn(
-    t: str,
+    t: str | None,
     client: openai.OpenAI | SubprocessOpenAI,
     session: Session,
     model: str,
@@ -3384,7 +3399,7 @@ def _sync_repl_turn(
 
 
 def _async_repl_turn(
-    t: str,
+    t: str | None,
     client: openai.OpenAI | SubprocessOpenAI,
     session: Session,
     model: str,
@@ -3392,7 +3407,7 @@ def _async_repl_turn(
     """Run a turn with a background ``_InputCollector`` queuing keystrokes."""
     _collector = _InputCollector()
     _tool_module._input_collector = _collector
-    _pending = [t]
+    _pending: list[str | None] = [t]
     try:
         while _pending:
             _task = _pending.pop(0)
@@ -3417,6 +3432,8 @@ def _async_repl_turn(
                     continue
                 if not _slash_registry.dispatch(_qs, session, client, model):
                     _pending.append(_qi)
+                elif session.pop("_continue_requested", False):
+                    _pending.append(None)
                 else:
                     _save_messages_snapshot(session)
     finally:
@@ -3449,7 +3466,7 @@ def run_repl(
     The session snapshot is saved after every turn so it can be resumed with
     ``--session <session_id>``.
 
-    Slash commands (``/clear``, ``/model``, ``/usage``, ``/help``) are
+    Slash commands (``/c``, ``/clear``, ``/model``, ``/usage``, ``/help``) are
     intercepted before sending input to the model.
 
     This is the *sync* variant — no background reader thread, so tools that
@@ -3610,7 +3627,7 @@ def parse_args() -> argparse.Namespace:
                         "call and tool result inside a turn is fsync'd to disk as it "
                         "happens, so a crashed session recovers to the exact point of "
                         "failure instead of losing the whole turn.")
-    return p.parse_args()
+    return p.parse_intermixed_args()
 
 
 def main() -> None:

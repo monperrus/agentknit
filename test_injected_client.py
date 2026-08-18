@@ -104,3 +104,18 @@ def test_run_repl_uses_injected_client(monkeypatch) -> None:
         run_repl(_schema(), client=client)
     assert len(client.requests) == 1
     assert client.requests[0]["messages"][-1]["content"] == "hi"
+
+
+def test_repl_continue_retries_without_adding_user_message(monkeypatch) -> None:
+    """/c replays an interrupted transcript instead of appending "go"."""
+    _stub_completions(monkeypatch)
+    monkeypatch.setattr(_core.select, "select", lambda *_: ([], [], []))
+    client = RecordingOpenAI(reply="repl-reply")
+    buf = io.StringIO()
+    monkeypatch.setattr(_core.sys, "stdin", io.StringIO("work\n/c\nexit\n"))
+    with contextlib.redirect_stdout(buf):
+        run_repl(_schema(), client=client)
+
+    assert len(client.requests) == 2
+    assert [m["content"] for m in client.requests[1]["messages"]
+            if m["role"] == "user"] == ["work"]

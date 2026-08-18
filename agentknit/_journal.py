@@ -113,7 +113,7 @@ class SessionJournal:
 
     # ── record builders ───────────────────────────────────────────────────
 
-    def turn_start(self, task: str) -> None:
+    def turn_start(self, task: str | None) -> None:
         self.append({"type": "turn_start", "task": task})
 
     def turn_end(self) -> None:

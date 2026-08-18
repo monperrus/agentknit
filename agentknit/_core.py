@@ -101,7 +101,11 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable, TypedDict
+
+if TYPE_CHECKING:
+    from typing import NotRequired
+    from .sandbox import ToolExecutor
 
 from . import openai_compat as openai
 from .openai_compat import SubprocessOpenAI
@@ -311,7 +315,7 @@ def _default_event_handler(event_type: str, data: dict) -> None:
         print(fmt)
 
 
-def _emit(session: dict, event_type: str, **data) -> None:
+def _emit(session: Session, event_type: str, **data) -> None:
     """Fire *event_type* through the session's registered event handlers.
 
     First calls any per-event-type handlers registered via :func:`subscribe`,
@@ -326,11 +330,11 @@ def _emit(session: dict, event_type: str, **data) -> None:
     for handler in handlers:
         handler(event_type, data)
     # Then call the generic handler
-    handler: EventCallback = session.get("on_event") or _default_event_handler
+    handler = session.get("on_event") or _default_event_handler  # type: ignore[truthy-function]
     handler(event_type, data)
 
 
-def subscribe(session: dict, event_type: str, handler: EventCallback) -> None:
+def subscribe(session: Session, event_type: str, handler: EventCallback) -> None:
     """Register an event handler for a specific event type.
 
     The *handler* will be called with ``(event_type, data)`` whenever an event
@@ -353,7 +357,7 @@ def subscribe(session: dict, event_type: str, handler: EventCallback) -> None:
     session["_event_handlers"].setdefault(event_type, []).append(handler)
 
 
-def unsubscribe(session: dict, event_type: str, handler: EventCallback) -> None:
+def unsubscribe(session: Session, event_type: str, handler: EventCallback) -> None:
     """Unregister a previously registered event handler.
 
     Does nothing if the *handler* was not registered for *event_type*.
@@ -874,7 +878,7 @@ def fmt_usage(usage, *, compaction_trigger: int | None = None) -> str:
     return "  |  ".join(parts)
 
 
-def _last_message_age_seconds(session: dict) -> float | None:
+def _last_message_age_seconds(session: Session) -> float | None:
     """Seconds since the last message in the session, or None if unmeasurable.
 
     When resuming a session after a break, the provider's prefix cache may
@@ -898,7 +902,7 @@ def _last_message_age_seconds(session: dict) -> float | None:
     return (now - last_dt).total_seconds()
 
 
-def _enforce_cache_proof(session: dict, usage) -> None:
+def _enforce_cache_proof(session: Session, usage) -> None:
     """Fail closed when strict cache mode does not observe a cache hit.
 
     A resumed session whose last message is older than
@@ -1034,7 +1038,7 @@ def read_repl_input(prompt: str) -> str:
     return text
 
 
-def print_session_history(session: dict) -> None:
+def print_session_history(session: Session) -> None:
     """Replay a resumed session's conversation to the console."""
     structured = session["structured"]
     sep = "─" * 56
@@ -1102,7 +1106,7 @@ def _open_log(model: str, session_id: str) -> Path:
     return path
 
 
-def _log(session: dict, record: dict) -> None:
+def _log(session: Session, record: dict) -> None:
     record["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
     record["cwd"] = os.getcwd()
     with session["log_path"].open("a") as f:
@@ -1117,7 +1121,7 @@ def _journal_path(model: str, session_id: str) -> Path:
     return LOG_BASE / safe_model_name(model) / f"{session_id}_journal.jsonl"
 
 
-def _save_messages_snapshot(session: dict) -> None:
+def _save_messages_snapshot(session: Session) -> None:
     # Only save if there is at least one non-system message worth resuming.
     if not any(m.get("role") != "system" for m in session["messages"]):
         return
@@ -1438,7 +1442,7 @@ _REQUIRED_SESSION_KEYS = frozenset({
 })
 
 
-def _validate_session_dict(session: dict) -> None:
+def _validate_session_dict(session: "Session") -> None:
     """Check that *session* has all keys required for restoration.
 
     Raises ``ValueError`` if any required key is missing.
@@ -1450,9 +1454,68 @@ def _validate_session_dict(session: dict) -> None:
         )
 
 
+class Session(TypedDict):
+    """Typed view of the stateful dict returned by :func:`init_session`.
+
+    A ``TypedDict`` (issue #3, lighter alternative to a dataclass): zero
+    runtime change — the session stays a plain ``dict`` — while IDEs and
+    mypy gain autocomplete and typo detection on every ``session["..."]``
+    access, and this class is the single source of truth for which fields
+    exist and what they hold.
+
+    Required keys mirror :data:`_REQUIRED_SESSION_KEYS`; runtime state that
+    only exists mid-session (underscore-prefixed) and optional auth metadata
+    are ``NotRequired``.
+    """
+    # conversation & tools
+    messages: list[dict]             # role/content dicts; [0] is the system prompt
+    tools: list[dict]                # model-facing tool specs (OpenAI format)
+    tool_dispatch: dict              # tool name → {python_function, param_map}
+    structured: bool                 # structured tool calls (vs inline text)
+    # identity
+    session_id: str
+    cache_key: str                   # prefix-cache key sent as user/prompt_cache_key
+    model: str
+    endpoint: str                    # base URL or run:// URI ("" if unknown)
+    non_interactive: bool
+    # accounting
+    usage_totals: dict               # {prompt, completion, total, cached, cache_write}
+    llm_call_count: int
+    session_start_ts: str            # ISO timestamp
+    # provider & limits
+    provider: dict | None            # OpenRouter routing hints
+    max_output_tokens: int | None
+    strict_cache_proof: bool
+    min_cacheable_tokens: int
+    streaming: bool
+    options: list[str]               # extra request options passed verbatim
+    # events
+    on_event: EventCallback
+    # compaction
+    compaction_enabled: bool
+    compaction_trigger_tokens: int
+    compaction_target_tokens: int
+    compaction_keep_last_turns: int
+    compaction_policy: "str | Callable[..., bool]"
+    compaction_min_chars: int
+    compaction_last_prompt_tokens: int
+    # durability
+    # NotRequired: sessions saved before the durable-recovery feature lack
+    # this key; the restore path defaults it to True.
+    durable: NotRequired[bool]
+    # ── runtime-only state (set after construction) ──────────────────
+    log_path: NotRequired[Path]      # JSONL transcript path (always set in practice)
+    auth: NotRequired[dict]          # auth *configuration* (never the key itself)
+    tool_executor: NotRequired["ToolExecutor | None"]
+    _journal: NotRequired["SessionJournal | None"]
+    _event_handlers: NotRequired[dict[str, list[EventCallback]]]
+    _content_was_streamed: NotRequired[bool]
+    _cache_cold_warned: NotRequired[bool]
+
+
 def init_session(schema: dict, non_interactive: bool = False,
                  resumed_from: str | None = None,
-                 session: dict | None = None,
+                 session: "Session | None" = None,
                  system_prompt_supplement: str = "",
                  cache_key: str | None = None,
                  max_output_tokens: int | None = None,
@@ -1468,8 +1531,8 @@ def init_session(schema: dict, non_interactive: bool = False,
                  compaction_min_chars: int | None = None,
                  min_cacheable_tokens: int | None = None,
                  durable: bool | None = None,
-                 ) -> dict:
-    """Build a stateful session dict.
+                 ) -> "Session":
+    """Build a stateful session dict (:class:`Session`).
 
     The cache_key is sent on every call as both `user` and `prompt_cache_key`
     so OpenRouter / the underlying provider can route this session's growing
@@ -1557,8 +1620,8 @@ def init_session(schema: dict, non_interactive: bool = False,
         _validate_session_dict(session)
         # Messages, usage totals, call count, session id, cache key, etc.
         # are preserved from the saved session.
-        restored = dict(session)  # shallow copy – we override several keys below
-        restored["log_path"] = _open_log(model, restored.get("session_id", uuid.uuid4().hex[:12]))
+        restored: Session = dict(session)  # type: ignore[assignment]  # shallow copy – we override several keys below
+        restored["log_path"] = _open_log(model, restored.get("session_id") or uuid.uuid4().hex[:12])
         # Reset compaction state so the new session starts fresh.
         restored["compaction_last_prompt_tokens"] = 0
         # Replace event handler if a new one was provided.
@@ -1590,8 +1653,8 @@ def init_session(schema: dict, non_interactive: bool = False,
             restored["durable"] = durable
         # Reopen (or start) the session journal on restore.
         restored["_journal"] = (
-            SessionJournal(_journal_path(restored.get("model", "unknown"),
-                                         restored.get("session_id", "")))
+            SessionJournal(_journal_path(restored.get("model") or "unknown",
+                                         restored.get("session_id") or ""))
             if restored.get("durable", True) else None
         )
         # Log the restoration event.
@@ -1799,7 +1862,7 @@ def init_session(schema: dict, non_interactive: bool = False,
 
 def _error_metadata(
     exc: BaseException,
-    session: dict,
+    session: Session,
     client: object | None = None,
     request_started_at: float | None = None,
 ) -> dict:
@@ -1833,7 +1896,7 @@ def _error_metadata(
 
 
 def _emit_and_log_error(
-    session: dict,
+    session: Session,
     exc: BaseException,
     text: str,
     fmt: str,
@@ -1853,7 +1916,7 @@ def _emit_and_log_error(
     _log(session, record)
 
 
-def _complete(client: openai.OpenAI | SubprocessOpenAI, session: dict, **kwargs) -> object:
+def _complete(client: openai.OpenAI | SubprocessOpenAI, session: Session, **kwargs) -> object:
     kwargs["user"] = session["cache_key"]
     if session.get("max_output_tokens"):
         kwargs.setdefault("max_tokens", session["max_output_tokens"])
@@ -1933,7 +1996,7 @@ def _complete(client: openai.OpenAI | SubprocessOpenAI, session: dict, **kwargs)
 def compact_session(
     client: openai.OpenAI | SubprocessOpenAI,
     model: str,
-    session: dict,
+    session: Session,
 ) -> bool:
     """Replace the oldest portion of the conversation with a continuation-oriented summary.
 
@@ -2063,7 +2126,7 @@ _compact_session = compact_session
 def _maybe_compact(
     client: openai.OpenAI | SubprocessOpenAI,
     model: str,
-    session: dict,
+    session: Session,
     usage,
 ) -> None:
     """Trigger compaction if the session's prompt tokens exceed the threshold.
@@ -2090,7 +2153,7 @@ def _maybe_compact(
 def _apply_compaction_policy(
     client: openai.OpenAI | SubprocessOpenAI,
     model: str,
-    session: dict,
+    session: Session,
     usage,
     phase: str,
 ) -> None:
@@ -2123,7 +2186,7 @@ def _apply_compaction_policy(
 def _handle_tool_call(
     name: str,
     args: dict,
-    session: dict,
+    session: Session,
     *,
     call_id: str | None = None,
 ) -> str:
@@ -2309,7 +2372,7 @@ class _InputCollector:
                 sys.stdout.flush()
 
 
-def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dict, task: str,
+def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Session, task: str,
              *, cancel: CancelToken | None = None,
              timeout: float | None = None,
              tool_executor: "ToolExecutor | None" = None) -> SessionResult:
@@ -2356,7 +2419,7 @@ def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dict
         _in_turn = False
 
 
-def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: dict, task: str,
+def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Session, task: str,
               cancel: CancelToken | None = None,
               timeout_expired: threading.Event | None = None) -> SessionResult:
     messages   = session["messages"]
@@ -2805,7 +2868,7 @@ class SessionResult:
     messages:    list[dict]
 
 
-def _session_result(session: dict) -> SessionResult:
+def _session_result(session: Session) -> SessionResult:
     """Build a SessionResult snapshot from the current session state."""
     final_reply: str | None = None
     for msg in reversed(session["messages"]):
@@ -3248,7 +3311,7 @@ def _repl_setup(
     return client, session, model, _hist_file
 
 
-def _repl_teardown(session: dict, hist_file: Path, resume_cmd: str) -> None:
+def _repl_teardown(session: Session, hist_file: Path, resume_cmd: str) -> None:
     """Common REPL teardown: save history, snapshot, log."""
     try:
         readline.write_history_file(hist_file)
@@ -3263,7 +3326,7 @@ def _repl_teardown(session: dict, hist_file: Path, resume_cmd: str) -> None:
 def _repl_loop_body(
     t: str,
     client: openai.OpenAI | SubprocessOpenAI,
-    session: dict,
+    session: Session,
     model: str,
     *,
     use_async_input: bool = False,
@@ -3290,7 +3353,7 @@ def _repl_loop_body(
 def _sync_repl_turn(
     t: str,
     client: openai.OpenAI | SubprocessOpenAI,
-    session: dict,
+    session: Session,
     model: str,
 ) -> None:
     """Run a single turn synchronously — no background reader thread."""
@@ -3307,7 +3370,7 @@ def _sync_repl_turn(
 def _async_repl_turn(
     t: str,
     client: openai.OpenAI | SubprocessOpenAI,
-    session: dict,
+    session: Session,
     model: str,
 ) -> None:
     """Run a turn with a background ``_InputCollector`` queuing keystrokes."""

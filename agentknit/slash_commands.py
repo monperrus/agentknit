@@ -23,9 +23,12 @@ import io
 import json
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .openai_compat import OpenAI, SubprocessOpenAI
+
+if TYPE_CHECKING:
+    from ._core import Session
 
 # ── colour helpers (same palette as _core.py) ─────────────────────────────────
 
@@ -77,7 +80,7 @@ class SlashCommandRegistry:
         self._commands.pop(name, None)
 
     def dispatch(self, line: str,
-                 session: dict,
+                 session: Session,
                  client: OpenAI | SubprocessOpenAI,
                  model: str) -> bool:
         """Parse *line* for a slash command and run it if found.
@@ -116,7 +119,7 @@ class SlashCommandRegistry:
 
 # ── built-in command handlers ─────────────────────────────────────────────────
 
-def _handle_clear(session: dict, client: Any, model: str, args: str) -> None:
+def _handle_clear(session: Session, client: Any, model: str, args: str) -> None:
     """Reset the session message history, keeping only the system prompt."""
     # Keep the first message (the system prompt).
     system_msgs = [m for m in session["messages"] if m.get("role") == "system"]
@@ -135,7 +138,7 @@ def _handle_clear(session: dict, client: Any, model: str, args: str) -> None:
     print(f"{GREEN}Context cleared. Session history has been reset.{RESET}")
 
 
-def _handle_compact(session: dict, client: Any, model: str, args: str) -> None:
+def _handle_compact(session: Session, client: Any, model: str, args: str) -> None:
     """Compact the session history into a continuation summary now."""
     from ._core import compact_session
 
@@ -176,7 +179,7 @@ def _fetch_models_from_endpoint(endpoint: str, api_key: str) -> list[dict]:
     return raw
 
 
-def _get_endpoint_and_key(client: Any, session: dict) -> tuple[str | None, str | None]:
+def _get_endpoint_and_key(client: Any, session: Session) -> tuple[str | None, str | None]:
     """Extract the endpoint URL and API key from the client or session."""
     # Prefer the endpoint stored in the session.
     endpoint = session.get("endpoint")
@@ -195,7 +198,7 @@ def _get_endpoint_and_key(client: Any, session: dict) -> tuple[str | None, str |
     return endpoint or None, api_key
 
 
-def _handle_model(session: dict, client: Any, model: str, args: str) -> None:
+def _handle_model(session: Session, client: Any, model: str, args: str) -> None:
     """List available models or switch to a different model."""
     from ._core import _parse_run_uri
 
@@ -243,7 +246,7 @@ def _handle_model(session: dict, client: Any, model: str, args: str) -> None:
     print(f"{DIM}The next turn will use the new model.{RESET}")
 
 
-def _handle_usage(session: dict, client: Any, model: str, args: str) -> None:
+def _handle_usage(session: Session, client: Any, model: str, args: str) -> None:
     """Display token usage for the current session."""
     t = session.get("usage_totals", {})
     prompt = t.get("prompt", 0)
@@ -274,7 +277,7 @@ def _handle_usage(session: dict, client: Any, model: str, args: str) -> None:
     print("\n".join(parts))
 
 
-def _handle_help(session: dict, client: Any, model: str, args: str) -> None:
+def _handle_help(session: Session, client: Any, model: str, args: str) -> None:
     """Show available slash commands."""
     print(REGISTRY.help_text())
 

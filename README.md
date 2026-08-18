@@ -279,8 +279,18 @@ subscribe(session, "usage", lambda event_type, data: print(f"[tokens] {data}"))
 subscribe(session, "error", lambda event_type, data: print(f"[error] {data['text']}"))
 ```
 
-The `on` function is a convenience alias for `subscribe`:
+`init_session()` returns a `Session` — a `TypedDict`, i.e. a plain `dict` at
+runtime, with typed, IDE-completable keys (`session["messages"]`,
+`session["usage_totals"]`, …). Import it from the package when you want the
+annotations in your own code:
 
+```python
+from agentknit import Session, init_session
+
+session: Session = init_session(schema)
+```
+
+The `on` function is a convenience alias for `subscribe`:
 ```python
 from agentknit import on
 

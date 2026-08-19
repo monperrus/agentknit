@@ -3377,14 +3377,19 @@ def _repl_loop_body(
     races with tools that call ``input()``.
     """
     current_model = session.get("model", model)
-    if _slash_registry.dispatch(t, session, client, current_model):
-        if session.pop("_continue_requested", False):
-            if use_async_input:
-                _async_repl_turn(None, client, session, current_model)
-            else:
-                _sync_repl_turn(None, client, session, current_model)
-            return
-        _save_messages_snapshot(session)
+    retried = False
+
+    def _retry_turn() -> None:
+        nonlocal retried
+        retried = True
+        if use_async_input:
+            _async_repl_turn(None, client, session, current_model)
+        else:
+            _sync_repl_turn(None, client, session, current_model)
+
+    if _slash_registry.dispatch(t, session, client, current_model, on_continue=_retry_turn):
+        if not retried:
+            _save_messages_snapshot(session)
         return
 
     if use_async_input:
@@ -3442,11 +3447,18 @@ def _async_repl_turn(
                 _qs = _qi.strip()
                 if not _qs or _qs.lower() in ("exit", "quit", "q"):
                     continue
-                if not _slash_registry.dispatch(_qs, session, client, model):
-                    _pending.append(_qi)
-                elif session.pop("_continue_requested", False):
+
+                _continued = False
+
+                def _on_continue() -> None:
+                    nonlocal _continued
+                    _continued = True
                     _pending.append(None)
-                else:
+
+                if not _slash_registry.dispatch(_qs, session, client, model,
+                                                on_continue=_on_continue):
+                    _pending.append(_qi)
+                elif not _continued:
                     _save_messages_snapshot(session)
     finally:
         _tool_module._input_collector = None

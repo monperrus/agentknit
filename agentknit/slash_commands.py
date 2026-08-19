@@ -83,11 +83,20 @@ class SlashCommandRegistry:
     def dispatch(self, line: str,
                  session: Session,
                  client: OpenAI | SubprocessOpenAI,
-                 model: str) -> bool:
+                 model: str,
+                 *,
+                 on_continue: Callable[[], None] | None = None) -> bool:
         """Parse *line* for a slash command and run it if found.
 
         Returns ``True`` if a command was handled (caller should skip model
         invocation), ``False`` if *line* is not a slash command.
+
+        Some commands (``/c``) print nothing; they ask for the interrupted
+        turn to be retried by setting ``session["_continue_requested"]``.
+        Pass *on_continue* to have that request resolved right here: it is
+        invoked, and the flag cleared, whenever a handler sets it — so
+        callers don't need to know the flag exists. Without *on_continue*
+        the flag is left untouched for the caller to check itself.
         """
         stripped = line.strip()
         if not stripped.startswith("/"):
@@ -107,6 +116,10 @@ class SlashCommandRegistry:
             cmd.handler(session, client, model, cmd_args)
         except Exception as exc:
             print(f"{RED}Error running /{cmd_name}: {exc}{RESET}")
+            return True
+
+        if on_continue is not None and session.pop("_continue_requested", False):
+            on_continue()
         return True
 
     def help_text(self) -> str:

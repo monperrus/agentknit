@@ -45,6 +45,7 @@ from .async_toolkit import (  # noqa: E402,A
     t_execute_async,
     t_nohup,
     t_query_exec,
+    t_wait_for,
 )
 
 __all__ = [  # re-exports (mypy --no-implicit-reexport)
@@ -54,7 +55,7 @@ __all__ = [  # re-exports (mypy --no-implicit-reexport)
     "_async_last_lines", "_async_try_inline", "_tool_context",
     "async_completion_queue", "enable_nohup",
     "get_async_command_for_output_path", "nohup_tool_specs",
-    "t_execute_async", "t_nohup", "t_query_exec",
+    "t_execute_async", "t_nohup", "t_query_exec", "t_wait_for",
 ]
 
 # Optional reference to the active _InputCollector (set by _core REPL loop).
@@ -556,6 +557,7 @@ TOOL_LIBRARY: "dict[str, ToolFn]" = {
     "t_execute_async":      t_execute_async,
     "t_query_exec":         t_query_exec,
     "t_nohup":              t_nohup,
+    "t_wait_for":           t_wait_for,
 }
 
 def enable_rtk_rewrite() -> None:

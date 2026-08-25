@@ -225,7 +225,7 @@ The framework ships with a built-in set of tools (`read_file`, `write_file`,
 `str_replace`, `exec_shell`). The previous name `execute_shell_command` is
 still accepted as an alias. 
 
-### Background shell tools (`nohup` / `nohup_query`)
+### Background shell tools (`nohup` / `nohup_query` / `wait_for`)
 
 `agentknit.async_toolkit` provides bounded background execution on top of the
 low-level `t_execute_async` / `t_query_exec` primitives: stdout/stderr are
@@ -238,11 +238,24 @@ import agentknit
 from agentknit.async_toolkit import enable_nohup
 
 schema = agentknit.load_specification(MODEL, ENDPOINT)
-enable_nohup(schema)   # appends nohup + nohup_query specs and dispatch entries
+enable_nohup(schema)   # appends nohup + nohup_query + wait_for specs and dispatch entries
 ```
 
 It is idempotent and supports both schema shapes (`tools` list or pre-built
 `tool_dispatch`). The default bound is 10 minutes (`NOHUP_TIMEOUT_MIN`).
+
+Async tools always come with three:
+
+| Tool | Role |
+|---|---|
+| `nohup` | Start a shell command in the background, bounded by `timeout` minutes (default 10). Returns `tool_exec_id` and the local stdin (FIFO)/stdout/stderr paths. |
+| `nohup_query` | Poll one execution by `tool_exec_id`; inlines stdout/stderr when both fit in 4 KiB, otherwise reports file sizes. |
+| `wait_for` | `wait_for(howmuch, unit)` blocks for `howmuch` × `unit` (`s`/`m`/`h`/`d`) instead of busy-polling, then reports every execution that finished meanwhile — returncode, output paths and last lines of stdout/stderr. |
+
+`wait_for` is the tool to call right after `nohup`: it sleeps once and returns
+whatever completed, so short commands need no `nohup_query` round trip. Waits
+are capped at `WAIT_FOR_MAX_SECONDS` (3600) per call; split longer waits into
+several calls.
 
 ### Sandboxed tool execution (Linux)
 

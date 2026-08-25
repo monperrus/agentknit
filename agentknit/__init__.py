@@ -103,9 +103,12 @@ from .tool_library import (
 
 from .async_toolkit import (
     NOHUP_TIMEOUT_MIN,
+    WAIT_FOR_MAX_SECONDS,
+    WAIT_FOR_UNIT_SECONDS,
     enable_nohup,
     nohup_tool_specs,
     t_nohup,
+    t_wait_for,
 )
 
 from .slash_commands import (
@@ -159,5 +162,6 @@ __all__ = [
     "ASYNC_EXEC_DIR", "ASYNC_FAST_THRESHOLD_S", "ASYNC_INLINE_MAX_BYTES",
     "enable_rtk_rewrite",
     # nohup tools (async_toolkit)
-    "NOHUP_TIMEOUT_MIN", "enable_nohup", "nohup_tool_specs", "t_nohup",
+    "NOHUP_TIMEOUT_MIN", "WAIT_FOR_MAX_SECONDS", "WAIT_FOR_UNIT_SECONDS",
+    "enable_nohup", "nohup_tool_specs", "t_nohup", "t_wait_for",
 ]

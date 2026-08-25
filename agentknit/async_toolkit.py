@@ -5,13 +5,15 @@ Two layers live here:
 * Low-level primitives ``t_execute_async`` / ``t_query_exec`` — start a shell
   command in the background (stdout/stderr captured to files, stdin exposed as
   a FIFO) and poll it by ``tool_exec_id``.
-* The model-facing ``nohup`` / ``nohup_query`` tools — the same primitives
-  wrapped in ``timeout(1)`` so execution is bounded, with ready-made JSON
-  tool specs.  :func:`enable_nohup` wires both into a spec schema in one call:
+* The model-facing async tool trio — async tools always come with three:
+  ``nohup`` (start, bounded by ``timeout(1)``), ``nohup_query`` (poll by
+  ``tool_exec_id``) and ``wait_for`` (block for *howmuch* × *unit* and report
+  everything that finished meanwhile), each with ready-made JSON tool specs.
+  :func:`enable_nohup` wires all three into a spec schema in one call:
 
   >>> from agentknit.async_toolkit import enable_nohup
   >>> schema = agentknit.load_specification(MODEL, ENDPOINT)
-  >>> enable_nohup(schema)          # adds nohup + nohup_query tools
+  >>> enable_nohup(schema)          # adds nohup + nohup_query + wait_for
 """
 
 from __future__ import annotations
@@ -295,15 +297,81 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict[str, object]]:
     return r, {"result": r}
 
 
-# ── nohup / nohup_query ───────────────────────────────────────────────────────
+# ── nohup / nohup_query / wait_for ───────────────────────────────────────────────────────
 
 def t_nohup(command: str, timeout: int = NOHUP_TIMEOUT_MIN) -> tuple[str, dict[str, object]]:
     """Bound the command with timeout(1) then hand off to t_execute_async."""
     return t_execute_async(f"timeout {int(timeout) * 60} {command}")
 
 
+# Units understood by t_wait_for.  Wait durations are computed as
+# howmuch * WAIT_FOR_UNIT_SECONDS[unit]; unknown units are rejected.
+WAIT_FOR_UNIT_SECONDS = {
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+}
+# Cap so a typo in howmuch cannot block the tool thread for hours on end.
+WAIT_FOR_MAX_SECONDS = 3600
+
+
+def t_wait_for(howmuch: int, unit: str = "s") -> tuple[str, dict[str, object]]:
+    """Wait *howmuch* × *unit*, then report every execution finished meanwhile.
+
+    Async tools always come with three: ``nohup`` starts a command in the
+    background, ``nohup_query`` polls one by ``tool_exec_id``, and
+    ``wait_for`` sleeps so background work can finish instead of busy-polling
+    with ``nohup_query``.  Completions queued while waiting (returncode,
+    output files, last output lines) are reported inline, so the model gets
+    results without an extra round trip.
+
+    Supported units: ``s`` seconds, ``m`` minutes, ``h`` hours, ``d`` days.
+    """
+    factor = WAIT_FOR_UNIT_SECONDS.get(unit)
+    if factor is None:
+        expected = "/".join(sorted(WAIT_FOR_UNIT_SECONDS))
+        r = json.dumps({"error": f"unknown unit {unit!r}, expected one of {expected}"})
+        return r, {"result": r}
+    seconds = float(howmuch) * factor
+    if seconds <= 0:
+        r = json.dumps({"error": "howmuch must be a positive number"})
+        return r, {"result": r}
+    if seconds > WAIT_FOR_MAX_SECONDS:
+        r = json.dumps({"error": f"wait of {seconds:g}s exceeds the {WAIT_FOR_MAX_SECONDS}s cap"})
+        return r, {"result": r}
+
+    time.sleep(seconds)
+
+    completions: list[dict[str, object]] = []
+    while True:
+        try:
+            c = async_completion_queue.get_nowait()
+        except _queue.Empty:
+            break
+        entry = _async_executions.get(c["tool_exec_id"])
+        out: dict[str, object] = {
+            "tool_exec_id":      c["tool_exec_id"],
+            "returncode":        c["returncode"],
+            "duration_time":     c["duration"],
+            "stdout_localfile":  c["stdout_file"],
+            "stderr_localfile":  c["stderr_file"],
+        }
+        if entry is not None:
+            out["command"] = entry["command"]
+            out["stdout_last_lines"] = _async_last_lines(entry["stdout_file"])
+            out["stderr_last_lines"] = _async_last_lines(entry["stderr_file"])
+        completions.append(out)
+
+    r = json.dumps({
+        "waited_seconds": round(seconds, 3),
+        "completed":      completions,
+    })
+    return r, {"result": r}
+
+
 def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any]]:
-    """JSON tool specs for the nohup / nohup_query pair."""
+    """JSON tool specs for the nohup / nohup_query / wait_for trio."""
     return [
         {
             "type": "function",
@@ -353,15 +421,45 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "wait_for",
+                "description": (
+                    "Wait howmuch * unit for background commands started with nohup "
+                    "to finish, instead of busy-polling with nohup_query. Reports "
+                    "every execution that completed while waiting: returncode, "
+                    "output file paths, and the last lines of stdout/stderr. Use "
+                    "nohup_query afterwards for executions still running."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "howmuch": {"type": "integer", "description": "How long to wait, in the given unit."},
+                        "unit": {
+                            "type": "string",
+                            "enum": sorted(WAIT_FOR_UNIT_SECONDS),
+                            "description": (
+                                "Time unit for howmuch: s=seconds, m=minutes, h=hours, "
+                                f"d=days. Waits above {WAIT_FOR_MAX_SECONDS}s are rejected; "
+                                "split long waits into several calls."
+                            ),
+                        },
+                    },
+                    "required": ["howmuch"],
+                },
+            },
+        },
     ]
 
 
 def enable_nohup(schema: dict[str, Any], timeout_min: int = NOHUP_TIMEOUT_MIN) -> dict[str, Any]:
-    """Add the nohup / nohup_query tools to *schema* in place and return it.
+    """Add the nohup / nohup_query / wait_for tools to *schema* in place.
 
     Appends the tool specs (both ``tool_specs`` and ``inferred_tool_schema``)
-    and wires dispatch to the ``t_nohup`` / ``t_query_exec`` functions already
-    registered in TOOL_LIBRARY.  Idempotent: calling it twice is a no-op.
+    and wires dispatch to the ``t_nohup`` / ``t_query_exec`` / ``t_wait_for``
+    functions already registered in TOOL_LIBRARY.  Idempotent: calling it
+    twice is a no-op.
 
     Supports both schema shapes, like the wrappers did inline before:
     ``tools`` (list of TOOL_LIBRARY function names) or a pre-built
@@ -375,11 +473,12 @@ def enable_nohup(schema: dict[str, Any], timeout_min: int = NOHUP_TIMEOUT_MIN) -
         schema["tool_specs"] = tool_specs
         schema["inferred_tool_schema"] = tool_specs
         if "tools" in schema:
-            schema["tools"] = list(schema["tools"]) + ["t_nohup", "t_query_exec"]
+            schema["tools"] = list(schema["tools"]) + ["t_nohup", "t_query_exec", "t_wait_for"]
         else:
             schema.setdefault("tool_dispatch", {})
             schema["tool_dispatch"].update({
-                "nohup":       {"python_function": "t_nohup",     "param_map": {}},
+                "nohup":       {"python_function": "t_nohup",      "param_map": {}},
                 "nohup_query": {"python_function": "t_query_exec", "param_map": {}},
+                "wait_for":    {"python_function": "t_wait_for",   "param_map": {}},
             })
     return schema

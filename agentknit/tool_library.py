@@ -483,7 +483,7 @@ def t_run(command: str) -> tuple[str, dict[str, object]]:
     """Execute a shell command and return its stdout, stderr, and exit code.
 
     Tool spec:
-        name: execute_shell_command
+        name: exec_shell
         description: Execute a shell command and return its stdout, stderr, and exit code.
         parameters:
             command:

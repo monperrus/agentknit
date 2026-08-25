@@ -83,7 +83,7 @@
     {
       "type": "function",
       "function": {
-        "name": "execute_shell_command",
+        "name": "exec_shell",
         "description": "Execute a shell command and return its stdout, stderr, and exit code.",
         "parameters": {
           "type": "object",

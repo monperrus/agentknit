@@ -168,7 +168,7 @@ String flags in the `options` array enable provider-specific workarounds:
     {
       "type": "function",
       "function": {
-        "name": "execute_shell_command",
+        "name": "exec_shell",
         "description": "Execute a shell command and return stdout, stderr, and exit code.",
         "parameters": {
           "type": "object",

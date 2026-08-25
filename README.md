@@ -222,7 +222,8 @@ tools = [
 ### Tool library
 
 The framework ships with a built-in set of tools (`read_file`, `write_file`,
-`str_replace`, `execute_shell_command`). 
+`str_replace`, `exec_shell`). The previous name `execute_shell_command` is
+still accepted as an alias. 
 
 ### Sandboxed tool execution (Linux)
 

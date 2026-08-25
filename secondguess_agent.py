@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Second-guess coding agent: standard read/write/edit/exec tools, but every
-execute_shell_command call waits 2 seconds before starting, giving the
+exec_shell call waits 2 seconds before starting, giving the
 operator (human Ctrl-C or supervisor LLM cancellation) time to abort.
 
 Exposed tools:
-  execute_shell_command  — shell exec with 2 s grace period
+  exec_shell             — shell exec with 2 s grace period
   query_tool_exec        — poll running commands
   read_file              — read file contents
   write_file             — write file contents
@@ -108,7 +108,7 @@ def t_secondguess_exec(command: str, when: int = 0) -> tuple[str, dict]:
 # ── tool definitions ─────────────────────────────────────────────────────────
 _TOOLS = [
     Tool(
-        "execute_shell_command",
+        "exec_shell",
         (
             f"Start a shell command asynchronously with a {GRACE_PERIOD_SECONDS}s "
             f"grace period. Returns tool_exec_id and local file paths for stdin "
@@ -138,7 +138,7 @@ _TOOLS = [
     ),
     Tool(
         "query_tool_exec",
-        f"Poll a command started with execute_shell_command. When completed, "
+        f"Poll a command started with exec_shell. When completed, "
         f"includes returncode and inlines stdout/stderr if both are under "
         f"{ASYNC_INLINE_MAX_BYTES} bytes; otherwise reports file sizes.",
         t_query_exec,
@@ -147,7 +147,7 @@ _TOOLS = [
             "properties": {
                 "tool_exec_id": {
                     "type": "string",
-                    "description": "The ID returned by execute_shell_command.",
+                    "description": "The ID returned by exec_shell.",
                 },
             },
             "required": ["tool_exec_id"],
@@ -206,11 +206,11 @@ _TOOL_SCHEMA, _TOOL_DISPATCH = build_tool_spec(_TOOLS)
 register_tools_in_library(_TOOLS)
 
 _SYSTEM_SUPPLEMENT = (
-    "You are a coding agent. Start shell commands with execute_shell_command — "
+    "You are a coding agent. Start shell commands with exec_shell — "
     "they run in the background. Use query_tool_exec to poll status. Pass `when` "
-    "to execute_shell_command to delay a command by N minutes. When a background "
+    "to exec_shell to delay a command by N minutes. When a background "
     "command finishes you will be notified automatically with its output.\n\n"
-    f"**Grace period**: every execute_shell_command call pauses {GRACE_PERIOD_SECONDS}s "
+    f"**Grace period**: every exec_shell call pauses {GRACE_PERIOD_SECONDS}s "
     "before actually starting the command. During this window the operator can "
     "Ctrl-C to abort. The command only begins after the grace period expires."
 )

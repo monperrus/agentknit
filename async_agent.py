@@ -3,7 +3,7 @@
 Async coding agent with non-blocking shell execution.
 
 Tools exposed to the LLM:
-  execute_shell_command  — t_execute_async from agentknit.tool_library
+  exec_shell             — t_execute_async from agentknit.tool_library
   query_tool_exec        — t_query_exec    from agentknit.tool_library
   read_file              — t_read          from agentknit.tool_library
   write_file             — t_write         from agentknit.tool_library
@@ -32,7 +32,7 @@ from agentknit._core import (
 
 _TOOLS = [
     Tool(
-        "execute_shell_command",
+        "exec_shell",
         f"Start a shell command asynchronously. Returns tool_exec_id and local "
         f"file paths for stdin (FIFO), stdout, and stderr. Write to stdin_localfile "
         f"to send input to the running process. Optional `when` (integer minutes, "
@@ -55,7 +55,7 @@ _TOOLS = [
     ),
     Tool(
         "query_tool_exec",
-        f"Poll a command started with execute_shell_command. When completed, "
+        f"Poll a command started with exec_shell. When completed, "
         f"includes returncode and inlines stdout/stderr if both are under "
         f"{ASYNC_INLINE_MAX_BYTES} bytes; otherwise reports file sizes.",
         t_query_exec,
@@ -64,7 +64,7 @@ _TOOLS = [
             "properties": {
                 "tool_exec_id": {
                     "type": "string",
-                    "description": "The ID returned by execute_shell_command.",
+                    "description": "The ID returned by exec_shell.",
                 },
             },
             "required": ["tool_exec_id"],
@@ -101,9 +101,9 @@ _TOOL_SCHEMA, _TOOL_DISPATCH = build_tool_spec(_TOOLS)
 register_tools_in_library(_TOOLS)
 
 _SYSTEM_SUPPLEMENT = (
-    "You are a coding agent. Start shell commands with execute_shell_command — "
+    "You are a coding agent. Start shell commands with exec_shell — "
     "they run in the background. Use query_tool_exec to poll status. Pass `when` "
-    "to execute_shell_command to delay a command by N minutes. When a background "
+    "to exec_shell to delay a command by N minutes. When a background "
     "command finishes you will be notified automatically with its output."
 )
 

@@ -56,7 +56,7 @@ def test_parse_tool_spec_execute_shell():
     doc = inspect.getdoc(tool_library.t_run)
     spec = parse_tool_spec_from_docstring(doc)
     assert spec is not None
-    assert spec["name"] == "execute_shell_command"
+    assert spec["name"] == "exec_shell"
     assert set(spec["parameters"]) == {"command"}
 
 
@@ -123,7 +123,7 @@ _TOOL_MAP = {
     "t_read":   ("read_file", "read_file"),
     "t_write":  ("write_file", "write_file"),
     "t_update": ("str_replace", "str_replace"),
-    "t_run":    ("execute_shell_command", "execute_shell_command"),
+    "t_run":    ("exec_shell", "exec_shell"),
 }
 
 

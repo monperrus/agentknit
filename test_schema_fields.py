@@ -67,7 +67,7 @@ def test_validate_schema_accepts_tool_specs_name() -> None:
             {
                 "type": "function",
                 "function": {
-                    "name": "execute_shell_command",
+                    "name": "exec_shell",
                     "description": "Run a shell command.",
                     "parameters": {
                         "type": "object",
@@ -127,3 +127,31 @@ def test_normalize_schema_rejects_length_mismatch() -> None:
 
     with pytest.raises(AgentSpecInvalidError, match="'tool_specs' has 1 entries but 'tools' has 2"):
         _normalize_schema(schema)
+
+
+def test_default_dispatch_accepts_legacy_shell_tool_name() -> None:
+    """Pre-rename specs named the shell tool 'execute_shell_command'."""
+    schema = {
+        "model": "test-model",
+        "tool_specs": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "execute_shell_command",
+                    "description": "Run a shell command.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            }
+        ],
+    }
+
+    normalized = _normalize_schema(schema)
+
+    assert normalized["tool_dispatch"]["execute_shell_command"] == {
+        "python_function": "t_run",
+        "param_map": {},
+    }

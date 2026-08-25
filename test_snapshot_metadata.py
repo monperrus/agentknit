@@ -63,7 +63,7 @@ def test_save_messages_snapshot_includes_metadata(monkeypatch):
             # named explicitly, plus the agentknit commit id.
             assert data["metadata"]["default_tools"] is True
             assert data["metadata"]["tools"] == [
-                "read_file", "write_file", "str_replace", "execute_shell_command",
+                "read_file", "write_file", "str_replace", "exec_shell",
             ]
             assert data["metadata"]["agentknit_commit"] == "deadbeef"
         finally:

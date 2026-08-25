@@ -50,7 +50,7 @@ def test_shell_runs_in_workspace_with_a_minimal_environment(tmp_path: Path) -> N
     if shutil.which("bwrap") is None:
         pytest.skip("Bubblewrap is not installed on this runner")
     e = BubblewrapToolExecutor(SandboxPolicy(workspace=tmp_path))
-    result, _ = e.execute("execute_shell_command",
+    result, _ = e.execute("exec_shell",
         {"command": "printf '%s:%s' \"$PWD\" \"${SECRET:-missing}\""},
         {"python_function": "t_run", "param_map": {}}, session={})
     assert '"stdout":"/workspace:missing"' in result

@@ -463,7 +463,7 @@ _DEFAULT_TOOL_SCHEMA: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "execute_shell_command",
+            "name": "exec_shell",
             "description": "Execute a shell command and return its stdout, stderr, and exit code.",
             "parameters": {
                 "type": "object",
@@ -480,7 +480,14 @@ _DEFAULT_TOOL_DISPATCH = {
     "read_file":            {"python_function": "t_read",        "param_map": {}},
     "write_file":           {"python_function": "t_write",       "param_map": {}},
     "str_replace":          {"python_function": "t_update",      "param_map": {"old_str": "old", "new_str": "new"}},
-    "execute_shell_command":{"python_function": "t_run",         "param_map": {}},
+    "exec_shell":           {"python_function": "t_run",         "param_map": {}},
+}
+
+# Retired tool names still accepted as aliases of their renamed successor.
+# Specs and sessions built before the rename keep working: the alias is
+# expanded into the canonical dispatch entry at session start.
+_LEGACY_TOOL_ALIASES: "dict[str, str]" = {
+    "execute_shell_command": "exec_shell",
 }
 _DEFAULT_TOOLS = [
     "t_read",
@@ -730,6 +737,10 @@ def _default_dispatch_for_tool_specs(tool_specs: list[dict[str, Any]]) -> dict[s
     for tool_spec in tool_specs:
         tool_name = _tool_name_from_spec(tool_spec)
         entry = _DEFAULT_TOOL_DISPATCH.get(tool_name)
+        if entry is None:
+            # Legacy tool names resolve to the renamed successor's dispatch entry.
+            alias_target = _LEGACY_TOOL_ALIASES.get(tool_name)
+            entry = _DEFAULT_TOOL_DISPATCH.get(alias_target) if alias_target else None
         if entry is not None:
             dispatch[tool_name] = copy.deepcopy(entry)
     return dispatch
@@ -1624,7 +1635,10 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
 
     # Expand aliases before any filtering so aliased tools are treated like
     # first-class tools everywhere (non-interactive filtering, inline prompt, …).
-    aliases = schema.get("aliases") or {}
+    # Legacy tool names (e.g. "execute_shell_command") are always expanded so
+    # pre-rename specs and restored sessions keep dispatching.
+    aliases = dict(_LEGACY_TOOL_ALIASES)
+    aliases.update(schema.get("aliases") or {})
     if aliases:
         tools, tool_dispatch = _expand_aliases(tools, tool_dispatch, aliases)
 

@@ -101,6 +101,13 @@ from .tool_library import (
     enable_rtk_rewrite,
 )
 
+from .async_toolkit import (
+    NOHUP_TIMEOUT_MIN,
+    enable_nohup,
+    nohup_tool_specs,
+    t_nohup,
+)
+
 from .slash_commands import (
     SlashCommand,
     SlashCommandRegistry,
@@ -151,4 +158,6 @@ __all__ = [
     "t_execute_async", "t_query_exec", "async_completion_queue",
     "ASYNC_EXEC_DIR", "ASYNC_FAST_THRESHOLD_S", "ASYNC_INLINE_MAX_BYTES",
     "enable_rtk_rewrite",
+    # nohup tools (async_toolkit)
+    "NOHUP_TIMEOUT_MIN", "enable_nohup", "nohup_tool_specs", "t_nohup",
 ]

@@ -225,6 +225,25 @@ The framework ships with a built-in set of tools (`read_file`, `write_file`,
 `str_replace`, `exec_shell`). The previous name `execute_shell_command` is
 still accepted as an alias. 
 
+### Background shell tools (`nohup` / `nohup_query`)
+
+`agentknit.async_toolkit` provides bounded background execution on top of the
+low-level `t_execute_async` / `t_query_exec` primitives: stdout/stderr are
+captured to files, stdin is exposed as a FIFO, and execution is wrapped in
+`timeout(1)`. The tool definitions and implementations both live there — add
+them to a spec with one call:
+
+```python
+import agentknit
+from agentknit.async_toolkit import enable_nohup
+
+schema = agentknit.load_specification(MODEL, ENDPOINT)
+enable_nohup(schema)   # appends nohup + nohup_query specs and dispatch entries
+```
+
+It is idempotent and supports both schema shapes (`tools` list or pre-built
+`tool_dispatch`). The default bound is 10 minutes (`NOHUP_TIMEOUT_MIN`).
+
 ### Sandboxed tool execution (Linux)
 
 Direct local tool dispatch remains the default. For untrusted replay workloads,

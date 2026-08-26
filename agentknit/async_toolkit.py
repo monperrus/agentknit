@@ -7,8 +7,9 @@ Two layers live here:
   a FIFO) and poll it by ``tool_exec_id``.
 * The model-facing async tool trio — async tools always come with three:
   ``nohup`` (start, bounded by ``timeout(1)``), ``nohup_query`` (poll by
-  ``tool_exec_id``) and ``wait_for`` (block for *howmuch* × *unit* and report
-  everything that finished meanwhile), each with ready-made JSON tool specs.
+  ``tool_exec_id``) and ``wait_for`` (block on one ``tool_exec_id`` until it
+  finishes or *howmuch* × *unit* elapses, reporting CPU/I/O activity when it
+  is still running), each with ready-made JSON tool specs.
   :func:`enable_nohup` wires all three into a spec schema in one call:
 
   >>> from agentknit.async_toolkit import enable_nohup
@@ -27,7 +28,6 @@ import time
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-
 if TYPE_CHECKING:
     from typing import BinaryIO, TypedDict
 else:
@@ -58,6 +58,7 @@ class _AsyncExecEntry(TypedDict):
     started_at: str
     cwd: str
     command: str
+    io_before: dict[str, int]          # last /proc/<pid>/io counters read for this exec
 
 
 _async_executions: dict[str, _AsyncExecEntry] = {}
@@ -126,6 +127,87 @@ def _async_add_inline(result: dict[str, object], stdout_path: str, stderr_path: 
         result["stdout"] = out
     if err is not None:
         result["stderr"] = err
+
+
+# ── CPU / I/O activity of a running execution ─────────────────────────────────
+
+# clock ticks per second, used to scale utime/stime from /proc/<pid>/stat.
+_CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+# /proc/<pid>/io fields reported for I/O activity (bytes read/written).
+_IO_FIELDS = ("rchar", "wchar", "read_bytes", "write_bytes")
+
+
+def _process_tree(pid: int) -> list[int]:
+    """PIDs of *pid* and all its descendants, alive at snapshot time."""
+    pids = [pid]
+    # /proc/<pid>/task/<tid>/children lists direct child pids, one per line entry.
+    try:
+        for tid_dir in Path(f"/proc/{pid}/task").glob("*"):
+            try:
+                pids.extend(int(x) for x in (tid_dir / "children").read_text().split())
+            except (OSError, ValueError):
+                pass
+    except OSError:
+        pass
+    return pids
+
+
+def _read_proc_io(pid: int) -> dict[str, int]:
+    """Aggregate /proc/<pid>/io counters, zeroed when unavailable (non-Linux)."""
+    io = dict.fromkeys(_IO_FIELDS, 0)
+    try:
+        for line in Path(f"/proc/{pid}/io").read_text().splitlines():
+            key, _, value = line.partition(":")
+            if key in io:
+                io[key] = int(value.strip() or 0)
+    except (OSError, ValueError):
+        pass
+    return io
+
+
+def _proc_cpu_seconds(pid: int) -> float:
+    """User+system CPU seconds of *pid* from /proc/<pid>/stat (0 if unavailable)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        # comm may contain spaces: fields start after the last ')'.
+        fields = stat[stat.rindex(")") + 2:].split()
+        return (int(fields[11]) + int(fields[12])) / _CLK_TCK   # utime + stime
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def _activity_snapshot(entry: _AsyncExecEntry) -> tuple[float, dict[str, int]]:
+    """CPU seconds and I/O counters of *entry*'s process tree (0 on non-Linux)."""
+    try:
+        pids = _process_tree(entry["proc"].pid)
+    except OSError:
+        pids = [entry["proc"].pid]
+    cpu = sum(_proc_cpu_seconds(pid) for pid in pids)
+    io: dict[str, int] = dict.fromkeys(_IO_FIELDS, 0)
+    for pid in pids:
+        for key, value in _read_proc_io(pid).items():
+            io[key] += value
+    return cpu, io
+
+
+def _activity_report(entry: _AsyncExecEntry) -> dict[str, Any]:
+    """CPU and I/O consumed by *entry* since the previous call (or since start).
+
+    ``wait_for`` calls this once when it has to report a still-running
+    execution, so the model can tell an active process from a hung or idle
+    one: a flat CPU delta and flat I/O counters mean nothing is happening.
+    """
+    cpu, io = _activity_snapshot(entry)
+    before = entry.get("io_before") or dict.fromkeys(_IO_FIELDS, 0)
+    entry["io_before"] = io
+    elapsed = max(time.monotonic() - entry["start"], 1e-9)
+    return {
+        "cpu_seconds": round(cpu, 3),
+        "cpu_percent": round(100.0 * cpu / elapsed, 1),
+        "io_bytes": {k: io[k] - before[k] for k in _IO_FIELDS},
+        "note": "bytes read/written since the last wait_for report of this execution",
+    }
 
 
 # ── low-level tools ───────────────────────────────────────────────────────────
@@ -240,6 +322,7 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict[str, object]
             "start": t0,
             "started_at": started_at,
             "cwd": cwd,
+            "io_before": dict.fromkeys(_IO_FIELDS, 0),
         }
 
     result: dict[str, object] = {
@@ -287,8 +370,8 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict[str, object]]:
                 "denied: nohup_query was just called for this tool_exec_id and it "
                 "is still running"
             ),
-            "hint": "Use wait_for(howmuch, unit) to wait for it to finish instead "
-                    "of polling nohup_query again.",
+            "hint": "Use wait_for(tool_exec_id, howmuch, unit) to wait for it to "
+                    "finish instead of polling nohup_query again.",
             "tool_exec_id": tool_exec_id,
         })
         return r, {"result": r}
@@ -341,57 +424,96 @@ WAIT_FOR_UNIT_SECONDS = {
 WAIT_FOR_MAX_SECONDS = 3600
 
 
-def t_wait_for(howmuch: int, unit: str = "s") -> tuple[str, dict[str, object]]:
-    """Wait *howmuch* × *unit*, then report every execution finished meanwhile.
+def t_wait_for(tool_exec_id: str, howmuch: int | None = None, unit: str = "s") -> tuple[str, dict[str, object]]:
+    """Wait for the execution *tool_exec_id* to finish, at most *howmuch* × *unit*.
 
     Async tools always come with three: ``nohup`` starts a command in the
     background, ``nohup_query`` polls one by ``tool_exec_id``, and
-    ``wait_for`` sleeps so background work can finish instead of busy-polling
-    with ``nohup_query``.  Completions queued while waiting (returncode,
-    output files, last output lines) are reported inline, so the model gets
-    results without an extra round trip.
+    ``wait_for`` sleeps until **this** execution completes (or the optional
+    ``howmuch`` × ``unit`` budget expires) instead of busy-polling with
+    ``nohup_query``.  Completions queued while waiting (returncode, output
+    files, last output lines) are reported inline, so the model gets results
+    without an extra round trip.
+
+    When the budget expires before the execution finishes, the result says so
+    (``completed: false``) and reports the CPU and I/O activity of the still
+    running process, so the model can tell progress from a hang.
 
     Supported units: ``s`` seconds, ``m`` minutes, ``h`` hours, ``d`` days.
     """
-    factor = WAIT_FOR_UNIT_SECONDS.get(unit)
-    if factor is None:
-        expected = "/".join(sorted(WAIT_FOR_UNIT_SECONDS))
-        r = json.dumps({"error": f"unknown unit {unit!r}, expected one of {expected}"})
-        return r, {"result": r}
-    seconds = float(howmuch) * factor
-    if seconds <= 0:
-        r = json.dumps({"error": "howmuch must be a positive number"})
-        return r, {"result": r}
-    if seconds > WAIT_FOR_MAX_SECONDS:
-        r = json.dumps({"error": f"wait of {seconds:g}s exceeds the {WAIT_FOR_MAX_SECONDS}s cap"})
+    # Validate the (optional) wait budget before touching the exec id.
+    seconds: float | None = None
+    if howmuch is not None:
+        factor = WAIT_FOR_UNIT_SECONDS.get(unit)
+        if factor is None:
+            expected = "/".join(sorted(WAIT_FOR_UNIT_SECONDS))
+            r = json.dumps({"error": f"unknown unit {unit!r}, expected one of {expected}"})
+            return r, {"result": r}
+        seconds = float(howmuch) * factor
+        if seconds <= 0:
+            r = json.dumps({"error": "howmuch must be a positive number"})
+            return r, {"result": r}
+        if seconds > WAIT_FOR_MAX_SECONDS:
+            r = json.dumps({"error": f"wait of {seconds:g}s exceeds the {WAIT_FOR_MAX_SECONDS}s cap"})
+            return r, {"result": r}
+
+    with _async_exec_lock:
+        entry = _async_executions.get(tool_exec_id)
+    if entry is None:
+        r = json.dumps({"error": f"unknown tool_exec_id: {tool_exec_id}"})
         return r, {"result": r}
 
-    time.sleep(seconds)
-
-    completions: list[dict[str, object]] = []
+    deadline = None if seconds is None else time.monotonic() + seconds
+    others: list[_AsyncCompletion] = []
+    done = False
     while True:
-        try:
-            c = async_completion_queue.get_nowait()
-        except _queue.Empty:
+        if entry["proc"].poll() is not None:
+            done = True
             break
-        entry = _async_executions.get(c["tool_exec_id"])
-        out: dict[str, object] = {
-            "tool_exec_id":      c["tool_exec_id"],
-            "returncode":        c["returncode"],
-            "duration_time":     c["duration"],
-            "stdout_localfile":  c["stdout_file"],
-            "stderr_localfile":  c["stderr_file"],
-        }
-        if entry is not None:
-            out["command"] = entry["command"]
-            out["stdout_last_lines"] = _async_last_lines(entry["stdout_file"])
-            out["stderr_last_lines"] = _async_last_lines(entry["stderr_file"])
-        completions.append(out)
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            break
+        timeout = 0.1 if remaining is None else min(0.1, remaining)
+        try:
+            c = async_completion_queue.get(timeout=timeout)
+        except _queue.Empty:
+            continue
+        if c["tool_exec_id"] == tool_exec_id:
+            done = True
+            break
+        others.append(c)   # finished meanwhile, but not the one we wait on
 
-    r = json.dumps({
-        "waited_seconds": round(seconds, 3),
-        "completed":      completions,
-    })
+    result: dict[str, object] = {"tool_exec_id": tool_exec_id, "completed": done}
+    if done:
+        result["returncode"] = entry["proc"].returncode
+        result["duration_time"] = round(time.monotonic() - entry["start"], 3)
+        result["stdout_localfile"] = entry["stdout_file"]
+        result["stderr_localfile"] = entry["stderr_file"]
+        result["command"] = entry["command"]
+        result["stdout_last_lines"] = _async_last_lines(entry["stdout_file"])
+        result["stderr_last_lines"] = _async_last_lines(entry["stderr_file"])
+        _async_add_inline(result, entry["stdout_file"], entry["stderr_file"])
+    else:
+        result["waited_seconds"] = round(seconds if seconds is not None
+                                         else time.monotonic() - entry["start"], 3)
+        result["activity"] = _activity_report(entry)
+        result["hint"] = (
+            "not completed yet; call wait_for again for this tool_exec_id (with a "
+            "fresh howmuch budget), do not poll nohup_query in a tight loop."
+        )
+    if others:
+        result["also_completed"] = [
+            {
+                "tool_exec_id":      c["tool_exec_id"],
+                "returncode":        c["returncode"],
+                "duration_time":     c["duration"],
+                "stdout_localfile":  c["stdout_file"],
+                "stderr_localfile":  c["stderr_file"],
+            }
+            for c in others
+        ]
+
+    r = json.dumps(result)
     return r, {"result": r}
 
 
@@ -437,7 +559,8 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                     "returncode and inlines stdout/stderr if both are under "
                     f"{ASYNC_INLINE_MAX_BYTES} bytes; otherwise reports file sizes. "
                     "Polling the same still-running tool_exec_id twice in a row is "
-                    "denied: call wait_for(howmuch, unit) to let it finish instead."
+                    "denied: call wait_for(tool_exec_id, howmuch, unit) to let it "
+                    "finish instead."
                 ),
                 "parameters": {
                     "type": "object",
@@ -453,16 +576,32 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
             "function": {
                 "name": "wait_for",
                 "description": (
-                    "Wait howmuch * unit for background commands started with nohup "
-                    "to finish, instead of busy-polling with nohup_query. Reports "
-                    "every execution that completed while waiting: returncode, "
-                    "output file paths, and the last lines of stdout/stderr. Use "
-                    "nohup_query afterwards for executions still running."
+                    "Wait for a background command started with nohup to finish, "
+                    "instead of busy-polling with nohup_query. Takes a mandatory "
+                    "tool_exec_id and an optional howmuch × unit wait budget. "
+                    "Returns as soon as that execution completes, reporting "
+                    "returncode, output file paths and the last lines of "
+                    "stdout/stderr. If the budget (if given) expires first, reports "
+                    "completed: false together with the CPU and I/O activity of the "
+                    "still-running process, so you can tell progress from a hang; "
+                    "then call wait_for again for the same tool_exec_id. Without "
+                    "howmuch, waits indefinitely until it completes."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "howmuch": {"type": "integer", "description": "How long to wait, in the given unit."},
+                        "tool_exec_id": {
+                            "type": "string",
+                            "description": "The tool_exec_id returned by nohup.",
+                        },
+                        "howmuch": {
+                            "type": "integer",
+                            "description": (
+                                "Optional wait budget in the given unit. When "
+                                "reached with the execution still running, the tool "
+                                "returns instead of blocking further."
+                            ),
+                        },
                         "unit": {
                             "type": "string",
                             "enum": sorted(WAIT_FOR_UNIT_SECONDS),
@@ -473,7 +612,7 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                             ),
                         },
                     },
-                    "required": ["howmuch"],
+                    "required": ["tool_exec_id"],
                 },
             },
         },

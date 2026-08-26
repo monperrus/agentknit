@@ -9,7 +9,6 @@ import time
 from agentknit.async_toolkit import (
     NOHUP_TIMEOUT_MIN,
     WAIT_FOR_MAX_SECONDS,
-    WAIT_FOR_UNIT_SECONDS,
     async_completion_queue,
     enable_nohup,
     nohup_tool_specs,
@@ -71,8 +70,10 @@ def test_nohup_tool_specs_shape() -> None:
     assert names == ["nohup", "nohup_query", "wait_for"]
     assert specs[0]["function"]["parameters"]["required"] == ["command"]
     assert specs[1]["function"]["parameters"]["required"] == ["tool_exec_id"]
-    assert specs[2]["function"]["parameters"]["required"] == ["howmuch"]
+    assert specs[2]["function"]["parameters"]["required"] == ["tool_exec_id"]
     assert specs[2]["function"]["parameters"]["properties"]["unit"]["enum"] == ["d", "h", "m", "s"]
+    assert "howmuch" in specs[2]["function"]["parameters"]["properties"]
+    assert "activity" in specs[2]["function"]["description"]
     assert str(NOHUP_TIMEOUT_MIN) in specs[0]["function"]["description"]
 
 
@@ -130,54 +131,138 @@ def _drain_queue() -> None:
 
 
 def test_wait_for_reports_completions() -> None:
-    """wait_for sleeps, then reports background execs finished meanwhile."""
+    """wait_for sleeps until the exec finishes, then reports it inline."""
     _drain_queue()
     result, _ = t_nohup("echo wait-for-test && sleep 1")
     d = json.loads(result)
     t0 = time.monotonic()
-    out = json.loads(t_wait_for(2, "s")[0])
+    out = json.loads(t_wait_for(d["tool_exec_id"], 5, "s")[0])
     elapsed = time.monotonic() - t0
-    assert out["waited_seconds"] == 2
-    assert 1.9 <= elapsed < 3
-    [done] = out["completed"]
-    assert done["tool_exec_id"] == d["tool_exec_id"]
-    assert done["returncode"] == 0
-    assert done["command"].endswith("echo wait-for-test && sleep 1")
-    assert done["stdout_last_lines"] == "wait-for-test"
-    assert done["stderr_last_lines"] == ""
+    assert out["tool_exec_id"] == d["tool_exec_id"]
+    assert out["completed"] is True
+    assert out["returncode"] == 0
+    assert 0.9 <= elapsed < 5
+    assert out["command"].endswith("echo wait-for-test && sleep 1")
+    assert out["stdout_last_lines"] == "wait-for-test"
+    assert out["stderr_last_lines"] == ""
+    assert out["stdout"].strip() == "wait-for-test"
 
 
-def test_wait_for_no_completions(monkeypatch) -> None:
-    """An empty completion queue yields an empty list, and the queue is drained."""
+def test_wait_for_returns_immediately_when_already_done() -> None:
+    """A finished exec completes the wait without sleeping."""
     _drain_queue()
-    monkeypatch.setattr("agentknit.async_toolkit.time.sleep", lambda s: None)
-    out = json.loads(t_wait_for(5, "m")[0])
-    assert out == {"waited_seconds": 300.0, "completed": []}
+    d = json.loads(t_nohup("true")[0])
+    _drain(d["tool_exec_id"])
+    t0 = time.monotonic()
+    out = json.loads(t_wait_for(d["tool_exec_id"], 60, "s")[0])
+    assert out["completed"] is True
+    assert time.monotonic() - t0 < 5
+
+
+def test_wait_for_reports_not_completed_with_activity() -> None:
+    """When the budget expires first, wait_for says so plus CPU/IO activity."""
+    _drain_queue()
+    d = json.loads(t_nohup("sleep 30")[0])
+    t0 = time.monotonic()
+    out = json.loads(t_wait_for(d["tool_exec_id"], 1, "s")[0])
+    elapsed = time.monotonic() - t0
+    assert out["tool_exec_id"] == d["tool_exec_id"]
+    assert out["completed"] is False
+    assert 0.9 <= elapsed < 3
+    assert out["waited_seconds"] == 1
+    assert "not completed" in out["hint"]
+    activity = out["activity"]
+    assert set(activity["io_bytes"]) == {"rchar", "wchar", "read_bytes", "write_bytes"}
+    assert all(isinstance(v, int) for v in activity["io_bytes"].values())
+    assert activity["cpu_seconds"] >= 0
+    assert activity["cpu_percent"] >= 0
+    # drain the leftover process so it does not outlive the test session
+    assert _drain(d["tool_exec_id"], timeout=45).get("returncode") is not None
+
+
+def test_wait_for_activity_deltas_between_calls() -> None:
+    """io_bytes measures progress since the previous wait_for report."""
+    _drain_queue()
+    d = json.loads(t_nohup("sleep 2 && dd if=/dev/zero of=/dev/null bs=1k count=2048 2>/dev/null")[0])
+    out1 = json.loads(t_wait_for(d["tool_exec_id"], 0.5, "s")[0])
+    assert out1["completed"] is False
+    out2 = json.loads(t_wait_for(d["tool_exec_id"], 3, "s")[0])
+    if out2["completed"]:
+        # dd finished inside the second budget: nothing more to assert.
+        assert out2["returncode"] == 0
+        return
+    assert out2["activity"]["io_bytes"]["rchar"] > 0   # dd read its input meanwhile
+
+
+def test_wait_for_reports_other_completions_as_side_info() -> None:
+    """Execs finishing meanwhile are reported, without ending the wait."""
+    _drain_queue()
+    a = json.loads(t_nohup("sleep 2")[0])
+    b = json.loads(t_nohup("sleep 1")[0])
+    out = json.loads(t_wait_for(a["tool_exec_id"], 10, "s")[0])
+    assert out["tool_exec_id"] == a["tool_exec_id"]
+    assert out["completed"] is True
+    assert out["returncode"] == 0
+    [other] = out["also_completed"]
+    assert other["tool_exec_id"] == b["tool_exec_id"]
+    assert other["returncode"] == 0
+
+
+def test_wait_for_unknown_id() -> None:
+    """Unknown ids error out before any sleeping happens."""
+    t0 = time.monotonic()
+    out = json.loads(t_wait_for("nope", 60, "s")[0])
+    assert "unknown tool_exec_id" in out["error"]
+    assert time.monotonic() - t0 < 1
+
+
+def test_wait_for_no_howmuch() -> None:
+    """Without howmuch there is no budget: wait ends on completion."""
+    _drain_queue()
+    d = json.loads(t_nohup("sleep 1")[0])
+    t0 = time.monotonic()
+    out = json.loads(t_wait_for(d["tool_exec_id"])[0])
+    assert out["completed"] is True
+    assert out["returncode"] == 0
+    assert 0.9 <= time.monotonic() - t0 < 5
+    assert "waited_seconds" not in out
 
 
 def test_wait_for_units(monkeypatch) -> None:
-    """Duration is computed as howmuch × unit; sleep is called with seconds."""
-    slept: list[float] = []
-    monkeypatch.setattr("agentknit.async_toolkit.time.sleep", slept.append)
+    """howmuch × unit is the budget; a fake completion queue short-circuits it."""
     _drain_queue()
     for howmuch, unit in [(1, "s"), (90, "s"), (2, "m"), (1, "h")]:
-        out = json.loads(t_wait_for(howmuch, unit)[0])
-        assert out["waited_seconds"] == howmuch * WAIT_FOR_UNIT_SECONDS[unit]
-        assert slept[-1] == howmuch * WAIT_FOR_UNIT_SECONDS[unit]
-    t0 = time.monotonic()
-    json.loads(t_wait_for(0.01, "s")[0])
-    assert time.monotonic() - t0 < 1
+        d = json.loads(t_nohup("sleep 30")[0])
+        # Simulate instant completion so no real time is spent sleeping.
+        async_completion_queue.put({
+            "tool_exec_id": d["tool_exec_id"], "returncode": 0,
+            "stdout_file": "", "stderr_file": "", "duration": 0.0, "cwd": "",
+        })
+        async_completion_queue.put({
+            "tool_exec_id": "filler-" + d["tool_exec_id"], "returncode": 0,
+            "stdout_file": "", "stderr_file": "", "duration": 0.0, "cwd": "",
+        })
+        monkeypatch.setattr("agentknit.async_toolkit.async_completion_queue.get_nowait",
+                            lambda: (_ for _ in ()).throw(_queue.Empty))
+        out = json.loads(t_wait_for(d["tool_exec_id"], howmuch, unit)[0])
+        monkeypatch.undo()
+        assert out["completed"] is True
+    monkeypatch.setattr("agentknit.async_toolkit.time.sleep", lambda s: None)   # unused now
+    monkeypatch.undo()
 
 
 def test_wait_for_rejects_bad_input() -> None:
     """Unknown units, non-positive amounts and over-cap waits error out."""
-    assert "unknown unit" in json.loads(t_wait_for(1, "x")[0])["error"]
-    assert "positive" in json.loads(t_wait_for(0, "s")[0])["error"]
-    assert "positive" in json.loads(t_wait_for(-5, "m")[0])["error"]
-    cap = json.loads(t_wait_for(WAIT_FOR_MAX_SECONDS + 1, "s")[0])["error"]
+    _drain_queue()
+    d = json.loads(t_nohup("sleep 30")[0])
+    assert "unknown unit" in json.loads(t_wait_for(d["tool_exec_id"], 1, "x")[0])["error"]
+    assert "positive" in json.loads(t_wait_for(d["tool_exec_id"], 0, "s")[0])["error"]
+    assert "positive" in json.loads(t_wait_for(d["tool_exec_id"], -5, "m")[0])["error"]
+    cap = json.loads(t_wait_for(d["tool_exec_id"], WAIT_FOR_MAX_SECONDS + 1, "s")[0])["error"]
     assert "exceeds" in cap
-    assert "exceeds" in json.loads(t_wait_for(2, "h")[0])["error"]
-    assert "exceeds" in json.loads(t_wait_for(1, "d")[0])["error"]
+    assert "exceeds" in json.loads(t_wait_for(d["tool_exec_id"], 2, "h")[0])["error"]
+    assert "exceeds" in json.loads(t_wait_for(d["tool_exec_id"], 1, "d")[0])["error"]
+    assert _drain(d["tool_exec_id"], timeout=45).get("returncode") is not None
 
 
 # ── nohup_query consecutive-poll denial ──────────────────────────────────
@@ -193,6 +278,7 @@ def test_t_query_exec_denies_consecutive_same_id_polls() -> None:
     assert "denied" in denied["error"]
     assert denied["tool_exec_id"] == exec_id
     assert "wait_for" in denied["hint"]
+    assert "tool_exec_id" in denied["hint"]
 
 
 def test_t_query_exec_denial_lifted_after_completion() -> None:

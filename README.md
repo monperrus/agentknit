@@ -250,16 +250,18 @@ Async tools always come with three:
 |---|---|
 | `nohup` | Start a shell command in the background, bounded by `timeout` minutes (default 10). Returns `tool_exec_id` and the local stdin (FIFO)/stdout/stderr paths. |
 | `nohup_query` | Poll one execution by `tool_exec_id`; inlines stdout/stderr when both fit in 4 KiB, otherwise reports file sizes. |
-| `wait_for` | `wait_for(howmuch, unit)` blocks for `howmuch` × `unit` (`s`/`m`/`h`/`d`) instead of busy-polling, then reports every execution that finished meanwhile — returncode, output paths and last lines of stdout/stderr. |
+| `wait_for` | `wait_for(tool_exec_id, howmuch, unit)` waits for **one** background execution instead of busy-polling; `howmuch` × `unit` (`s`/`m`/`h`/`d`) is an optional budget. Returns as soon as the exec completes (returncode, output paths, last lines of stdout/stderr, inline output when small). If the budget expires first, it reports `completed: false` plus the CPU and I/O activity of the still-running process so you can tell progress from a hang. Execs finishing meanwhile are listed under `also_completed`. |
 
-`wait_for` is the tool to call right after `nohup`: it sleeps once and returns
-whatever completed, so short commands need no `nohup_query` round trip. Waits
-are capped at `WAIT_FOR_MAX_SECONDS` (3600) per call; split longer waits into
+`wait_for` is the tool to call right after `nohup`: it blocks until the given
+`tool_exec_id` finishes (or the optional `howmuch` budget expires) and returns
+the result, so short commands need no `nohup_query` round trip. Waits are
+capped at `WAIT_FOR_MAX_SECONDS` (3600) per call; split longer waits into
 several calls.
 
 Busy-polling is also discouraged at the source: two consecutive `nohup_query`
 calls for the same still-running `tool_exec_id` are **denied**, with the
-response pointing at `wait_for(howmuch, unit)` instead. The denial lifts as
+response pointing at `wait_for(tool_exec_id, howmuch, unit)` instead. The
+denial lifts as
 soon as anything else happens — another exec is polled, a new command is
 started, or the execution completes.
 

@@ -178,3 +178,59 @@ def test_wait_for_rejects_bad_input() -> None:
     assert "exceeds" in cap
     assert "exceeds" in json.loads(t_wait_for(2, "h")[0])["error"]
     assert "exceeds" in json.loads(t_wait_for(1, "d")[0])["error"]
+
+
+# ── nohup_query consecutive-poll denial ──────────────────────────────────
+
+
+def test_t_query_exec_denies_consecutive_same_id_polls() -> None:
+    """A second poll of the same still-running exec is denied with a redirect."""
+    result, _ = t_nohup("sleep 3")
+    exec_id = json.loads(result)["tool_exec_id"]
+    first = json.loads(t_query_exec(exec_id)[0])
+    assert first["completed"] is False
+    denied = json.loads(t_query_exec(exec_id)[0])
+    assert "denied" in denied["error"]
+    assert denied["tool_exec_id"] == exec_id
+    assert "wait_for" in denied["hint"]
+
+
+def test_t_query_exec_denial_lifted_after_completion() -> None:
+    """Once the exec completes, the same tool_exec_id polls normally again."""
+    result, _ = t_nohup("sleep 1")
+    exec_id = json.loads(result)["tool_exec_id"]
+    assert json.loads(t_query_exec(exec_id)[0])["completed"] is False
+    _drain(exec_id, timeout=10.0)
+    final = json.loads(t_query_exec(exec_id)[0])
+    assert final["completed"] is True
+    assert final["returncode"] == 0
+
+
+def test_t_query_exec_denial_only_for_consecutive_polls() -> None:
+    """Polling another exec in between clears the denial for the first one."""
+    a, _ = t_nohup("sleep 3")
+    b, _ = t_nohup("sleep 3")
+    id_a, id_b = json.loads(a)["tool_exec_id"], json.loads(b)["tool_exec_id"]
+    assert json.loads(t_query_exec(id_a)[0])["completed"] is False
+    assert json.loads(t_query_exec(id_b)[0])["completed"] is False
+    # id_b was queried last, so polling id_a again is a fresh poll, not a repeat.
+    again = json.loads(t_query_exec(id_a)[0])
+    assert "error" not in again
+    assert again["completed"] is False
+
+
+def test_t_query_exec_denial_reset_by_new_execution() -> None:
+    """Starting a new execution resets the tracker, so old ids poll again."""
+    result, _ = t_nohup("sleep 3")
+    exec_id = json.loads(result)["tool_exec_id"]
+    assert "completed" in json.loads(t_query_exec(exec_id)[0])
+    t_nohup("true")
+    again = json.loads(t_query_exec(exec_id)[0])
+    assert "error" not in again
+
+
+def test_t_query_exec_unknown_id() -> None:
+    """Unknown ids keep their original error."""
+    out = json.loads(t_query_exec("nope")[0])
+    assert "unknown tool_exec_id" in out["error"]
+

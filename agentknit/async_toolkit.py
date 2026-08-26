@@ -76,6 +76,11 @@ class _AsyncCompletion(TypedDict):
 
 async_completion_queue: "_queue.Queue[_AsyncCompletion]" = _queue.Queue()
 
+# tool_exec_id returned by the last t_query_exec call. A second query for the
+# same still-running execution is denied with a wait_for redirect, so the
+# model sleeps instead of busy-polling. Reset whenever a new execution starts.
+_last_queried_exec_id: str | None = None
+
 # Thread-local set by _core._handle_tool_call before each dispatch so tools
 # can access the current session without being passed the session dict.
 # Defined here (not tool_library) so async_toolkit has no import cycle; it is
@@ -222,6 +227,9 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict[str, object]
 
     duration = round(time.monotonic() - t0, 3)
 
+    global _last_queried_exec_id
+    _last_queried_exec_id = None
+
     with _async_exec_lock:
         _async_executions[exec_id] = {
             "proc": proc,
@@ -268,6 +276,23 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict[str, object]]:
     proc = entry["proc"]
     returncode = proc.poll()
     completed = returncode is not None
+
+    global _last_queried_exec_id
+    if not completed and tool_exec_id == _last_queried_exec_id:
+        # Consecutive poll of the same still-running execution: busy-waiting
+        # wastes turns. Deny and redirect to wait_for, which sleeps and
+        # reports this execution as soon as it finishes.
+        r = json.dumps({
+            "error": (
+                "denied: nohup_query was just called for this tool_exec_id and it "
+                "is still running"
+            ),
+            "hint": "Use wait_for(howmuch, unit) to wait for it to finish instead "
+                    "of polling nohup_query again.",
+            "tool_exec_id": tool_exec_id,
+        })
+        return r, {"result": r}
+    _last_queried_exec_id = tool_exec_id
     duration = round(time.monotonic() - entry["start"], 3)
 
     stdout_size = stderr_size = 0
@@ -410,7 +435,9 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                 "description": (
                     "Poll a command started with nohup. When completed, includes "
                     "returncode and inlines stdout/stderr if both are under "
-                    f"{ASYNC_INLINE_MAX_BYTES} bytes; otherwise reports file sizes."
+                    f"{ASYNC_INLINE_MAX_BYTES} bytes; otherwise reports file sizes. "
+                    "Polling the same still-running tool_exec_id twice in a row is "
+                    "denied: call wait_for(howmuch, unit) to let it finish instead."
                 ),
                 "parameters": {
                     "type": "object",

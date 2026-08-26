@@ -257,6 +257,12 @@ whatever completed, so short commands need no `nohup_query` round trip. Waits
 are capped at `WAIT_FOR_MAX_SECONDS` (3600) per call; split longer waits into
 several calls.
 
+Busy-polling is also discouraged at the source: two consecutive `nohup_query`
+calls for the same still-running `tool_exec_id` are **denied**, with the
+response pointing at `wait_for(howmuch, unit)` instead. The denial lifts as
+soon as anything else happens — another exec is polled, a new command is
+started, or the execution completes.
+
 ### Sandboxed tool execution (Linux)
 
 Direct local tool dispatch remains the default. For untrusted replay workloads,

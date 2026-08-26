@@ -448,13 +448,21 @@ _DEFAULT_TOOL_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "str_replace",
-            "description": "Edit an existing file by replacing a specific substring.",
+            "description": (
+                "Edit an existing file by replacing a specific substring. "
+                "By default replaces only the first occurrence; pass "
+                "replace_all=true to replace every occurrence."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "old_str": {"type": "string"},
                     "new_str": {"type": "string"},
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every occurrence of old_str instead of only the first (default false).",
+                    },
                 },
                 "required": ["path", "old_str", "new_str"],
             },

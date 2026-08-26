@@ -223,7 +223,8 @@ tools = [
 
 The framework ships with a built-in set of tools (`read_file`, `write_file`,
 `str_replace`, `exec_shell`). The previous name `execute_shell_command` is
-still accepted as an alias. 
+still accepted as an alias. `str_replace` replaces the first occurrence of
+`old_str` by default; pass `replace_all: true` to replace every occurrence.
 
 ### Background shell tools (`nohup` / `nohup_query` / `wait_for`)
 

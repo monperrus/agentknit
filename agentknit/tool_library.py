@@ -214,7 +214,8 @@ def _apply_patch_format(patch: str) -> tuple[str, dict[str, object]]:
     return t_update(path=path, old=old, new=new)
 
 
-def t_update(path: str = "", old: str = "", new: str = "", patch: str = "") -> tuple[str, dict[str, object]]:
+def t_update(path: str = "", old: str = "", new: str = "", patch: str = "",
+             replace_all: bool = False) -> tuple[str, dict[str, object]]:
     """Edit an existing file by replacing a specific substring.
 
     Tool spec:
@@ -230,6 +231,13 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "") -> t
             new_str:
                 type: string
                 description: Replacement text.
+            replace_all:
+                type: boolean
+                description: Replace every occurrence instead of only the first.
+
+    With *replace_all* False (default) only the first occurrence is replaced;
+    with it True every occurrence is. Either way the exact byte sequence of
+    *old_str* must be present in the file, else the edit is refused.
     """
     if patch:
         return _apply_patch_format(patch)
@@ -241,13 +249,17 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "") -> t
                  f"({len(old)} chars, starts with {repr(old[:80])}). "
                  f"Re-read the file and copy the exact bytes.")
             return r, {"result": r}
-        n = text.count(old)
-        p.write_text(text.replace(old, new))
+        n = text.count(old)                      # total matches before the edit
+        done = n if replace_all else min(1, n)
+        p.write_text(text.replace(old, new) if replace_all else text.replace(old, new, 1))
         # Count lines and UTF-8 characters in the replaced text
-        old_lines = old.count('\n') + (1 if old else 0)
-        old_chars = len(old)
-        new_lines = new.count('\n') + (1 if new else 0)
-        r = f"OK: replaced {n} occurrence(s) ({old_lines} line(s), {old_chars} UTF-8 character(s)) in {path}"
+        old_lines = (old.count('\n') + (1 if old else 0)) * done
+        old_chars = len(old) * done
+        new_lines = (new.count('\n') + (1 if new else 0)) * done
+        r = f"OK: replaced {done} of {n} occurrence(s)"
+        r += (f" ({old_lines} line(s), {old_chars} UTF-8 character(s)) in {path}"
+              + ("" if done == n
+                 else f"; {n - done} remaining — pass replace_all=True to replace them"))
         return r, {
             "result": r,
             "files": [path],

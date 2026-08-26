@@ -48,7 +48,8 @@ def test_parse_tool_spec_str_replace():
     spec = parse_tool_spec_from_docstring(doc)
     assert spec is not None
     assert spec["name"] == "str_replace"
-    assert set(spec["parameters"]) == {"path", "old_str", "new_str"}
+    assert set(spec["parameters"]) == {"path", "old_str", "new_str", "replace_all"}
+    assert spec["parameters"]["replace_all"]["type"] == "boolean"
 
 
 def test_parse_tool_spec_execute_shell():

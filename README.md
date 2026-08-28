@@ -260,9 +260,9 @@ capped at `WAIT_FOR_MAX_SECONDS` (3600) per call; split longer waits into
 several calls.
 
 To run a command later — e.g. re-check CI in 5 minutes — pass
-`wait_before_s=300` instead of prefixing the command with `sleep 300 &&`: the
-`nohup` call returns immediately with the `tool_exec_id`, the delay does not
-burn the `timeout(1)` budget, and `nohup_wait` reports it as usual.
+`wait_before_s=300`: the `nohup` call returns immediately with the
+`tool_exec_id`, the command starts after the delay, the `timeout(1)` budget
+applies only once it runs, and `nohup_wait` reports it as usual.
 
 Busy-polling is also discouraged at the source: two consecutive `nohup_query`
 calls for the same still-running `tool_exec_id` are **denied**, with the

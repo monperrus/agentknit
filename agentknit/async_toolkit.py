@@ -230,8 +230,8 @@ def t_execute_async(command: str, wait_before_s: float = 0) -> tuple[str, dict[s
     execution is registered immediately (so the caller gets its
     ``tool_exec_id`` and file paths right away) and a background thread runs
     the command once the delay has elapsed. Use it to schedule a command for
-    later instead of prefixing it with ``sleep N &&`` — the delay does not
-    count towards any timeout(1) bound on the command.
+    later; the delay does not count towards any timeout(1) bound on the
+    command.
 
     A named FIFO is created at stdin_localfile; write text to it to send input
     to the running process (e.g. via write_file or a shell redirect). The FIFO
@@ -484,9 +484,8 @@ def t_nohup(command: str, timeout: int = NOHUP_TIMEOUT_MIN,
             wait_before_s: float = 0) -> tuple[str, dict[str, object]]:
     """Bound the command with timeout(1) then hand off to t_execute_async.
 
-    The bound applies to the command itself only: a ``wait_before_s`` delay
-    elapses *before* the command starts and is not counted against it (unlike
-    a hand-written ``sleep N && cmd``, which burns the whole budget sleeping).
+    A ``wait_before_s`` delay elapses *before* the command starts and is not
+    counted against the bound, which begins when the command runs.
     """
     if wait_before_s < 0:
         r = json.dumps({"error": "wait_before_s must be >= 0"})
@@ -625,9 +624,9 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                     f"If the command finishes within {int(ASYNC_FAST_THRESHOLD_S * 1000)} ms "
                     f"and both outputs are under {ASYNC_INLINE_MAX_BYTES} bytes, "
                     "stdout/stderr are inlined immediately. To run a command in N "
-                    "seconds from now, pass wait_before_s=N — never prefix the "
-                    "command with `sleep N &&`: that burns the timeout budget while "
-                    "sleeping and delays nothing else."
+                    "seconds from now, pass wait_before_s=N: the command starts N "
+                    "seconds later and its full `timeout` budget is available "
+                    "when it starts."
                 ),
                 "parameters": {
                     "type": "object",
@@ -647,8 +646,7 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                                 "Seconds to wait before starting the command "
                                 f"(default 0). Cap {WAIT_BEFORE_MAX_SECONDS}s. The "
                                 "tool returns immediately with tool_exec_id and file "
-                                "paths; poll/wait on that id as usual. Use this "
-                                "instead of `sleep N && command`."
+                                "paths; poll/wait on that id as usual."
                             ),
                         },
                     },

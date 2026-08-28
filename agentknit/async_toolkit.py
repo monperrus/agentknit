@@ -48,9 +48,13 @@ ASYNC_INLINE_MAX_BYTES = 4096
 # Default execution bound (minutes) applied by t_nohup via timeout(1).
 NOHUP_TIMEOUT_MIN = 10
 
-# exec_id → {"proc": Popen, "stdout_file": str, "stderr_file": str, "start": float}
+# Cap on wait_before_s (delayed start), same order of magnitude as the
+# nohup_wait budget cap: enough to let CI run, not enough to schedule tomorrow.
+WAIT_BEFORE_MAX_SECONDS = 3600
+
+# exec_id → {"proc": Popen (None until a wait_before_s delay elapses), …}
 class _AsyncExecEntry(TypedDict):
-    proc: subprocess.Popen[bytes]
+    proc: "subprocess.Popen[bytes] | None"
     stdout_file: str
     stderr_file: str
     stdin_file: str
@@ -59,6 +63,9 @@ class _AsyncExecEntry(TypedDict):
     cwd: str
     command: str
     io_before: dict[str, int]          # last /proc/<pid>/io counters read for this exec
+    scheduled_for: float               # monotonic time at which the command starts
+                                        # (== start when there is no wait_before_s delay)
+    fast_done: bool                    # finished within ASYNC_FAST_THRESHOLD_S (sync path only)
 
 
 _async_executions: dict[str, _AsyncExecEntry] = {}
@@ -179,6 +186,8 @@ def _proc_cpu_seconds(pid: int) -> float:
 
 def _activity_snapshot(entry: _AsyncExecEntry) -> tuple[float, dict[str, int]]:
     """CPU seconds and I/O counters of *entry*'s process tree (0 on non-Linux)."""
+    if entry["proc"] is None:
+        return 0.0, dict.fromkeys(_IO_FIELDS, 0)
     try:
         pids = _process_tree(entry["proc"].pid)
     except OSError:
@@ -206,27 +215,38 @@ def _activity_report(entry: _AsyncExecEntry) -> dict[str, Any]:
         "cpu_seconds": round(cpu, 3),
         "cpu_percent": round(100.0 * cpu / elapsed, 1),
         "io_bytes": {k: io[k] - before[k] for k in _IO_FIELDS},
-        "note": "bytes read/written since the last nohup_wait report of this execution",
+        "note": ("command not started yet (wait_before_s delay)"
+                 if entry["proc"] is None
+                 else "bytes read/written since the last nohup_wait report of this execution"),
     }
 
 
 # ── low-level tools ───────────────────────────────────────────────────────────
 
-def t_execute_async(command: str, when: int = 0) -> tuple[str, dict[str, object]]:
+def t_execute_async(command: str, wait_before_s: float = 0) -> tuple[str, dict[str, object]]:
     """Start a shell command asynchronously, capturing stdout/stderr to files.
 
-    *when* (minutes, default 0) delays the start; use it to schedule a command
-    for later without a separate planning tool.
+    *wait_before_s* (seconds, default 0) delays the start of the command: the
+    execution is registered immediately (so the caller gets its
+    ``tool_exec_id`` and file paths right away) and a background thread runs
+    the command once the delay has elapsed. Use it to schedule a command for
+    later instead of prefixing it with ``sleep N &&`` — the delay does not
+    count towards any timeout(1) bound on the command.
 
     A named FIFO is created at stdin_localfile; write text to it to send input
-    to the running process (e.g. via write_file or a shell redirect).
+    to the running process (e.g. via write_file or a shell redirect). The FIFO
+    is only connected once the command actually starts.
 
     If the command finishes within ASYNC_FAST_THRESHOLD_S *and* both output
     files are small, the content is inlined so the caller needs no follow-up
     t_query_exec call.
     """
-    if when:
-        time.sleep(when * 60)
+    if wait_before_s < 0:
+        r = json.dumps({"error": "wait_before_s must be >= 0"})
+        return r, {"result": r}
+    if wait_before_s > WAIT_BEFORE_MAX_SECONDS:
+        r = json.dumps({"error": f"wait_before_s exceeds the {WAIT_BEFORE_MAX_SECONDS}s cap"})
+        return r, {"result": r}
     session_id = getattr(_tool_context, "session_id", None)
     exec_dir = (ASYNC_EXEC_DIR / session_id) if session_id else ASYNC_EXEC_DIR
     exec_dir.mkdir(parents=True, exist_ok=True)
@@ -236,85 +256,13 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict[str, object]
     stdin_path  = str(exec_dir / f"{exec_id}.stdin")
     cwd = os.getcwd()
 
-    os.mkfifo(stdin_path)
-    stdout_fh = open(stdout_path, "wb", buffering=0)
-    stderr_fh = open(stderr_path, "wb", buffering=0)
-
-    # Open the FIFO write-end in a background thread (open() on a FIFO blocks
-    # until a reader appears). The read-end is handed to the process.
-    stdin_write_fh: "list[BinaryIO]" = []   # populated by the thread once the process opens it
-
-    def _open_fifo_write() -> None:
-        fh = open(stdin_path, "wb", buffering=0)
-        stdin_write_fh.append(fh)
-
-    fifo_thread = threading.Thread(target=_open_fifo_write, daemon=True)
-    fifo_thread.start()
-
-    stdin_read_fh = open(stdin_path, "rb")   # unblocks the writer thread
-
-    t0 = time.monotonic()
-    started_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
-    proc = subprocess.Popen(
-        command,
-        shell=True,
-        stdin=stdin_read_fh,
-        stdout=stdout_fh,
-        stderr=stderr_fh,
-        preexec_fn=os.setsid,
-    )
-    stdin_read_fh.close()   # process has inherited the fd; we don't need it
-
-    try:
-        proc.wait(timeout=ASYNC_FAST_THRESHOLD_S)
-    except subprocess.TimeoutExpired:
-        pass
-
-    stdout_fh.flush()
-    stderr_fh.flush()
-    returncode = proc.poll()
-    fast_done = returncode is not None
-
-    def _close_on_exit() -> None:
-        proc.wait()
-        stdout_fh.close()
-        stderr_fh.close()
-        fifo_thread.join(timeout=1)
-        for fh in stdin_write_fh:
-            try:
-                fh.close()
-            except OSError:
-                pass
-        async_completion_queue.put({
-            "tool_exec_id": exec_id,
-            "returncode":   proc.returncode,
-            "stdout_file":  stdout_path,
-            "stderr_file":  stderr_path,
-            "duration":     round(time.monotonic() - t0, 3),
-            "cwd":          cwd,
-        })
-
-    if fast_done:
-        # Result already inlined; close handles but skip the completion queue push.
-        stdout_fh.close()
-        stderr_fh.close()
-        fifo_thread.join(timeout=1)
-        for fh in stdin_write_fh:
-            try:
-                fh.close()
-            except OSError:
-                pass
-    else:
-        threading.Thread(target=_close_on_exit, daemon=True).start()
-
-    duration = round(time.monotonic() - t0, 3)
-
-    global _last_queried_exec_id
-    _last_queried_exec_id = None
+    now = time.monotonic()
+    t0 = now + wait_before_s
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + wait_before_s))
 
     with _async_exec_lock:
         _async_executions[exec_id] = {
-            "proc": proc,
+            "proc": None,
             "command": command,
             "stdout_file": stdout_path,
             "stderr_file": stderr_path,
@@ -323,7 +271,116 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict[str, object]
             "started_at": started_at,
             "cwd": cwd,
             "io_before": dict.fromkeys(_IO_FIELDS, 0),
+            "scheduled_for": t0,
+            "fast_done": False,
         }
+
+    def _spawn() -> None:
+        """Sleep out the delay, then run the command (the body of the old synchronous path)."""
+        if wait_before_s:
+            time.sleep(wait_before_s)
+
+        os.mkfifo(stdin_path)
+        stdout_fh = open(stdout_path, "wb", buffering=0)
+        stderr_fh = open(stderr_path, "wb", buffering=0)
+
+        # Open the FIFO write-end in a background thread (open() on a FIFO blocks
+        # until a reader appears). The read-end is handed to the process.
+        stdin_write_fh: "list[BinaryIO]" = []   # populated by the thread once the process opens it
+
+        def _open_fifo_write() -> None:
+            fh = open(stdin_path, "wb", buffering=0)
+            stdin_write_fh.append(fh)
+
+        fifo_thread = threading.Thread(target=_open_fifo_write, daemon=True)
+        fifo_thread.start()
+
+        stdin_read_fh = open(stdin_path, "rb")   # unblocks the writer thread
+
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            stdin=stdin_read_fh,
+            stdout=stdout_fh,
+            stderr=stderr_fh,
+            preexec_fn=os.setsid,
+        )
+        stdin_read_fh.close()   # process has inherited the fd; we don't need it
+
+        with _async_exec_lock:
+            _async_executions[exec_id]["proc"] = proc
+
+        try:
+            proc.wait(timeout=ASYNC_FAST_THRESHOLD_S)
+        except subprocess.TimeoutExpired:
+            pass
+
+        stdout_fh.flush()
+        stderr_fh.flush()
+        returncode = proc.poll()
+        fast_done = returncode is not None
+
+        def _close_on_exit() -> None:
+            proc.wait()
+            stdout_fh.close()
+            stderr_fh.close()
+            fifo_thread.join(timeout=1)
+            for fh in stdin_write_fh:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+            async_completion_queue.put({
+                "tool_exec_id": exec_id,
+                "returncode":   proc.returncode,
+                "stdout_file":  stdout_path,
+                "stderr_file":  stderr_path,
+                "duration":     round(time.monotonic() - t0, 3),
+                "cwd":          cwd,
+            })
+
+        if fast_done:
+            # Result already inlined; close handles but skip the completion queue push.
+            stdout_fh.close()
+            stderr_fh.close()
+            fifo_thread.join(timeout=1)
+            for fh in stdin_write_fh:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+        else:
+            threading.Thread(target=_close_on_exit, daemon=True).start()
+
+        global _last_queried_exec_id
+        _last_queried_exec_id = None
+
+        with _async_exec_lock:
+            entry_now = _async_executions[exec_id]
+            entry_now["fast_done"] = fast_done
+
+    if wait_before_s:
+        threading.Thread(target=_spawn, daemon=True).start()
+        scheduled: dict[str, object] = {
+            "tool_exec_id": exec_id,
+            "scheduled_for": started_at,
+            "starts_in_seconds": round(wait_before_s, 3),
+            "cwd": cwd,
+            "stdin_localfile":  stdin_path,
+            "stdout_localfile": stdout_path,
+            "stderr_localfile": stderr_path,
+            "command": command,
+        }
+        r = json.dumps(scheduled)
+        return r, {"result": r}
+
+    _spawn()
+    with _async_exec_lock:
+        entry = _async_executions[exec_id]
+    proc = entry["proc"]
+    assert proc is not None   # synchronous path: _spawn ran to completion
+
+    duration = round(time.monotonic() - t0, 3)
 
     result: dict[str, object] = {
         "tool_exec_id": exec_id,
@@ -334,12 +391,11 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict[str, object]
         "stdout_localfile": stdout_path,
         "stderr_localfile": stderr_path,
     }
-    if fast_done:
+    if entry.get("fast_done"):
         result["completed"] = True
-        result["returncode"] = returncode
+        result["returncode"] = proc.returncode
         result["duration_time"] = duration
         _async_add_inline(result, stdout_path, stderr_path)
-
     r = json.dumps(result)
     return r, {"result": r}
 
@@ -358,7 +414,23 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict[str, object]]:
         return r, {"result": r}
 
     proc = entry["proc"]
-    returncode = proc.poll()
+    if proc is None:
+        # Delayed start not elapsed yet (wait_before_s): the command has not run.
+        starts_in = round(entry["scheduled_for"] - time.monotonic(), 3)
+        scheduled_result: dict[str, object] = {
+            "completed": False,
+            "scheduled": True,
+            "starts_in_seconds": max(starts_in, 0.0),
+            "started_at": entry["started_at"],
+            "cwd":         entry.get("cwd", ""),
+            "command":     entry["command"],
+            "stdout_localfile": entry["stdout_file"],
+            "stderr_localfile": entry["stderr_file"],
+        }
+        r = json.dumps(scheduled_result)
+        return r, {"result": r}
+
+    returncode = entry["proc"].poll() if entry["proc"] is not None else None
     completed = returncode is not None
 
     global _last_queried_exec_id
@@ -408,9 +480,22 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict[str, object]]:
 
 # ── nohup / nohup_query / nohup_wait ───────────────────────────────────────────────────────
 
-def t_nohup(command: str, timeout: int = NOHUP_TIMEOUT_MIN) -> tuple[str, dict[str, object]]:
-    """Bound the command with timeout(1) then hand off to t_execute_async."""
-    return t_execute_async(f"timeout {int(timeout) * 60} {command}")
+def t_nohup(command: str, timeout: int = NOHUP_TIMEOUT_MIN,
+            wait_before_s: float = 0) -> tuple[str, dict[str, object]]:
+    """Bound the command with timeout(1) then hand off to t_execute_async.
+
+    The bound applies to the command itself only: a ``wait_before_s`` delay
+    elapses *before* the command starts and is not counted against it (unlike
+    a hand-written ``sleep N && cmd``, which burns the whole budget sleeping).
+    """
+    if wait_before_s < 0:
+        r = json.dumps({"error": "wait_before_s must be >= 0"})
+        return r, {"result": r}
+    if wait_before_s > WAIT_BEFORE_MAX_SECONDS:
+        r = json.dumps({"error": f"wait_before_s exceeds the {WAIT_BEFORE_MAX_SECONDS}s cap"})
+        return r, {"result": r}
+    return t_execute_async(f"timeout {int(timeout) * 60} {command}",
+                           wait_before_s=wait_before_s)
 
 
 # Units understood by t_nohup_wait.  Wait durations are computed as
@@ -468,7 +553,8 @@ def t_nohup_wait(tool_exec_id: str, howmuch: int | None = None, unit: str = "s")
     others: list[_AsyncCompletion] = []
     done = False
     while True:
-        if entry["proc"].poll() is not None:
+        proc = entry["proc"]
+        if proc is not None and proc.poll() is not None:
             done = True
             break
         remaining = None if deadline is None else deadline - time.monotonic()
@@ -486,7 +572,9 @@ def t_nohup_wait(tool_exec_id: str, howmuch: int | None = None, unit: str = "s")
 
     result: dict[str, object] = {"tool_exec_id": tool_exec_id, "completed": done}
     if done:
-        result["returncode"] = entry["proc"].returncode
+        proc = entry["proc"]
+        assert proc is not None
+        result["returncode"] = proc.returncode
         result["duration_time"] = round(time.monotonic() - entry["start"], 3)
         result["stdout_localfile"] = entry["stdout_file"]
         result["stderr_localfile"] = entry["stderr_file"]
@@ -495,6 +583,9 @@ def t_nohup_wait(tool_exec_id: str, howmuch: int | None = None, unit: str = "s")
         result["stderr_last_lines"] = _async_last_lines(entry["stderr_file"])
         _async_add_inline(result, entry["stdout_file"], entry["stderr_file"])
     else:
+        if entry["proc"] is None:
+            result["scheduled"] = True
+            result["starts_in_seconds"] = max(round(entry["scheduled_for"] - time.monotonic(), 3), 0.0)
         result["waited_seconds"] = round(seconds if seconds is not None
                                          else time.monotonic() - entry["start"], 3)
         result["activity"] = _activity_report(entry)
@@ -533,7 +624,10 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                     f"the command is killed after `timeout` minutes (default {timeout_min}). "
                     f"If the command finishes within {int(ASYNC_FAST_THRESHOLD_S * 1000)} ms "
                     f"and both outputs are under {ASYNC_INLINE_MAX_BYTES} bytes, "
-                    "stdout/stderr are inlined immediately."
+                    "stdout/stderr are inlined immediately. To run a command in N "
+                    "seconds from now, pass wait_before_s=N — never prefix the "
+                    "command with `sleep N &&`: that burns the timeout budget while "
+                    "sleeping and delays nothing else."
                 ),
                 "parameters": {
                     "type": "object",
@@ -543,7 +637,18 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                             "type": "integer",
                             "description": (
                                 "Maximum minutes the command may run before being "
-                                f"killed (default {timeout_min})."
+                                f"killed (default {timeout_min}). Counts from the "
+                                "moment the command starts, not from wait_before_s."
+                            ),
+                        },
+                        "wait_before_s": {
+                            "type": "number",
+                            "description": (
+                                "Seconds to wait before starting the command "
+                                f"(default 0). Cap {WAIT_BEFORE_MAX_SECONDS}s. The "
+                                "tool returns immediately with tool_exec_id and file "
+                                "paths; poll/wait on that id as usual. Use this "
+                                "instead of `sleep N && command`."
                             ),
                         },
                     },

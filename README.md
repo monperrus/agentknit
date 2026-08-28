@@ -249,7 +249,7 @@ Async tools always come with three:
 
 | Tool | Role |
 |---|---|
-| `nohup` | Start a shell command in the background, bounded by `timeout` minutes (default 10). Returns `tool_exec_id`, the `pid`, and the local stdin (FIFO)/stdout/stderr paths. |
+| `nohup` | Start a shell command in the background, bounded by `timeout` minutes (default 10). Returns `tool_exec_id`, the `pid`, and the local stdin (FIFO)/stdout/stderr paths. `wait_before_s` starts the command N seconds later (the `timeout` budget counts from the start, not from the delay). |
 | `nohup_query` | Poll one execution by `tool_exec_id`; inlines stdout/stderr when both fit in 4 KiB, otherwise reports file sizes. |
 | `nohup_wait` | `nohup_wait(tool_exec_id, howmuch, unit)` waits for **one** background execution instead of busy-polling; `howmuch` × `unit` (`s`/`m`/`h`/`d`) is an optional budget. Returns as soon as the exec completes (returncode, output paths, last lines of stdout/stderr, inline output when small). If the budget expires first, it reports `completed: false` plus the CPU and I/O activity of the still-running process so you can tell progress from a hang. Execs finishing meanwhile are listed under `also_completed`. |
 
@@ -258,6 +258,11 @@ Async tools always come with three:
 the result, so short commands need no `nohup_query` round trip. Waits are
 capped at `WAIT_FOR_MAX_SECONDS` (3600) per call; split longer waits into
 several calls.
+
+To run a command later — e.g. re-check CI in 5 minutes — pass
+`wait_before_s=300` instead of prefixing the command with `sleep 300 &&`: the
+`nohup` call returns immediately with the `tool_exec_id`, the delay does not
+burn the `timeout(1)` budget, and `nohup_wait` reports it as usual.
 
 Busy-polling is also discouraged at the source: two consecutive `nohup_query`
 calls for the same still-running `tool_exec_id` are **denied**, with the

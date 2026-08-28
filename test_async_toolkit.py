@@ -9,6 +9,7 @@ import time
 from agentknit.async_toolkit import (
     NOHUP_TIMEOUT_MIN,
     WAIT_FOR_MAX_SECONDS,
+    _async_executions,
     async_completion_queue,
     enable_nohup,
     nohup_tool_specs,
@@ -54,14 +55,61 @@ def test_t_nohup_bounds_with_timeout(monkeypatch) -> None:
     """t_nohup prefixes the command with timeout(1), minutes → seconds."""
     seen: list[str] = []
 
-    def _fake_execute(command: str, when: int = 0):
-        seen.append(command)
+    def _fake_execute(command: str, wait_before_s: float = 0):
+        seen.append((command, wait_before_s))
         return json.dumps({"tool_exec_id": "x"}), {"result": "x"}
 
     monkeypatch.setattr("agentknit.async_toolkit.t_execute_async", _fake_execute)
     t_nohup("sleep 30")
     t_nohup("sleep 30", timeout=3)
-    assert seen == ["timeout 600 sleep 30", "timeout 180 sleep 30"]
+    t_nohup("sleep 30", wait_before_s=300)
+    assert seen == [
+        ("timeout 600 sleep 30", 0),
+        ("timeout 180 sleep 30", 0),
+        ("timeout 600 sleep 30", 300),   # bound applies to the command, not the delay
+    ]
+
+
+def test_t_nohup_rejects_bad_wait_before(monkeypatch) -> None:
+    """Out-of-range wait_before_s is rejected before any command is started."""
+    def _fake_execute(command: str, wait_before_s: float = 0):
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr("agentknit.async_toolkit.t_execute_async", _fake_execute)
+    assert ">= 0" in json.loads(t_nohup("true", wait_before_s=-1)[0])["error"]
+    assert "cap" in json.loads(t_nohup("true", wait_before_s=99999)[0])["error"]
+
+
+def test_t_execute_async_schedules_later_start() -> None:
+    """wait_before_s registers the exec immediately, spawns after the delay."""
+    result, _ = t_execute_async("echo scheduled-late && sleep 0.2", wait_before_s=1.0)
+    d = json.loads(result)
+    assert d["starts_in_seconds"] >= 0.9
+    assert "pid" not in d                      # no process yet
+    assert "scheduled_for" in d
+
+    # Query sees the scheduled state, not a running process.
+    q = json.loads(t_query_exec(d["tool_exec_id"])[0])
+    assert q["scheduled"] is True
+    assert q["completed"] is False
+    assert q["starts_in_seconds"] >= 0.5
+
+    # A short wait budget expires while still scheduled: activity reports it.
+    w = json.loads(t_nohup_wait(d["tool_exec_id"], 0.3, "s")[0])
+    assert w["completed"] is False
+    assert w["scheduled"] is True
+
+    final = _drain(d["tool_exec_id"])
+    assert final["returncode"] == 0
+    assert final["stdout"].strip() == "scheduled-late"
+
+
+def test_t_execute_async_rejects_bad_wait_before() -> None:
+    """Out-of-range wait_before_s errors without registering anything."""
+    before = len(_async_executions)
+    assert ">= 0" in json.loads(t_execute_async("true", wait_before_s=-5)[0])["error"]
+    assert "cap" in json.loads(t_execute_async("true", wait_before_s=7200)[0])["error"]
+    assert len(_async_executions) == before
 
 
 def test_nohup_tool_specs_shape() -> None:

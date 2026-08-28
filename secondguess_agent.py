@@ -53,7 +53,7 @@ def cancel_next_exec() -> None:
     _grace_cancel.set()
 
 
-def t_secondguess_exec(command: str, when: int = 0) -> tuple[str, dict]:
+def t_secondguess_exec(command: str) -> tuple[str, dict]:
     """Execute a shell command, but wait {GRACE_PERIOD_SECONDS}s before
     starting so the operator can Ctrl-C to abort.
 
@@ -63,9 +63,6 @@ def t_secondguess_exec(command: str, when: int = 0) -> tuple[str, dict]:
 
     If cancelled, returns a cancellation notice instead of running the command.
     """
-    # Apply the `when` delay first (if any) — same as t_execute_async does.
-    if when:
-        time.sleep(when * 60)
 
     # ── grace period ─────────────────────────────────────────────────────
     # Check first — a supervisor may have called cancel_next_exec() while
@@ -101,8 +98,7 @@ def t_secondguess_exec(command: str, when: int = 0) -> tuple[str, dict]:
         return r, {"result": r}
 
     # ── proceed with actual execution ────────────────────────────────────
-    # Pass when=0 because we already applied the delay above.
-    return t_execute_async(command, when=0)
+    return t_execute_async(command)
 
 
 # ── tool definitions ─────────────────────────────────────────────────────────
@@ -113,8 +109,7 @@ _TOOLS = [
             f"Start a shell command asynchronously with a {GRACE_PERIOD_SECONDS}s "
             f"grace period. Returns tool_exec_id and local file paths for stdin "
             f"(FIFO), stdout, and stderr. Write to stdin_localfile to send input "
-            f"to the running process. Optional `when` (integer minutes, default 0) "
-            f"delays the start. If the command finishes within "
+            f"to the running process. If the command finishes within "
             f"{int(ASYNC_FAST_THRESHOLD_S * 1000)} ms and both outputs are under "
             f"{ASYNC_INLINE_MAX_BYTES} bytes, stdout/stderr are inlined immediately. "
             f"**IMPORTANT**: The command does NOT start immediately. There is a "
@@ -128,10 +123,6 @@ _TOOLS = [
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Shell command to run."},
-                "when": {
-                    "type": "integer",
-                    "description": "Minutes to wait before starting the command (default 0).",
-                },
             },
             "required": ["command"],
         },

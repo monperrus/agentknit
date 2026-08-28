@@ -1,4 +1,4 @@
-"""Tests for agentknit.async_toolkit — nohup/nohup_query/wait_for tools and specs."""
+"""Tests for agentknit.async_toolkit — nohup/nohup_query/nohup_wait tools and specs."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from agentknit.async_toolkit import (
     t_execute_async,
     t_nohup,
     t_query_exec,
-    t_wait_for,
+    t_nohup_wait,
 )
 from agentknit.tool_library import TOOL_LIBRARY
 
@@ -37,7 +37,7 @@ def test_t_nohup_registered_in_tool_library() -> None:
     assert TOOL_LIBRARY["t_nohup"] is t_nohup
     assert TOOL_LIBRARY["t_execute_async"] is t_execute_async
     assert TOOL_LIBRARY["t_query_exec"] is t_query_exec
-    assert TOOL_LIBRARY["t_wait_for"] is t_wait_for
+    assert TOOL_LIBRARY["t_nohup_wait"] is t_nohup_wait
 
 
 def test_t_nohup_runs_and_reports_output() -> None:
@@ -64,10 +64,10 @@ def test_t_nohup_bounds_with_timeout(monkeypatch) -> None:
 
 
 def test_nohup_tool_specs_shape() -> None:
-    """Specs describe the nohup / nohup_query / wait_for trio with params."""
+    """Specs describe the nohup / nohup_query / nohup_wait trio with params."""
     specs = nohup_tool_specs()
     names = [s["function"]["name"] for s in specs]
-    assert names == ["nohup", "nohup_query", "wait_for"]
+    assert names == ["nohup", "nohup_query", "nohup_wait"]
     assert specs[0]["function"]["parameters"]["required"] == ["command"]
     assert specs[1]["function"]["parameters"]["required"] == ["tool_exec_id"]
     assert specs[2]["function"]["parameters"]["required"] == ["tool_exec_id"]
@@ -82,10 +82,10 @@ def test_enable_nohup_dispatch_schema() -> None:
     schema: dict = {"model": "m", "inferred_tool_schema": []}
     enable_nohup(schema)
     names = [t["function"]["name"] for t in schema["inferred_tool_schema"]]
-    assert "nohup" in names and "nohup_query" in names and "wait_for" in names
+    assert "nohup" in names and "nohup_query" in names and "nohup_wait" in names
     assert schema["tool_dispatch"]["nohup"]["python_function"] == "t_nohup"
     assert schema["tool_dispatch"]["nohup_query"]["python_function"] == "t_query_exec"
-    assert schema["tool_dispatch"]["wait_for"]["python_function"] == "t_wait_for"
+    assert schema["tool_dispatch"]["nohup_wait"]["python_function"] == "t_nohup_wait"
 
 
 def test_enable_nohup_tools_list_schema() -> None:
@@ -103,7 +103,7 @@ def test_enable_nohup_tools_list_schema() -> None:
         "tools": ["t_run"],
     }
     enable_nohup(schema)
-    assert schema["tools"][-3:] == ["t_nohup", "t_query_exec", "t_wait_for"]
+    assert schema["tools"][-3:] == ["t_nohup", "t_query_exec", "t_nohup_wait"]
     assert len(schema["tools"]) == len(schema["inferred_tool_schema"])
 
 
@@ -115,10 +115,10 @@ def test_enable_nohup_idempotent() -> None:
     names = [t["function"]["name"] for t in schema["inferred_tool_schema"]]
     assert names.count("nohup") == 1
     assert names.count("nohup_query") == 1
-    assert names.count("wait_for") == 1
+    assert names.count("nohup_wait") == 1
 
 
-# ── wait_for ─────────────────────────────────────────────────────────────
+# ── nohup_wait ─────────────────────────────────────────────────────────────
 
 
 def _drain_queue() -> None:
@@ -130,13 +130,13 @@ def _drain_queue() -> None:
             return
 
 
-def test_wait_for_reports_completions() -> None:
-    """wait_for sleeps until the exec finishes, then reports it inline."""
+def test_nohup_wait_reports_completions() -> None:
+    """nohup_wait sleeps until the exec finishes, then reports it inline."""
     _drain_queue()
     result, _ = t_nohup("echo wait-for-test && sleep 1")
     d = json.loads(result)
     t0 = time.monotonic()
-    out = json.loads(t_wait_for(d["tool_exec_id"], 5, "s")[0])
+    out = json.loads(t_nohup_wait(d["tool_exec_id"], 5, "s")[0])
     elapsed = time.monotonic() - t0
     assert out["tool_exec_id"] == d["tool_exec_id"]
     assert out["completed"] is True
@@ -148,23 +148,23 @@ def test_wait_for_reports_completions() -> None:
     assert out["stdout"].strip() == "wait-for-test"
 
 
-def test_wait_for_returns_immediately_when_already_done() -> None:
+def test_nohup_wait_returns_immediately_when_already_done() -> None:
     """A finished exec completes the wait without sleeping."""
     _drain_queue()
     d = json.loads(t_nohup("true")[0])
     _drain(d["tool_exec_id"])
     t0 = time.monotonic()
-    out = json.loads(t_wait_for(d["tool_exec_id"], 60, "s")[0])
+    out = json.loads(t_nohup_wait(d["tool_exec_id"], 60, "s")[0])
     assert out["completed"] is True
     assert time.monotonic() - t0 < 5
 
 
-def test_wait_for_reports_not_completed_with_activity() -> None:
-    """When the budget expires first, wait_for says so plus CPU/IO activity."""
+def test_nohup_wait_reports_not_completed_with_activity() -> None:
+    """When the budget expires first, nohup_wait says so plus CPU/IO activity."""
     _drain_queue()
     d = json.loads(t_nohup("sleep 30")[0])
     t0 = time.monotonic()
-    out = json.loads(t_wait_for(d["tool_exec_id"], 1, "s")[0])
+    out = json.loads(t_nohup_wait(d["tool_exec_id"], 1, "s")[0])
     elapsed = time.monotonic() - t0
     assert out["tool_exec_id"] == d["tool_exec_id"]
     assert out["completed"] is False
@@ -180,13 +180,13 @@ def test_wait_for_reports_not_completed_with_activity() -> None:
     assert _drain(d["tool_exec_id"], timeout=45).get("returncode") is not None
 
 
-def test_wait_for_activity_deltas_between_calls() -> None:
-    """io_bytes measures progress since the previous wait_for report."""
+def test_nohup_wait_activity_deltas_between_calls() -> None:
+    """io_bytes measures progress since the previous nohup_wait report."""
     _drain_queue()
     d = json.loads(t_nohup("sleep 2 && dd if=/dev/zero of=/dev/null bs=1k count=2048 2>/dev/null")[0])
-    out1 = json.loads(t_wait_for(d["tool_exec_id"], 0.5, "s")[0])
+    out1 = json.loads(t_nohup_wait(d["tool_exec_id"], 0.5, "s")[0])
     assert out1["completed"] is False
-    out2 = json.loads(t_wait_for(d["tool_exec_id"], 3, "s")[0])
+    out2 = json.loads(t_nohup_wait(d["tool_exec_id"], 3, "s")[0])
     if out2["completed"]:
         # dd finished inside the second budget: nothing more to assert.
         assert out2["returncode"] == 0
@@ -194,12 +194,12 @@ def test_wait_for_activity_deltas_between_calls() -> None:
     assert out2["activity"]["io_bytes"]["rchar"] > 0   # dd read its input meanwhile
 
 
-def test_wait_for_reports_other_completions_as_side_info() -> None:
+def test_nohup_wait_reports_other_completions_as_side_info() -> None:
     """Execs finishing meanwhile are reported, without ending the wait."""
     _drain_queue()
     a = json.loads(t_nohup("sleep 2")[0])
     b = json.loads(t_nohup("sleep 1")[0])
-    out = json.loads(t_wait_for(a["tool_exec_id"], 10, "s")[0])
+    out = json.loads(t_nohup_wait(a["tool_exec_id"], 10, "s")[0])
     assert out["tool_exec_id"] == a["tool_exec_id"]
     assert out["completed"] is True
     assert out["returncode"] == 0
@@ -208,27 +208,27 @@ def test_wait_for_reports_other_completions_as_side_info() -> None:
     assert other["returncode"] == 0
 
 
-def test_wait_for_unknown_id() -> None:
+def test_nohup_wait_unknown_id() -> None:
     """Unknown ids error out before any sleeping happens."""
     t0 = time.monotonic()
-    out = json.loads(t_wait_for("nope", 60, "s")[0])
+    out = json.loads(t_nohup_wait("nope", 60, "s")[0])
     assert "unknown tool_exec_id" in out["error"]
     assert time.monotonic() - t0 < 1
 
 
-def test_wait_for_no_howmuch() -> None:
+def test_nohup_wait_no_howmuch() -> None:
     """Without howmuch there is no budget: wait ends on completion."""
     _drain_queue()
     d = json.loads(t_nohup("sleep 1")[0])
     t0 = time.monotonic()
-    out = json.loads(t_wait_for(d["tool_exec_id"])[0])
+    out = json.loads(t_nohup_wait(d["tool_exec_id"])[0])
     assert out["completed"] is True
     assert out["returncode"] == 0
     assert 0.9 <= time.monotonic() - t0 < 5
     assert "waited_seconds" not in out
 
 
-def test_wait_for_units(monkeypatch) -> None:
+def test_nohup_wait_units(monkeypatch) -> None:
     """howmuch × unit is the budget; a fake completion queue short-circuits it."""
     _drain_queue()
     for howmuch, unit in [(1, "s"), (90, "s"), (2, "m"), (1, "h")]:
@@ -244,24 +244,24 @@ def test_wait_for_units(monkeypatch) -> None:
         })
         monkeypatch.setattr("agentknit.async_toolkit.async_completion_queue.get_nowait",
                             lambda: (_ for _ in ()).throw(_queue.Empty))
-        out = json.loads(t_wait_for(d["tool_exec_id"], howmuch, unit)[0])
+        out = json.loads(t_nohup_wait(d["tool_exec_id"], howmuch, unit)[0])
         monkeypatch.undo()
         assert out["completed"] is True
     monkeypatch.setattr("agentknit.async_toolkit.time.sleep", lambda s: None)   # unused now
     monkeypatch.undo()
 
 
-def test_wait_for_rejects_bad_input() -> None:
+def test_nohup_wait_rejects_bad_input() -> None:
     """Unknown units, non-positive amounts and over-cap waits error out."""
     _drain_queue()
     d = json.loads(t_nohup("sleep 30")[0])
-    assert "unknown unit" in json.loads(t_wait_for(d["tool_exec_id"], 1, "x")[0])["error"]
-    assert "positive" in json.loads(t_wait_for(d["tool_exec_id"], 0, "s")[0])["error"]
-    assert "positive" in json.loads(t_wait_for(d["tool_exec_id"], -5, "m")[0])["error"]
-    cap = json.loads(t_wait_for(d["tool_exec_id"], WAIT_FOR_MAX_SECONDS + 1, "s")[0])["error"]
+    assert "unknown unit" in json.loads(t_nohup_wait(d["tool_exec_id"], 1, "x")[0])["error"]
+    assert "positive" in json.loads(t_nohup_wait(d["tool_exec_id"], 0, "s")[0])["error"]
+    assert "positive" in json.loads(t_nohup_wait(d["tool_exec_id"], -5, "m")[0])["error"]
+    cap = json.loads(t_nohup_wait(d["tool_exec_id"], WAIT_FOR_MAX_SECONDS + 1, "s")[0])["error"]
     assert "exceeds" in cap
-    assert "exceeds" in json.loads(t_wait_for(d["tool_exec_id"], 2, "h")[0])["error"]
-    assert "exceeds" in json.loads(t_wait_for(d["tool_exec_id"], 1, "d")[0])["error"]
+    assert "exceeds" in json.loads(t_nohup_wait(d["tool_exec_id"], 2, "h")[0])["error"]
+    assert "exceeds" in json.loads(t_nohup_wait(d["tool_exec_id"], 1, "d")[0])["error"]
     assert _drain(d["tool_exec_id"], timeout=45).get("returncode") is not None
 
 
@@ -277,7 +277,7 @@ def test_t_query_exec_denies_consecutive_same_id_polls() -> None:
     denied = json.loads(t_query_exec(exec_id)[0])
     assert "denied" in denied["error"]
     assert denied["tool_exec_id"] == exec_id
-    assert "wait_for" in denied["hint"]
+    assert "nohup_wait" in denied["hint"]
     assert "tool_exec_id" in denied["hint"]
 
 

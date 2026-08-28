@@ -108,7 +108,7 @@ from .async_toolkit import (
     enable_nohup,
     nohup_tool_specs,
     t_nohup,
-    t_wait_for,
+    t_nohup_wait,
 )
 
 from .slash_commands import (
@@ -163,5 +163,5 @@ __all__ = [
     "enable_rtk_rewrite",
     # nohup tools (async_toolkit)
     "NOHUP_TIMEOUT_MIN", "WAIT_FOR_MAX_SECONDS", "WAIT_FOR_UNIT_SECONDS",
-    "enable_nohup", "nohup_tool_specs", "t_nohup", "t_wait_for",
+    "enable_nohup", "nohup_tool_specs", "t_nohup", "t_nohup_wait",
 ]

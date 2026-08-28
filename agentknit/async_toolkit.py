@@ -7,14 +7,14 @@ Two layers live here:
   a FIFO) and poll it by ``tool_exec_id``.
 * The model-facing async tool trio — async tools always come with three:
   ``nohup`` (start, bounded by ``timeout(1)``), ``nohup_query`` (poll by
-  ``tool_exec_id``) and ``wait_for`` (block on one ``tool_exec_id`` until it
+  ``tool_exec_id``) and ``nohup_wait`` (block on one ``tool_exec_id`` until it
   finishes or *howmuch* × *unit* elapses, reporting CPU/I/O activity when it
   is still running), each with ready-made JSON tool specs.
   :func:`enable_nohup` wires all three into a spec schema in one call:
 
   >>> from agentknit.async_toolkit import enable_nohup
   >>> schema = agentknit.load_specification(MODEL, ENDPOINT)
-  >>> enable_nohup(schema)          # adds nohup + nohup_query + wait_for
+  >>> enable_nohup(schema)          # adds nohup + nohup_query + nohup_wait
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ class _AsyncCompletion(TypedDict):
 async_completion_queue: "_queue.Queue[_AsyncCompletion]" = _queue.Queue()
 
 # tool_exec_id returned by the last t_query_exec call. A second query for the
-# same still-running execution is denied with a wait_for redirect, so the
+# same still-running execution is denied with a nohup_wait redirect, so the
 # model sleeps instead of busy-polling. Reset whenever a new execution starts.
 _last_queried_exec_id: str | None = None
 
@@ -194,7 +194,7 @@ def _activity_snapshot(entry: _AsyncExecEntry) -> tuple[float, dict[str, int]]:
 def _activity_report(entry: _AsyncExecEntry) -> dict[str, Any]:
     """CPU and I/O consumed by *entry* since the previous call (or since start).
 
-    ``wait_for`` calls this once when it has to report a still-running
+    ``nohup_wait`` calls this once when it has to report a still-running
     execution, so the model can tell an active process from a hung or idle
     one: a flat CPU delta and flat I/O counters mean nothing is happening.
     """
@@ -206,7 +206,7 @@ def _activity_report(entry: _AsyncExecEntry) -> dict[str, Any]:
         "cpu_seconds": round(cpu, 3),
         "cpu_percent": round(100.0 * cpu / elapsed, 1),
         "io_bytes": {k: io[k] - before[k] for k in _IO_FIELDS},
-        "note": "bytes read/written since the last wait_for report of this execution",
+        "note": "bytes read/written since the last nohup_wait report of this execution",
     }
 
 
@@ -363,14 +363,14 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict[str, object]]:
     global _last_queried_exec_id
     if not completed and tool_exec_id == _last_queried_exec_id:
         # Consecutive poll of the same still-running execution: busy-waiting
-        # wastes turns. Deny and redirect to wait_for, which sleeps and
+        # wastes turns. Deny and redirect to nohup_wait, which sleeps and
         # reports this execution as soon as it finishes.
         r = json.dumps({
             "error": (
                 "denied: nohup_query was just called for this tool_exec_id and it "
                 "is still running"
             ),
-            "hint": "Use wait_for(tool_exec_id, howmuch, unit) to wait for it to "
+            "hint": "Use nohup_wait(tool_exec_id, howmuch, unit) to wait for it to "
                     "finish instead of polling nohup_query again.",
             "tool_exec_id": tool_exec_id,
         })
@@ -405,14 +405,14 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict[str, object]]:
     return r, {"result": r}
 
 
-# ── nohup / nohup_query / wait_for ───────────────────────────────────────────────────────
+# ── nohup / nohup_query / nohup_wait ───────────────────────────────────────────────────────
 
 def t_nohup(command: str, timeout: int = NOHUP_TIMEOUT_MIN) -> tuple[str, dict[str, object]]:
     """Bound the command with timeout(1) then hand off to t_execute_async."""
     return t_execute_async(f"timeout {int(timeout) * 60} {command}")
 
 
-# Units understood by t_wait_for.  Wait durations are computed as
+# Units understood by t_nohup_wait.  Wait durations are computed as
 # howmuch * WAIT_FOR_UNIT_SECONDS[unit]; unknown units are rejected.
 WAIT_FOR_UNIT_SECONDS = {
     "s": 1,
@@ -424,12 +424,12 @@ WAIT_FOR_UNIT_SECONDS = {
 WAIT_FOR_MAX_SECONDS = 3600
 
 
-def t_wait_for(tool_exec_id: str, howmuch: int | None = None, unit: str = "s") -> tuple[str, dict[str, object]]:
+def t_nohup_wait(tool_exec_id: str, howmuch: int | None = None, unit: str = "s") -> tuple[str, dict[str, object]]:
     """Wait for the execution *tool_exec_id* to finish, at most *howmuch* × *unit*.
 
     Async tools always come with three: ``nohup`` starts a command in the
     background, ``nohup_query`` polls one by ``tool_exec_id``, and
-    ``wait_for`` sleeps until **this** execution completes (or the optional
+    ``nohup_wait`` sleeps until **this** execution completes (or the optional
     ``howmuch`` × ``unit`` budget expires) instead of busy-polling with
     ``nohup_query``.  Completions queued while waiting (returncode, output
     files, last output lines) are reported inline, so the model gets results
@@ -498,7 +498,7 @@ def t_wait_for(tool_exec_id: str, howmuch: int | None = None, unit: str = "s") -
                                          else time.monotonic() - entry["start"], 3)
         result["activity"] = _activity_report(entry)
         result["hint"] = (
-            "not completed yet; call wait_for again for this tool_exec_id (with a "
+            "not completed yet; call nohup_wait again for this tool_exec_id (with a "
             "fresh howmuch budget), do not poll nohup_query in a tight loop."
         )
     if others:
@@ -518,7 +518,7 @@ def t_wait_for(tool_exec_id: str, howmuch: int | None = None, unit: str = "s") -
 
 
 def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any]]:
-    """JSON tool specs for the nohup / nohup_query / wait_for trio."""
+    """JSON tool specs for the nohup / nohup_query / nohup_wait trio."""
     return [
         {
             "type": "function",
@@ -559,7 +559,7 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                     "returncode and inlines stdout/stderr if both are under "
                     f"{ASYNC_INLINE_MAX_BYTES} bytes; otherwise reports file sizes. "
                     "Polling the same still-running tool_exec_id twice in a row is "
-                    "denied: call wait_for(tool_exec_id, howmuch, unit) to let it "
+                    "denied: call nohup_wait(tool_exec_id, howmuch, unit) to let it "
                     "finish instead."
                 ),
                 "parameters": {
@@ -574,7 +574,7 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
         {
             "type": "function",
             "function": {
-                "name": "wait_for",
+                "name": "nohup_wait",
                 "description": (
                     "Wait for a background command started with nohup to finish, "
                     "instead of busy-polling with nohup_query. Takes a mandatory "
@@ -584,7 +584,7 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                     "stdout/stderr. If the budget (if given) expires first, reports "
                     "completed: false together with the CPU and I/O activity of the "
                     "still-running process, so you can tell progress from a hang; "
-                    "then call wait_for again for the same tool_exec_id. Without "
+                    "then call nohup_wait again for the same tool_exec_id. Without "
                     "howmuch, waits indefinitely until it completes."
                 ),
                 "parameters": {
@@ -620,10 +620,10 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
 
 
 def enable_nohup(schema: dict[str, Any], timeout_min: int = NOHUP_TIMEOUT_MIN) -> dict[str, Any]:
-    """Add the nohup / nohup_query / wait_for tools to *schema* in place.
+    """Add the nohup / nohup_query / nohup_wait tools to *schema* in place.
 
     Appends the tool specs (both ``tool_specs`` and ``inferred_tool_schema``)
-    and wires dispatch to the ``t_nohup`` / ``t_query_exec`` / ``t_wait_for``
+    and wires dispatch to the ``t_nohup`` / ``t_query_exec`` / ``t_nohup_wait``
     functions already registered in TOOL_LIBRARY.  Idempotent: calling it
     twice is a no-op.
 
@@ -639,12 +639,12 @@ def enable_nohup(schema: dict[str, Any], timeout_min: int = NOHUP_TIMEOUT_MIN) -
         schema["tool_specs"] = tool_specs
         schema["inferred_tool_schema"] = tool_specs
         if "tools" in schema:
-            schema["tools"] = list(schema["tools"]) + ["t_nohup", "t_query_exec", "t_wait_for"]
+            schema["tools"] = list(schema["tools"]) + ["t_nohup", "t_query_exec", "t_nohup_wait"]
         else:
             schema.setdefault("tool_dispatch", {})
             schema["tool_dispatch"].update({
                 "nohup":       {"python_function": "t_nohup",      "param_map": {}},
                 "nohup_query": {"python_function": "t_query_exec", "param_map": {}},
-                "wait_for":    {"python_function": "t_wait_for",   "param_map": {}},
+                "nohup_wait":    {"python_function": "t_nohup_wait",   "param_map": {}},
             })
     return schema

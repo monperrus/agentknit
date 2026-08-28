@@ -226,7 +226,7 @@ The framework ships with a built-in set of tools (`read_file`, `write_file`,
 still accepted as an alias. `str_replace` replaces the first occurrence of
 `old_str` by default; pass `replace_all: true` to replace every occurrence.
 
-### Background shell tools (`nohup` / `nohup_query` / `wait_for`)
+### Background shell tools (`nohup` / `nohup_query` / `nohup_wait`)
 
 `agentknit.async_toolkit` provides bounded background execution on top of the
 low-level `t_execute_async` / `t_query_exec` primitives: stdout/stderr are
@@ -239,7 +239,7 @@ import agentknit
 from agentknit.async_toolkit import enable_nohup
 
 schema = agentknit.load_specification(MODEL, ENDPOINT)
-enable_nohup(schema)   # appends nohup + nohup_query + wait_for specs and dispatch entries
+enable_nohup(schema)   # appends nohup + nohup_query + nohup_wait specs and dispatch entries
 ```
 
 It is idempotent and supports both schema shapes (`tools` list or pre-built
@@ -251,9 +251,9 @@ Async tools always come with three:
 |---|---|
 | `nohup` | Start a shell command in the background, bounded by `timeout` minutes (default 10). Returns `tool_exec_id` and the local stdin (FIFO)/stdout/stderr paths. |
 | `nohup_query` | Poll one execution by `tool_exec_id`; inlines stdout/stderr when both fit in 4 KiB, otherwise reports file sizes. |
-| `wait_for` | `wait_for(tool_exec_id, howmuch, unit)` waits for **one** background execution instead of busy-polling; `howmuch` × `unit` (`s`/`m`/`h`/`d`) is an optional budget. Returns as soon as the exec completes (returncode, output paths, last lines of stdout/stderr, inline output when small). If the budget expires first, it reports `completed: false` plus the CPU and I/O activity of the still-running process so you can tell progress from a hang. Execs finishing meanwhile are listed under `also_completed`. |
+| `nohup_wait` | `nohup_wait(tool_exec_id, howmuch, unit)` waits for **one** background execution instead of busy-polling; `howmuch` × `unit` (`s`/`m`/`h`/`d`) is an optional budget. Returns as soon as the exec completes (returncode, output paths, last lines of stdout/stderr, inline output when small). If the budget expires first, it reports `completed: false` plus the CPU and I/O activity of the still-running process so you can tell progress from a hang. Execs finishing meanwhile are listed under `also_completed`. |
 
-`wait_for` is the tool to call right after `nohup`: it blocks until the given
+`nohup_wait` is the tool to call right after `nohup`: it blocks until the given
 `tool_exec_id` finishes (or the optional `howmuch` budget expires) and returns
 the result, so short commands need no `nohup_query` round trip. Waits are
 capped at `WAIT_FOR_MAX_SECONDS` (3600) per call; split longer waits into
@@ -261,7 +261,7 @@ several calls.
 
 Busy-polling is also discouraged at the source: two consecutive `nohup_query`
 calls for the same still-running `tool_exec_id` are **denied**, with the
-response pointing at `wait_for(tool_exec_id, howmuch, unit)` instead. The
+response pointing at `nohup_wait(tool_exec_id, howmuch, unit)` instead. The
 denial lifts as
 soon as anything else happens — another exec is polled, a new command is
 started, or the execution completes.

@@ -200,12 +200,10 @@ _COMPACTION_PROMPT = (
     "- Failed hypotheses or dead ends already explored\n"
     "- Unresolved issues or blockers\n"
     "- The immediate next step if one was identified\n\n"
-    "Avoid:\n"
-    "- Conversational filler or chatter\n"
-    "- Repeated log output (summarize outcomes, don't quote logs verbatim)\n"
-    "- Redundant observations\n"
-    "- Rewriting uncertainty as certainty\n\n"
-    "Format the summary as plain text with clear sections. Be concise but complete."
+    "Style:\n"
+    "- Plain text with clear sections. Be concise but complete.\n"
+    "- Summarize outcomes; quote logs only where the exact bytes matter.\n"
+    "- Report each fact once. Keep uncertainty expressed as uncertainty.\n"
 )
 
 BOLD = "\033[1m"
@@ -1040,10 +1038,11 @@ def inline_system_prompt(tools: list[dict[str, Any]]) -> str:
         arg_obj = {k: f"<{k}>" for k in schema_props(tool)}
         examples.append(json.dumps({"name": name, "arguments": arg_obj}))
     return (
-        "To call a tool respond with ONLY a JSON object (no prose, no markdown fence):\n"
+        "Tool calls are made by responding with a single JSON object on its "
+        "own line:\n"
         + "\n".join(examples) + "\n\n"
         "After each call you will receive the result. When the task is done, "
-        "respond with a plain-text summary (no JSON).\n"
+        "respond with a plain-text summary.\n"
     )
 
 
@@ -1900,8 +1899,8 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                     "content": (
                         "SYSTEM RECOVERY NOTE: These tool calls completed just "
                         "before the crash but their results were never shown "
-                        "to you. Do NOT re-run them; treat these results as "
-                        f"observed:\n{results}"
+                        "to you; treat these results as observed:\n"
+                        f"{results}"
                     ),
                     "ts": datetime.datetime.now().isoformat(timespec="seconds"),
                 })

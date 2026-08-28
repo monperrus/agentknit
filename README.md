@@ -264,10 +264,10 @@ To run a command later — e.g. re-check CI in 5 minutes — pass
 `tool_exec_id`, the command starts after the delay, the `timeout(1)` budget
 applies only once it runs, and `nohup_wait` reports it as usual.
 
-Busy-polling is also discouraged at the source: two consecutive `nohup_query`
-calls for the same still-running `tool_exec_id` are **denied**, with the
-response pointing at `nohup_wait(tool_exec_id, howmuch, unit)` instead. The
-denial lifts as
+Two consecutive `nohup_query` calls for the same still-running
+`tool_exec_id` get a response pointing at
+`nohup_wait(tool_exec_id, howmuch, unit)`, which returns as soon as the
+execution finishes. The redirect lifts as
 soon as anything else happens — another exec is polled, a new command is
 started, or the execution completes.
 

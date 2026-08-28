@@ -148,7 +148,7 @@ def test_resume_recovers_journal_state_over_stale_snapshot(tmp_path, monkeypatch
     assert "deploy" in contents
     # The tool ran and finished — its result is re-injected, never re-run.
     notes = [c for c in contents if c and "RECOVERY NOTE" in c]
-    assert any("deploy ok" in n and "NOT re-run" in n for n in notes)
+    assert any("deploy ok" in n and "as observed" in n for n in notes)
 
 
 def test_resume_flags_pending_tool_calls(tmp_path, monkeypatch):

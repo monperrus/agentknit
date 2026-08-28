@@ -85,7 +85,7 @@ class _AsyncCompletion(TypedDict):
 async_completion_queue: "_queue.Queue[_AsyncCompletion]" = _queue.Queue()
 
 # tool_exec_id returned by the last t_query_exec call. A second query for the
-# same still-running execution is denied with a nohup_wait redirect, so the
+# same still-running execution is answered with a nohup_wait redirect, so the
 # model sleeps instead of busy-polling. Reset whenever a new execution starts.
 _last_queried_exec_id: str | None = None
 
@@ -436,15 +436,16 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict[str, object]]:
     global _last_queried_exec_id
     if not completed and tool_exec_id == _last_queried_exec_id:
         # Consecutive poll of the same still-running execution: busy-waiting
-        # wastes turns. Deny and redirect to nohup_wait, which sleeps and
-        # reports this execution as soon as it finishes.
+        # wastes turns. Answer with the still-running state and point at
+        # nohup_wait, which sleeps and reports this execution as soon as it
+        # finishes.
         r = json.dumps({
             "error": (
-                "denied: nohup_query was just called for this tool_exec_id and it "
-                "is still running"
+                "nohup_query was just called for this tool_exec_id and it is "
+                "still running"
             ),
-            "hint": "Use nohup_wait(tool_exec_id, howmuch, unit) to wait for it to "
-                    "finish instead of polling nohup_query again.",
+            "hint": "nohup_wait(tool_exec_id, howmuch, unit) returns as soon as "
+                    "it finishes.",
             "tool_exec_id": tool_exec_id,
         })
         return r, {"result": r}
@@ -589,8 +590,8 @@ def t_nohup_wait(tool_exec_id: str, howmuch: int | None = None, unit: str = "s")
                                          else time.monotonic() - entry["start"], 3)
         result["activity"] = _activity_report(entry)
         result["hint"] = (
-            "not completed yet; call nohup_wait again for this tool_exec_id (with a "
-            "fresh howmuch budget), do not poll nohup_query in a tight loop."
+            "not completed yet; call nohup_wait again for this tool_exec_id "
+            "with a fresh howmuch budget."
         )
     if others:
         result["also_completed"] = [
@@ -662,9 +663,8 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                     "Poll a command started with nohup. When completed, includes "
                     "returncode and inlines stdout/stderr if both are under "
                     f"{ASYNC_INLINE_MAX_BYTES} bytes; otherwise reports file sizes. "
-                    "Polling the same still-running tool_exec_id twice in a row is "
-                    "denied: call nohup_wait(tool_exec_id, howmuch, unit) to let it "
-                    "finish instead."
+                    "While a command is still running, nohup_wait(tool_exec_id, "
+                    "howmuch, unit) is the efficient way to let it finish."
                 ),
                 "parameters": {
                     "type": "object",
@@ -680,8 +680,8 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
             "function": {
                 "name": "nohup_wait",
                 "description": (
-                    "Wait for a background command started with nohup to finish, "
-                    "instead of busy-polling with nohup_query. Takes a mandatory "
+                    "Wait for a background command started with nohup to finish. "
+                    "Takes a mandatory "
                     "tool_exec_id and an optional howmuch × unit wait budget. "
                     "Returns as soon as that execution completes, reporting "
                     "returncode, output file paths and the last lines of "

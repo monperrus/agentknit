@@ -318,16 +318,16 @@ def test_nohup_wait_rejects_bad_input() -> None:
 
 
 def test_t_query_exec_denies_consecutive_same_id_polls() -> None:
-    """A second poll of the same still-running exec is denied with a redirect."""
+    """A second poll of the same still-running exec gets a nohup_wait redirect."""
     result, _ = t_nohup("sleep 3")
     exec_id = json.loads(result)["tool_exec_id"]
     first = json.loads(t_query_exec(exec_id)[0])
     assert first["completed"] is False
-    denied = json.loads(t_query_exec(exec_id)[0])
-    assert "denied" in denied["error"]
-    assert denied["tool_exec_id"] == exec_id
-    assert "nohup_wait" in denied["hint"]
-    assert "tool_exec_id" in denied["hint"]
+    redirected = json.loads(t_query_exec(exec_id)[0])
+    assert "still running" in redirected["error"]
+    assert redirected["tool_exec_id"] == exec_id
+    assert "nohup_wait" in redirected["hint"]
+    assert "tool_exec_id" in redirected["hint"]
 
 
 def test_t_query_exec_denial_lifted_after_completion() -> None:

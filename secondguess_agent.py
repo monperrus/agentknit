@@ -106,15 +106,14 @@ _TOOLS = [
     Tool(
         "exec_shell",
         (
-            f"Start a shell command asynchronously with a {GRACE_PERIOD_SECONDS}s "
-            f"grace period. Returns tool_exec_id and local file paths for stdin "
+            f"Start a shell command asynchronously. It starts after a "
+            f"{GRACE_PERIOD_SECONDS}s grace period, during which you can cancel by "
+            f"pressing Ctrl-C (or having a supervisor call cancel_next_exec()). "
+            f"Returns tool_exec_id and local file paths for stdin "
             f"(FIFO), stdout, and stderr. Write to stdin_localfile to send input "
             f"to the running process. If the command finishes within "
             f"{int(ASYNC_FAST_THRESHOLD_S * 1000)} ms and both outputs are under "
             f"{ASYNC_INLINE_MAX_BYTES} bytes, stdout/stderr are inlined immediately. "
-            f"**IMPORTANT**: The command does NOT start immediately. There is a "
-            f"{GRACE_PERIOD_SECONDS}s grace period during which you can cancel by "
-            f"pressing Ctrl-C (or having a supervisor call cancel_next_exec()). "
             f"Use query_tool_exec to poll status. When a background command "
             f"finishes the agent is notified automatically."
         ),

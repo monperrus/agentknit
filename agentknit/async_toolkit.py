@@ -327,6 +327,7 @@ def t_execute_async(command: str, when: int = 0) -> tuple[str, dict[str, object]
 
     result: dict[str, object] = {
         "tool_exec_id": exec_id,
+        "pid":              proc.pid,
         "started_at":       started_at,
         "cwd":              cwd,
         "stdin_localfile":  stdin_path,
@@ -526,11 +527,11 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                 "name": "nohup",
                 "description": (
                     "Start a shell command asynchronously, like nohup(1). Returns "
-                    "tool_exec_id and local file paths for stdin (FIFO), stdout, "
-                    "and stderr. Write to stdin_localfile to send input to the "
-                    "running process. Execution is bounded: the command is killed "
-                    f"after `timeout` minutes (default {timeout_min}). If "
-                    f"the command finishes within {int(ASYNC_FAST_THRESHOLD_S * 1000)} ms "
+                    "tool_exec_id, the process id (pid), and local file paths for "
+                    "stdin (FIFO), stdout, and stderr. Write to stdin_localfile "
+                    "to send input to the running process. Execution is bounded: "
+                    f"the command is killed after `timeout` minutes (default {timeout_min}). "
+                    f"If the command finishes within {int(ASYNC_FAST_THRESHOLD_S * 1000)} ms "
                     f"and both outputs are under {ASYNC_INLINE_MAX_BYTES} bytes, "
                     "stdout/stderr are inlined immediately."
                 ),

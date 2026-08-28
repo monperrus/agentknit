@@ -44,6 +44,7 @@ def test_t_nohup_runs_and_reports_output() -> None:
     """t_nohup executes the command and query returns stdout + returncode."""
     result, _ = t_nohup("echo async-toolkit-test")
     d = json.loads(result)
+    assert isinstance(d["pid"], int)
     final = _drain(d["tool_exec_id"])
     assert final["returncode"] == 0
     assert final["stdout"].strip() == "async-toolkit-test"

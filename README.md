@@ -515,6 +515,16 @@ resume against a different provider. The recorded key source
 key sources the resumed session never used are dropped. When the resolved
 endpoint differs from the requested one, a one-line notice is printed.
 
+### Resuming with another provider/model
+
+`agentknit <other-model> --session <id>` deliberately switches provider. The
+session file is **copied** into the new model's directory and re-stamped —
+`metadata.model` / `endpoint` / `auth` describe the new provider, and the old
+one is kept in `metadata.ported_from` — so the transcript continues on the
+endpoint/key of the model you named, and a later resume of that session binds
+to the new provider. The original file is left untouched as the record of
+where the history came from.
+
 ## rtk Integration (optional token savings)
 
 [rtk](https://github.com/rtk-ai/rtk) is a CLI proxy that rewrites shell

@@ -1395,14 +1395,12 @@ def _find_snapshot_in_other_models(
 
 
 def _load_snapshot_metadata(model: str, session_id: str) -> "dict[str, Any] | None":
-    """Return the metadata describing the endpoint a session ran on.
+    """Return the metadata describing the endpoint *model*'s session ran on.
 
     Two sources are combined:
 
-    * the snapshot's ``metadata`` block (own model directory first, then any
-      other model directory — the cross-model resume path — preferring the
-      most recently written trajectory on collision); legacy snapshots
-      without the wrapper contribute only what they have;
+    * the snapshot's ``metadata`` block in *model*'s own directory (legacy
+      snapshots without the wrapper contribute only what they have);
     * the session logs (``<date>/<HHMMSS>_<id>.jsonl``): the endpoint of the
       **earliest** ``session_start`` record.  Snapshots are rewritten at
       every turn boundary, so a buggy resume that ran the transcript against
@@ -1410,17 +1408,13 @@ def _load_snapshot_metadata(model: str, session_id: str) -> "dict[str, Any] | No
       logs are append-only and keep the endpoint the session was actually
       created on.  The log wins whenever the two disagree.
 
-    Returns ``None`` when neither source knows anything about the session.
+    A snapshot found under a *different* model directory is deliberately not
+    consulted: that is the cross-model resume path, where the caller has
+    chosen a new provider (see :func:`_port_snapshot_to_model`).  Returns
+    ``None`` when neither source knows anything about the session.
     """
     meta: "dict[str, Any] | None" = None
     path = _snapshot_path(model, session_id)
-    if not path.exists() and LOG_BASE.exists():
-        matches = [
-            p for p in LOG_BASE.glob(f"*/{session_id}_messages.json")
-            if p.parent.name != safe_model_name(model) and p.is_file()
-        ]
-        if matches:
-            path = max(matches, key=lambda p: p.stat().st_mtime)
     if path.exists():
         try:
             with path.open() as f:
@@ -1477,6 +1471,11 @@ def _bind_schema_to_resumed_session(
     useful error.  The snapshot's recorded ``endpoint`` and ``auth``
     configuration therefore win over whatever the CLI default or wrapper
     resolved.  Returns a copy; the caller's schema is never mutated.
+
+    No-op when the model has no session of its own for *session_id*: that is
+    a deliberate provider switch (cross-model resume, handled by
+    :func:`_port_snapshot_to_model` re-stamping the copied snapshot), where
+    the caller's endpoint and key source are the whole point.
     """
     meta = _load_snapshot_metadata(schema.get("model", "unknown"), session_id)
     if not meta:
@@ -1504,6 +1503,69 @@ def _bind_schema_to_resumed_session(
         print(f"{YEL}Resuming session {session_id} on its original "
               f"endpoint {endpoint!r} ({'; '.join(changes)}){RESET}")
     return bound
+
+
+def _port_snapshot_to_model(
+    schema: "dict[str, Any]", session_id: str,
+) -> "Path | None":
+    """Copy a session's snapshot into the new model's directory, re-stamped.
+
+    Cross-model resume (``agentknit <new-model> --session <id>``) must not
+    drag the old provider along: tool-call IDs, prefix-cache keys and the
+    funding key are provider-specific.  Instead of replaying another
+    provider's transcript in place, the snapshot file is **copied** under
+    the new model with ``metadata.model`` / ``endpoint`` / ``auth``
+    re-stamped from *schema* — the new session file records the new
+    provider, so a later resume of it binds to that provider, not the old
+    one.  The origin is kept in ``metadata.ported_from`` for traceability
+    and the original file is left untouched.
+
+    Idempotent: an existing snapshot for *session_id* under the new model
+    wins and nothing is copied.  Returns the (new or pre-existing) snapshot
+    path, or ``None`` when no snapshot exists under any other model.
+    """
+    model = schema.get("model", "unknown")
+    dest = _snapshot_path(model, session_id)
+    if dest.exists():
+        return dest
+    if not LOG_BASE.exists():
+        return None
+    matches = [
+        p for p in LOG_BASE.glob(f"*/{session_id}_messages.json")
+        if p.parent.name != safe_model_name(model) and p.is_file()
+    ]
+    if not matches:
+        return None
+    src = max(matches, key=lambda p: p.stat().st_mtime)
+    try:
+        with src.open() as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not (isinstance(data, dict) and isinstance(data.get("messages"), list)):
+        return None
+    src_meta: "dict[str, Any]" = (
+        data["metadata"] if isinstance(data.get("metadata"), dict) else {})
+    auth = {k: schema[k] for k in
+            ("auth", "keyring_service", "keyring_username", "key_env")
+            if schema.get(k) is not None}
+    data["metadata"] = {
+        "model":        model,
+        "endpoint":     schema.get("endpoint", ""),
+        "session_id":   session_id,
+        "ported_from":  {"model": src_meta.get("model"),
+                         "endpoint": src_meta.get("endpoint")},
+        **{k: v for k, v in src_meta.items()
+           if k in ("default_tools", "tools", "agentknit_commit")},
+        "auth":         auth,
+    }
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"{YEL}Ported session {session_id} from {src.parent.name} to "
+          f"{safe_model_name(model)}; continuing on "
+          f"{schema.get('endpoint') or 'the new endpoint'}{RESET}")
+    return dest
 
 
 # ── agent loop ────────────────────────────────────────────────────────────────
@@ -1748,7 +1810,11 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     # A resumed session must run (and re-save its snapshot) on the endpoint
     # it was created on — bind here so every caller is covered, including
     # ones that build their own client and call init_session directly.
+    # A cross-model resume ports the snapshot first: the copy under the new
+    # model makes the provider switch explicit and keeps the original file
+    # as the record of where the history came from.
     if resumed_from:
+        _port_snapshot_to_model(schema, resumed_from)
         schema = _bind_schema_to_resumed_session(schema, resumed_from)
     schema = _normalize_schema(schema)
     tools         = schema.get("inferred_tool_schema") or []

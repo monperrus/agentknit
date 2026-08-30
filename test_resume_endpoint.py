@@ -18,7 +18,11 @@ from agentknit import (
     run_task,
     safe_model_name,
 )
-from agentknit._core import _bind_schema_to_resumed_session, _load_snapshot_metadata
+from agentknit._core import (
+    _bind_schema_to_resumed_session,
+    _load_snapshot_metadata,
+    _port_snapshot_to_model,
+)
 
 Z_AI = "https://api.z.ai/api/coding/paas/v4"
 
@@ -51,12 +55,12 @@ def test_load_snapshot_metadata_prefers_own_model_dir(monkeypatch, tmp_path):
     assert _load_snapshot_metadata("test/model", "s1")["endpoint"] == "https://a.test/v1"
 
 
-def test_load_snapshot_metadata_falls_back_to_other_models(monkeypatch, tmp_path):
+def test_load_snapshot_metadata_ignores_other_models(monkeypatch, tmp_path):
+    """A snapshot under another model is a provider switch, not this model's
+    history — its endpoint must not leak into the binding."""
     monkeypatch.setattr(core, "LOG_BASE", tmp_path)
     _write_snapshot(tmp_path, "other/model", "s1", endpoint=Z_AI)
-    meta = _load_snapshot_metadata("test/model", "s1")
-    assert meta is not None
-    assert meta["endpoint"] == Z_AI
+    assert _load_snapshot_metadata("test/model", "s1") is None
 
 
 def test_load_snapshot_metadata_absent(monkeypatch, tmp_path):
@@ -100,6 +104,92 @@ def test_metadata_without_logs_keeps_snapshot_endpoint(monkeypatch, tmp_path):
     meta = _load_snapshot_metadata("test/model", "s1")
     assert meta is not None
     assert meta["endpoint"] == Z_AI
+
+
+# ── _port_snapshot_to_model ──────────────────────────────────────────────────
+
+def test_port_copies_snapshot_and_restamps_model(monkeypatch, tmp_path, capsys):
+    """Cross-model resume copies the file; the original stays untouched."""
+    monkeypatch.setattr(core, "LOG_BASE", tmp_path)
+    _write_snapshot(tmp_path, "glm-5.3", "s1", endpoint=Z_AI)
+    path = _port_snapshot_to_model(
+        {"model": "qwen/qwen3.7-max", "endpoint": "https://opencode.ai/zen/v1"}, "s1")
+    assert path is not None and path.exists()
+    data = json.loads(path.read_text())
+    assert data["metadata"]["model"] == "qwen/qwen3.7-max"
+    assert data["metadata"]["session_id"] == "s1"
+    assert data["metadata"]["endpoint"] == "https://opencode.ai/zen/v1"
+    assert data["metadata"]["ported_from"] == {"model": "glm-5.3", "endpoint": Z_AI}
+    assert len(data["messages"]) == 1
+    # Original file untouched.
+    orig = json.loads((tmp_path / safe_model_name("glm-5.3")
+                       / "s1_messages.json").read_text())
+    assert orig["metadata"]["model"] == "glm-5.3"
+    assert orig["metadata"]["endpoint"] == Z_AI
+    assert "Ported session s1 from" in capsys.readouterr().out
+
+
+def test_port_is_idempotent(monkeypatch, tmp_path):
+    """An existing snapshot under the target model wins; nothing is copied."""
+    monkeypatch.setattr(core, "LOG_BASE", tmp_path)
+    _write_snapshot(tmp_path, "test/model", "s1", endpoint="https://mine.test/v1")
+    _write_snapshot(tmp_path, "other/model", "s1", endpoint=Z_AI)
+    path = _port_snapshot_to_model({"model": "test/model"}, "s1")
+    data = json.loads(path.read_text())
+    assert data["metadata"]["endpoint"] == "https://mine.test/v1"
+
+
+def test_port_without_snapshot_returns_none(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "LOG_BASE", tmp_path)
+    assert _port_snapshot_to_model({"model": "test/model"}, "nope") is None
+
+
+def test_port_skips_legacy_array_snapshots(monkeypatch, tmp_path):
+    """A legacy snapshot without a messages wrapper is not portable."""
+    monkeypatch.setattr(core, "LOG_BASE", tmp_path)
+    d = tmp_path / safe_model_name("other/model")
+    d.mkdir(parents=True)
+    (d / "s1_messages.json").write_text(json.dumps([{"role": "user", "content": "x"}]))
+    assert _port_snapshot_to_model({"model": "test/model"}, "s1") is None
+
+
+def test_ported_session_binds_to_new_model_not_old_endpoint(monkeypatch, tmp_path, capsys):
+    """End to end: cross-model resume ports the snapshot, keeps the caller's
+    endpoint (the new provider) and re-saves the ported session under it."""
+    from agentknit import init_session, _save_messages_snapshot
+    monkeypatch.setattr(core, "LOG_BASE", tmp_path)
+    _write_snapshot(tmp_path, "glm-5.3", "s2", endpoint=Z_AI)
+    new_endpoint = "https://opencode.ai/zen/v1"
+    schema = load_specification("qwen/qwen3.7-max", new_endpoint)
+    session = init_session(schema, resumed_from="s2")
+    # The new provider is used — no binding back to z.ai…
+    assert session["endpoint"] == new_endpoint
+    # …and the ported history was loaded.
+    assert any(m.get("content") == "hi" for m in session["messages"])
+    # The first snapshot the ported session saves records the new endpoint.
+    _save_messages_snapshot(session)
+    saved = json.loads((tmp_path / safe_model_name("qwen/qwen3.7-max")
+                        / "s2_messages.json").read_text())
+    assert saved["metadata"]["endpoint"] == new_endpoint
+    # The original file is still the z.ai record.
+    orig = json.loads((tmp_path / safe_model_name("glm-5.3")
+                       / "s2_messages.json").read_text())
+    assert orig["metadata"]["endpoint"] == Z_AI
+    assert "Ported session s2 from" in capsys.readouterr().out
+
+
+def test_same_model_resume_still_binds_to_origin(monkeypatch, tmp_path):
+    """Same-model resume (the 402 bug) is unaffected by the porting path."""
+    from agentknit import init_session
+    monkeypatch.setattr(core, "LOG_BASE", tmp_path)
+    _write_snapshot(tmp_path, "glm-5.3", "s3", endpoint=Z_AI)
+    day = tmp_path / "glm-5.3" / "2026-08-30"
+    day.mkdir(parents=True)
+    (day / "071859_s3.jsonl").write_text(json.dumps({
+        "type": "session_start", "endpoint": Z_AI, "session_id": "s3"}) + "\n")
+    session = init_session(load_specification("glm-5.3", DEFAULT_ENDPOINT),
+                           resumed_from="s3")
+    assert session["endpoint"] == Z_AI
 
 
 # ── _bind_schema_to_resumed_session ──────────────────────────────────────────

@@ -55,6 +55,8 @@ from ._core import (
     _save_messages_snapshot,
     _load_messages_snapshot,
     _find_snapshot_in_other_models,
+    _load_snapshot_metadata,
+    _bind_schema_to_resumed_session,
     _handle_tool_call,
     _complete,
     compact_session,
@@ -140,7 +142,8 @@ __all__ = [
     "DEFAULT_COMPACTION_KEEP_LAST_TURNS",
     "_parse_run_uri", "_expand_aliases", "_open_log",
     "_save_messages_snapshot", "_load_messages_snapshot",
-    "_find_snapshot_in_other_models", "_handle_tool_call", "_complete",
+    "_find_snapshot_in_other_models", "_load_snapshot_metadata",
+    "_bind_schema_to_resumed_session", "_handle_tool_call", "_complete",
     "compact_session", "_compact_session", "_maybe_compact",
     "_journal_path",
     # durable recovery

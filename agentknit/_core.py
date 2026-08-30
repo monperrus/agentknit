@@ -1394,6 +1394,118 @@ def _find_snapshot_in_other_models(
     return _normalise_for_resume(msgs, flatten=flatten), best.parent.name
 
 
+def _load_snapshot_metadata(model: str, session_id: str) -> "dict[str, Any] | None":
+    """Return the metadata describing the endpoint a session ran on.
+
+    Two sources are combined:
+
+    * the snapshot's ``metadata`` block (own model directory first, then any
+      other model directory — the cross-model resume path — preferring the
+      most recently written trajectory on collision); legacy snapshots
+      without the wrapper contribute only what they have;
+    * the session logs (``<date>/<HHMMSS>_<id>.jsonl``): the endpoint of the
+      **earliest** ``session_start`` record.  Snapshots are rewritten at
+      every turn boundary, so a buggy resume that ran the transcript against
+      the wrong provider overwrites the snapshot with *that* endpoint; the
+      logs are append-only and keep the endpoint the session was actually
+      created on.  The log wins whenever the two disagree.
+
+    Returns ``None`` when neither source knows anything about the session.
+    """
+    meta: "dict[str, Any] | None" = None
+    path = _snapshot_path(model, session_id)
+    if not path.exists() and LOG_BASE.exists():
+        matches = [
+            p for p in LOG_BASE.glob(f"*/{session_id}_messages.json")
+            if p.parent.name != safe_model_name(model) and p.is_file()
+        ]
+        if matches:
+            path = max(matches, key=lambda p: p.stat().st_mtime)
+    if path.exists():
+        try:
+            with path.open() as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("metadata"), dict):
+            meta = data["metadata"]
+
+    origin = _session_origin_endpoint(model, session_id)
+    if origin is not None:
+        combined = dict(meta or {})
+        combined["endpoint"] = origin
+        return combined
+    return meta
+
+
+def _session_origin_endpoint(model: str, session_id: str) -> "str | None":
+    """Return the endpoint the session was created on, from its logs.
+
+    Scans every dated log file for *session_id* and returns the endpoint of
+    the earliest ``session_start`` record (files sort chronologically:
+    ``<YYYY-MM-DD>/<HHMMSS>_<id>.jsonl``).  ``None`` when no log survives.
+    """
+    model_dir = LOG_BASE / safe_model_name(model)
+    if not model_dir.is_dir():
+        return None
+    starts: list[tuple[str, str]] = []
+    for day in model_dir.iterdir():
+        if not day.is_dir() or not day.name[:4].isdigit():
+            continue
+        for log in day.glob(f"*_{session_id}.jsonl"):
+            try:
+                with log.open() as f:
+                    for line in f:
+                        rec = json.loads(line)
+                        if rec.get("type") == "session_start" and rec.get("endpoint"):
+                            starts.append((f"{day.name}/{log.name}", rec["endpoint"]))
+                        break  # session_start is always the first record
+            except (OSError, json.JSONDecodeError):
+                continue
+    return min(starts)[1] if starts else None
+
+
+def _bind_schema_to_resumed_session(
+    schema: "dict[str, Any]", session_id: str,
+) -> "dict[str, Any]":
+    """Pin a schema to the endpoint and key source a session was run on.
+
+    Resume must continue on the endpoint that produced the history: tool-call
+    IDs, prefix-cache keys and model behaviour are provider-specific, and the
+    key that funded the session lives with that provider — replaying a
+    z.ai transcript against OpenRouter fails with a bogus 402 rather than a
+    useful error.  The snapshot's recorded ``endpoint`` and ``auth``
+    configuration therefore win over whatever the CLI default or wrapper
+    resolved.  Returns a copy; the caller's schema is never mutated.
+    """
+    meta = _load_snapshot_metadata(schema.get("model", "unknown"), session_id)
+    if not meta:
+        return schema
+    bound = dict(schema)
+    changes: list[str] = []
+    endpoint = str(meta.get("endpoint") or "")
+    if endpoint and endpoint != (bound.get("endpoint") or ""):
+        changes.append(f"endpoint {bound.get('endpoint') or '∅'!r} → {endpoint!r}")
+        bound["endpoint"] = endpoint
+    auth = meta.get("auth")
+    if isinstance(auth, dict) and auth:
+        # Key sources the resumed session never used are dropped, not merged:
+        # resolution order (keyring → key_env → OPENROUTER_API_KEY) would
+        # otherwise resurrect a key for the wrong provider.
+        for key in ("auth", "keyring_service", "keyring_username", "key_env"):
+            if key in auth:
+                if bound.get(key) != auth[key]:
+                    changes.append(f"{key} → {auth[key]!r}")
+                bound[key] = auth[key]
+            elif bound.get(key) is not None:
+                changes.append(f"{key} dropped")
+                del bound[key]
+    if changes:
+        print(f"{YEL}Resuming session {session_id} on its original "
+              f"endpoint {endpoint!r} ({'; '.join(changes)}){RESET}")
+    return bound
+
+
 # ── agent loop ────────────────────────────────────────────────────────────────
 
 def _tool_call_history_item(tc: Any) -> "dict[str, Any]":
@@ -3099,6 +3211,8 @@ def run_task(
     :func:`create_client` would build from the schema.  The schema is still
     validated and used for tools, prompts and session state.
     """
+    if session_id is not None:
+        schema = _bind_schema_to_resumed_session(schema, session_id)
     validate_schema(schema)
     client = client or create_client(schema)
     session = init_session(
@@ -3323,6 +3437,8 @@ def _repl_setup(
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
 ) -> tuple[Any, ...]:
     """Common REPL setup: validate, create client, init session, return (client, session, model, hist_file)."""
+    if session_id is not None:
+        schema = _bind_schema_to_resumed_session(schema, session_id)
     validate_schema(schema)
     client = client or create_client(schema)
     session = init_session(
@@ -3681,6 +3797,10 @@ def main() -> None:
     args   = parse_args()
     try:
         schema = load_specification(args.model, args.endpoint, spec_path=args.spec_path)
+        if args.session:
+            # A resumed session must continue on the endpoint it was run on,
+            # not on whatever --endpoint / the OpenRouter default resolves to.
+            schema = _bind_schema_to_resumed_session(schema, args.session)
         validate_schema(schema)
         check_and_display_pricing(schema)
     except AgentSpecDisabledError as e:

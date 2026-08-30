@@ -503,6 +503,18 @@ result = run_task(schema, task, durable=False)
 A `journal_recovered` event is emitted whenever a resume rebuilt state from
 the journal.
 
+## Resuming sessions
+
+A session is resumed with ``--session <id>`` (CLI) or ``session_id=`` (SDK).
+Resume always continues on the endpoint the session was **created** on, not on
+whatever the current `--endpoint` / CLI default resolves to: the endpoint is
+recovered from the session's append-only logs (the earliest `session_start`
+record), which also protects against a snapshot overwritten by an earlier
+resume against a different provider. The recorded key source
+(`keyring_service`+`keyring_username` or `key_env`) is restored with it, and
+key sources the resumed session never used are dropped. When the resolved
+endpoint differs from the requested one, a one-line notice is printed.
+
 ## rtk Integration (optional token savings)
 
 [rtk](https://github.com/rtk-ai/rtk) is a CLI proxy that rewrites shell

@@ -170,6 +170,26 @@ class _RecordingClient:
         return self._response
 
 
+def test_init_session_binds_resumed_schema(monkeypatch, tmp_path, capsys):
+    """The binding must also cover callers that use init_session directly
+    (e.g. the TUI) — otherwise their next snapshot rewrites the endpoint."""
+    from agentknit import init_session, _save_messages_snapshot
+    monkeypatch.setattr(core, "LOG_BASE", tmp_path)
+    day = tmp_path / "glm-5.3" / "2026-08-30"
+    day.mkdir(parents=True)
+    (day / "071859_s1.jsonl").write_text(json.dumps({
+        "type": "session_start", "endpoint": Z_AI, "session_id": "s1"}) + "\n")
+    session = init_session(
+        load_specification("glm-5.3", DEFAULT_ENDPOINT), resumed_from="s1")
+    assert session["endpoint"] == Z_AI
+    # And the snapshot the resumed session writes records that endpoint.
+    session["messages"].append({"role": "user", "content": "hi"})
+    _save_messages_snapshot(session)
+    saved = json.loads(
+        (tmp_path / safe_model_name("glm-5.3") / "s1_messages.json").read_text())
+    assert saved["metadata"]["endpoint"] == Z_AI
+
+
 def test_run_task_resumes_on_recorded_endpoint(monkeypatch, tmp_path):
     from agentknit.openai_compat import _SubprocessCompletions
 

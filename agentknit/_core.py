@@ -1745,6 +1745,11 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     outcome is unknown are flagged for verification.  Set to ``False`` to
     fall back to turn-boundary snapshots only.
     """
+    # A resumed session must run (and re-save its snapshot) on the endpoint
+    # it was created on — bind here so every caller is covered, including
+    # ones that build their own client and call init_session directly.
+    if resumed_from:
+        schema = _bind_schema_to_resumed_session(schema, resumed_from)
     schema = _normalize_schema(schema)
     tools         = schema.get("inferred_tool_schema") or []
     behaviour     = schema.get("behaviour") or {}

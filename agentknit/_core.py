@@ -1591,6 +1591,8 @@ def _expand_aliases(
     tools: list[dict[str, Any]],
     tool_dispatch: dict[str, Any],
     aliases: dict[str, str],
+    *,
+    advertise: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Expand alias → canonical mappings into the tool schema and dispatch table.
 
@@ -1598,9 +1600,15 @@ def _expand_aliases(
 
     * If the alias already has its own ``tool_dispatch`` entry it is left alone.
     * Otherwise the canonical dispatch entry is copied under the alias name.
-    * If the canonical tool appears in ``tools`` (structured schema) and the
-      alias does not, a deep-copy of the canonical tool spec is appended under
-      the alias name so the model is aware of it in structured mode.
+    * If ``advertise`` and the canonical tool appears in ``tools`` (structured
+      schema) and the alias does not, a deep-copy of the canonical tool spec is
+      appended under the alias name so the model is aware of it too.
+
+    ``advertise=False`` makes the alias dispatch-only: the retired name still
+    works if a model or a restored session emits it, but it is not offered to
+    the model as a second tool.  Advertising a retired name alongside its
+    successor would show the model two identical tools (see
+    ``_LEGACY_TOOL_ALIASES``).
 
     Both ``tools`` and ``tool_dispatch`` are copied; originals are not mutated.
     """
@@ -1629,7 +1637,7 @@ def _expand_aliases(
                 continue
 
         # Tool schema (structured mode): clone canonical spec under alias name
-        if canonical_name in schema_by_name and alias_name not in schema_by_name:
+        if advertise and canonical_name in schema_by_name and alias_name not in schema_by_name:
             alias_tool = copy.deepcopy(schema_by_name[canonical_name])
             # Custom tools carry their name at the top level; function tools
             # nest it under "function".
@@ -1825,12 +1833,19 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
 
     # Expand aliases before any filtering so aliased tools are treated like
     # first-class tools everywhere (non-interactive filtering, inline prompt, …).
-    # Legacy tool names (e.g. "execute_shell_command") are always expanded so
-    # pre-rename specs and restored sessions keep dispatching.
-    aliases = dict(_LEGACY_TOOL_ALIASES)
-    aliases.update(schema.get("aliases") or {})
-    if aliases:
-        tools, tool_dispatch = _expand_aliases(tools, tool_dispatch, aliases)
+    #
+    # Legacy names (e.g. "execute_shell_command") are expanded dispatch-only:
+    # a restored session or a model that still emits the retired name keeps
+    # working, but the model is never shown both it and its successor.  A spec
+    # that names the retired tool itself already gets a dispatch entry from
+    # _normalize_schema, so nothing needs advertising here.  Aliases declared
+    # in the spec are the caller's explicit choice and are advertised.
+    declared_aliases = dict(schema.get("aliases") or {})
+    legacy_aliases = {a: c for a, c in _LEGACY_TOOL_ALIASES.items() if a not in declared_aliases}
+    if legacy_aliases:
+        tools, tool_dispatch = _expand_aliases(tools, tool_dispatch, legacy_aliases, advertise=False)
+    if declared_aliases:
+        tools, tool_dispatch = _expand_aliases(tools, tool_dispatch, declared_aliases)
 
     if non_interactive:
         # Remove tools whose dispatch entry maps to t_ask_user.

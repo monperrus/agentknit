@@ -155,3 +155,71 @@ def test_default_dispatch_accepts_legacy_shell_tool_name() -> None:
         "python_function": "t_run",
         "param_map": {},
     }
+
+
+def test_legacy_alias_is_dispatch_only_not_advertised() -> None:
+    """A retired name must never be offered alongside its successor.
+
+    Advertising both showed the model two identical shell tools
+    ('exec_shell' and 'execute_shell_command'), wasting prompt tokens and
+    leaving the choice between them ambiguous.
+    """
+    import agentknit
+
+    schema = agentknit.load_specification("test-model", "http://example.invalid/v1")
+    session = agentknit.init_session(schema)
+
+    advertised = [(t.get("function") or t)["name"] for t in session["tools"]]
+    assert "exec_shell" in advertised
+    assert "execute_shell_command" not in advertised
+    assert advertised == sorted(set(advertised), key=advertised.index)  # no duplicates
+
+    # …but a model or restored session emitting the retired name still runs.
+    assert session["tool_dispatch"]["execute_shell_command"] == {
+        "python_function": "t_run",
+        "param_map": {},
+    }
+
+
+def test_spec_declared_aliases_are_still_advertised() -> None:
+    """Aliases in the spec are the caller's explicit choice, so keep offering them."""
+    import agentknit
+
+    schema = agentknit.load_specification("test-model", "http://example.invalid/v1")
+    schema["aliases"] = {"run_command": "exec_shell"}
+    session = agentknit.init_session(schema)
+
+    advertised = [(t.get("function") or t)["name"] for t in session["tools"]]
+    assert "run_command" in advertised
+    assert session["tool_dispatch"]["run_command"]["python_function"] == "t_run"
+
+
+def test_legacy_named_spec_keeps_its_own_tool() -> None:
+    """A pre-rename spec naming the retired tool keeps advertising exactly that."""
+    import agentknit
+
+    schema = {
+        "model": "test-model",
+        "endpoint": "http://example.invalid/v1",
+        "status": "default",
+        "tool_specs": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "execute_shell_command",
+                    "description": "Run a shell command.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            }
+        ],
+        "behaviour": {"call_delivery_mode": "structured_tool_calls"},
+    }
+    session = agentknit.init_session(schema)
+
+    advertised = [(t.get("function") or t)["name"] for t in session["tools"]]
+    assert advertised == ["execute_shell_command"]
+    assert session["tool_dispatch"]["execute_shell_command"]["python_function"] == "t_run"

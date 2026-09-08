@@ -123,6 +123,7 @@ from .exceptions import (
 )
 from .slash_commands import REGISTRY as _slash_registry
 from ._journal import (
+    DurableSink,
     SessionJournal,
     new_call_id,
     replay_journal,
@@ -326,6 +327,11 @@ def _emit(session: Session, event_type: str, **data: Any) -> None:
 
         :ref:`event-types` — full list of event types with descriptions.
     """
+    # A durable sink is intentionally before every subscriber, including the
+    # default terminal renderer.  A sink failure propagates and prevents the
+    # event from being consumed.
+    _persist_record(session, {"type": "event", "event_type": event_type,
+                              "data": data})
     # Call per-event-type handlers first
     handlers = session.get("_event_handlers", {}).get(event_type, [])
     for handler in handlers:
@@ -1128,11 +1134,14 @@ def print_session_history(session: Session) -> None:
 
 # ── logging ───────────────────────────────────────────────────────────────────
 
-def _open_log(model: str, session_id: str) -> Path:
+def _open_log(model: str, session_id: str, session_dir: str | Path | None = None) -> Path:
     now = datetime.datetime.now()
-    path = (LOG_BASE / safe_model_name(model)
-                     / now.strftime("%Y-%m-%d")
-                     / f"{now.strftime('%H%M%S')}_{session_id}.jsonl")
+    if session_dir is not None:
+        path = Path(session_dir) / "events.jsonl"
+    else:
+        path = (LOG_BASE / safe_model_name(model)
+                         / now.strftime("%Y-%m-%d")
+                         / f"{now.strftime('%H%M%S')}_{session_id}.jsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -1142,13 +1151,47 @@ def _log(session: Session, record: "dict[str, Any]") -> None:
     record["cwd"] = os.getcwd()
     with session["log_path"].open("a") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if session.get("_durable_capture"):
+            f.flush()
+            os.fsync(f.fileno())
 
 
-def _snapshot_path(model: str, session_id: str) -> Path:
+def _persist_record(session: Session, record: "dict[str, Any]") -> None:
+    """Commit one lifecycle record before its producer exposes it.
+
+    The built-in journal is the authoritative recovery stream.  An optional
+    caller sink receives the same record synchronously, allowing a consumer
+    to mirror or replace storage without patching agent internals.
+    """
+    journal = session.get("_journal")
+    if session.get("_durable_capture") and journal is not None:
+        journal.append(record)
+    sink = session.get("durable_sink")
+    if sink is not None and sink is not journal:
+        sink.append(dict(record))
+
+
+def _write_journal_record(session: Session, record: "dict[str, Any]") -> None:
+    """Write a recovery record and mirror it to the optional public sink."""
+    journal = session.get("_journal")
+    if journal is not None:
+        journal.append(record)
+    sink = session.get("durable_sink")
+    if sink is not None and sink is not journal:
+        sink.append(dict(record))
+
+
+def _snapshot_path(model: str, session_id: str,
+                   session_dir: str | Path | None = None) -> Path:
+    if session_dir is not None:
+        return Path(session_dir) / "messages.json"
     return LOG_BASE / safe_model_name(model) / f"{session_id}_messages.json"
 
 
-def _journal_path(model: str, session_id: str) -> Path:
+def _journal_path(model: str, session_id: str,
+                  session_dir: str | Path | None = None) -> Path:
+    if session_dir is not None:
+        return Path(session_dir) / "journal.jsonl"
     return LOG_BASE / safe_model_name(model) / f"{session_id}_journal.jsonl"
 
 
@@ -1156,7 +1199,8 @@ def _save_messages_snapshot(session: Session) -> None:
     # Only save if there is at least one non-system message worth resuming.
     if not any(m.get("role") != "system" for m in session["messages"]):
         return
-    path = _snapshot_path(session["model"], session["session_id"])
+    path = _snapshot_path(session["model"], session["session_id"],
+                          session.get("session_dir"))
     path.parent.mkdir(parents=True, exist_ok=True)
     # Annotate each message with a timestamp (backward-compatible: existing
     # messages that already have a "ts" key are left unchanged).
@@ -1194,6 +1238,15 @@ def _save_messages_snapshot(session: Session) -> None:
     }
     with path.open("w") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+        if session.get("_durable_capture"):
+            f.flush()
+            os.fsync(f.fileno())
+    if session.get("_durable_capture"):
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 _MAX_ARGS_PREVIEW = 200
@@ -1724,6 +1777,8 @@ class Session(TypedDict):
     # NotRequired: sessions saved before the durable-recovery feature lack
     # this key; the restore path defaults it to True.
     durable: NotRequired[bool]
+    session_dir: NotRequired[Path]
+    durable_sink: NotRequired[DurableSink | None]
     # ── runtime-only state (set after construction) ──────────────────
     log_path: NotRequired[Path]      # JSONL transcript path (always set in practice)
     auth: NotRequired[dict[str, Any]]          # auth *configuration* (never the key itself)
@@ -1731,6 +1786,7 @@ class Session(TypedDict):
     _journal: NotRequired["SessionJournal | None"]
     _event_handlers: NotRequired[dict[str, list[EventCallback]]]
     _content_was_streamed: NotRequired[bool]
+    _durable_capture: NotRequired[bool]
     _cache_cold_warned: NotRequired[bool]
     _continue_requested: NotRequired[bool]
 
@@ -1753,6 +1809,8 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                  compaction_min_chars: int | None = None,
                  min_cacheable_tokens: int | None = None,
                  durable: bool | None = None,
+                 session_dir: str | Path | None = None,
+                 durable_sink: DurableSink | None = None,
                  ) -> "Session":
     """Build a stateful session dict (:class:`Session`).
 
@@ -1814,6 +1872,15 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     are re-injected instead of re-run, and in-flight tool calls whose
     outcome is unknown are flagged for verification.  Set to ``False`` to
     fall back to turn-boundary snapshots only.
+
+    ``session_dir`` — explicit directory for this session's journal,
+    snapshots, and logs.  It is independent of the model name and working
+    directory and is also used when resuming the session.
+
+    ``durable_sink`` — synchronous ``append(record)`` destination for the
+    ordered lifecycle stream.  It is called only after the built-in journal
+    commits, and before any event handler, model request, or tool dispatch
+    consumes that record.  Exceptions stop the operation that produced it.
     """
     # A resumed session must run (and re-save its snapshot) on the endpoint
     # it was created on — bind here so every caller is covered, including
@@ -1821,7 +1888,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     # A cross-model resume ports the snapshot first: the copy under the new
     # model makes the provider switch explicit and keeps the original file
     # as the record of where the history came from.
-    if resumed_from:
+    if resumed_from and session_dir is None:
         _port_snapshot_to_model(schema, resumed_from)
         schema = _bind_schema_to_resumed_session(schema, resumed_from)
     schema = _normalize_schema(schema)
@@ -1862,7 +1929,13 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         # Messages, usage totals, call count, session id, cache key, etc.
         # are preserved from the saved session.
         restored: Session = dict(session)  # type: ignore[assignment]  # shallow copy – we override several keys below
-        restored["log_path"] = _open_log(model, restored.get("session_id") or uuid.uuid4().hex[:12])
+        if session_dir is not None:
+            restored["session_dir"] = Path(session_dir)
+        if durable_sink is not None:
+            restored["durable_sink"] = durable_sink
+        restored["_durable_capture"] = bool(restored.get("session_dir") or restored.get("durable_sink"))
+        restored["log_path"] = _open_log(model, restored.get("session_id") or uuid.uuid4().hex[:12],
+                                           restored.get("session_dir"))
         # Reset compaction state so the new session starts fresh.
         restored["compaction_last_prompt_tokens"] = 0
         # Replace event handler if a new one was provided.
@@ -1895,8 +1968,10 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         # Reopen (or start) the session journal on restore.
         restored["_journal"] = (
             SessionJournal(_journal_path(restored.get("model") or "unknown",
-                                         restored.get("session_id") or ""))
-            if restored.get("durable", True) else None
+                                         restored.get("session_id") or "",
+                                         restored.get("session_dir")),
+                           exclusive=bool(restored.get("session_dir")))
+            if (restored.get("durable", True) or restored.get("session_dir")) else None
         )
         # Log the restoration event.
         _log(restored, {"type": "session_restored",
@@ -1933,7 +2008,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         .get("supported", False)
     )
     session_start_ts = datetime.datetime.now().isoformat(timespec="seconds")
-    session = {
+    session = cast(Session, {
         "messages":        [{"role": "system", "content": sys_msg,
                              "ts": session_start_ts}],
         "tools":           tools,
@@ -1956,7 +2031,8 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                            if schema.get("keyring_service") and schema.get("keyring_username")
                            else {k: schema[k] for k in ("auth", "key_env")
                                  if schema.get(k) is not None}),
-        "log_path":        _open_log(model, session_id),
+        "session_dir":     Path(session_dir) if session_dir is not None else None,
+        "log_path":        _open_log(model, session_id, session_dir),
         "non_interactive": non_interactive,
         "usage_totals":    {"prompt": 0, "completion": 0, "total": 0,
                             "cached": 0, "cache_write": 0},
@@ -1999,13 +2075,21 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         ),
         # Durable recovery: append-only WAL of every in-turn state change.
         "durable": (
-            schema.get("durable", True) if durable is None else durable
+            True if session_dir is not None else
+            (schema.get("durable", True) if durable is None else durable)
         ),
         "_journal": SessionJournal(
-            _journal_path(model, session_id)) if (
-                durable if durable is not None else schema.get("durable", True)
-        ) else None,
-    }
+            _journal_path(model, session_id, session_dir),
+            exclusive=session_dir is not None) if (
+                session_dir is not None or
+                (durable if durable is not None else schema.get("durable", True))
+            ) else None,
+        "durable_sink": durable_sink,
+        "_durable_capture": session_dir is not None or durable_sink is not None,
+    })
+    # The system prompt becomes durable before the session can send it or
+    # report any startup event.
+    _persist_record(session, {"type": "message", "msg": session["messages"][0]})
     _log(session, {"type": "session_start", "model": model,
                    "endpoint": schema.get("endpoint", ""),
                    "session_id": session_id,
@@ -2017,7 +2101,17 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                    "ts": session_start_ts})
     if resumed_from:
         flatten_resume = bool(behaviour.get("resume_rejects_stale_tool_call_ids"))
-        loaded = _load_messages_snapshot(model, resumed_from, flatten=flatten_resume)
+        if session_dir is not None:
+            custom_snapshot = _snapshot_path(model, resumed_from, session_dir)
+            if custom_snapshot.exists():
+                with custom_snapshot.open() as f:
+                    raw_snapshot = json.load(f)
+                raw_messages = raw_snapshot.get("messages", raw_snapshot) if isinstance(raw_snapshot, dict) else raw_snapshot
+                loaded = _normalise_for_resume(raw_messages, flatten=flatten_resume) if isinstance(raw_messages, list) else None
+            else:
+                loaded = None
+        else:
+            loaded = _load_messages_snapshot(model, resumed_from, flatten=flatten_resume)
         if loaded:
             session["messages"] = loaded
             _log(session, {"type": "session_resumed", "resumed_from": resumed_from,
@@ -2052,7 +2146,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         # The journal records state changes the turn-boundary snapshot cannot:
         # messages appended after the last snapshot and the outcome of every
         # tool call.  Prefer it whenever it knows at least as much.
-        journal_state = replay_journal(_journal_path(model, resumed_from))
+        journal_state = replay_journal(_journal_path(model, resumed_from, session_dir))
         if journal_state.entries_replayed and (
             not session["messages"] or journal_state.mid_turn
             or len(journal_state.messages) > 1
@@ -2188,6 +2282,18 @@ def _complete(client: openai.OpenAI | SubprocessOpenAI, session: Session, **kwar
     kwargs["extra_body"] = extra
     kwargs["on_rate_limit_wait"] = _rate_limit_wait_callback(session)
 
+    # Do not include callbacks (or any authentication transport state) in the
+    # durable request.  This is the exact model request payload otherwise.
+    request = {key: value for key, value in kwargs.items()
+               if not key.startswith("on_")}
+    _persist_record(session, {"type": "model_request", "request": request})
+
+    def _on_raw_response(frame: Any) -> None:
+        _persist_record(session, {"type": "model_response_frame", "frame": frame})
+
+    def _on_request_attempt(attempt: Any) -> None:
+        _persist_record(session, {"type": "model_request_attempt", "attempt": attempt})
+
     session["_content_was_streamed"] = False
     if session.get("streaming"):
         streamed: list[str] = []
@@ -2212,10 +2318,15 @@ def _complete(client: openai.OpenAI | SubprocessOpenAI, session: Session, **kwar
             _emit(session, "reasoning_delta", text=piece, first=first,
                   no_newline=True, fmt=fmt)
 
+        stream_callbacks: dict[str, Any] = {}
+        if isinstance(client, (openai.OpenAI, SubprocessOpenAI)):
+            stream_callbacks["on_raw_response"] = _on_raw_response
+            stream_callbacks["on_request_attempt"] = _on_request_attempt
         resp = client.chat.completions.create(
             **kwargs,
             on_content_delta=_on_delta,
             on_reasoning_delta=_on_reasoning,
+            **stream_callbacks,
         )
         if streamed:
             _emit(session, "content_stream_end", no_newline=True, fmt="\n")
@@ -2223,7 +2334,21 @@ def _complete(client: openai.OpenAI | SubprocessOpenAI, session: Session, **kwar
         elif reasoned:
             _emit(session, "reasoning_stream_end", no_newline=True, fmt="\n")
     else:
-        resp = client.chat.completions.create(**kwargs)
+        response_callbacks: dict[str, Any] = {}
+        if isinstance(client, (openai.OpenAI, SubprocessOpenAI)):
+            response_callbacks["on_raw_response"] = _on_raw_response
+            response_callbacks["on_request_attempt"] = _on_request_attempt
+        resp = client.chat.completions.create(**kwargs, **response_callbacks)
+
+    _persist_record(session, {"type": "model_response", "response": {
+        "content": getattr(resp.choices[0].message, "content", None),
+        "reasoning": getattr(resp, "reasoning", None),
+        "tool_calls": [
+            {"id": tc.id, "type": tc.type, "name": tc.function.name,
+             "arguments": tc.function.arguments}
+            for tc in (getattr(resp.choices[0].message, "tool_calls", None) or [])
+        ],
+    }})
 
     # Sticky provider: lock onto whichever provider served the first call so
     # the rest of the session reuses one provider's prefix cache. An explicit
@@ -2306,6 +2431,12 @@ def compact_session(
 
     request_started_at = time.monotonic()
     try:
+        _persist_record(session, {"type": "model_request", "purpose": "compaction",
+                                  "request": {"model": model, "messages": compaction_messages,
+                                              "temperature": 0,
+                                              "max_tokens": session.get(
+                                                  "compaction_target_tokens",
+                                                  DEFAULT_COMPACTION_TARGET_TOKENS)}})
         resp = client.chat.completions.create(
             model=model,
             messages=compaction_messages,
@@ -2327,6 +2458,8 @@ def compact_session(
         return False
 
     summary = (resp.choices[0].message.content or "").strip()
+    _persist_record(session, {"type": "model_response", "purpose": "compaction",
+                              "response": {"content": resp.choices[0].message.content}})
     if not summary:
         return False
 
@@ -2339,9 +2472,8 @@ def compact_session(
         "ts": datetime.datetime.now().isoformat(timespec="seconds"),
     }
     session["messages"] = system_msgs + [summary_msg] + suffix
-    journal = session.get("_journal")
-    if journal is not None:
-        journal.reset_messages(session["messages"], reason="compaction")
+    _write_journal_record(session, {"type": "reset_messages", "reason": "compaction",
+                                    "messages": list(session["messages"])})
 
     compacted_turns = len(prefix) - len(system_msgs)
     compacted_chars = sum(
@@ -2453,7 +2585,8 @@ def _handle_tool_call(
     if journal is not None:
         # Write-ahead: persisted before the tool runs, so a crash between
         # here and tool_end marks the side effects as unknown on recovery.
-        journal.tool_start(call_id, name, args)
+        _write_journal_record(session, {"type": "tool_start", "call_id": call_id,
+                                        "name": name, "args": args})
 
     pf_name = getattr(entry.get("python_function"), "__name__",
                       entry.get("python_function"))
@@ -2480,6 +2613,12 @@ def _handle_tool_call(
             streamed = bool(log_data.pop("streamed", False))
         except FatalToolDispatchError as e:
             result = str(e)
+            # A fatal outcome is still an outcome: recovery must never leave
+            # this call looking merely in-flight.
+            if journal is not None:
+                _write_journal_record(session, {"type": "tool_end", "call_id": call_id,
+                                                "name": name, "result": result,
+                                                "outcome": "fatal_error"})
             _emit(session, "tool_result", name=name, result=result, streamed=False,
                   fmt=fmt_result(result))
             _log(session, {"type": "fatal_error", "name": name,
@@ -2487,6 +2626,20 @@ def _handle_tool_call(
                            "result": result,
                            "ts": datetime.datetime.now().isoformat(timespec="seconds")})
             raise SystemExit(2) from e
+        except Exception as exc:
+            # The caller may choose how to surface the exception, but the
+            # durable stream must record the observable failure first.
+            failure = f"ERROR: {exc}"
+            if journal is not None:
+                _write_journal_record(session, {"type": "tool_end", "call_id": call_id,
+                                                "name": name, "result": failure,
+                                                "outcome": "error"})
+            _emit(session, "tool_result", name=name, result=failure, streamed=False,
+                  files=None, diff_summary=None, fmt=fmt_result(failure))
+            _log(session, {"type": "tool_error", "name": name,
+                           "python_function": pf_name, "result": failure,
+                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+            raise
 
     fmt = fmt_result(result, streamed=streamed)
     if name == "read_file":
@@ -2500,7 +2653,8 @@ def _handle_tool_call(
         # Persisted only after the side effects have happened: a tool_end
         # without a later assistant message tells recovery the result is
         # known and must be re-used, not re-computed.
-        journal.tool_end(call_id, result, name=name)
+        _write_journal_record(session, {"type": "tool_end", "call_id": call_id,
+                                        "name": name, "result": result})
 
     # Pass file-change metadata from log_data to the event payload
     # so consumers (e.g. Telegram controller) can show "Changed path +5 -2".
@@ -2677,13 +2831,13 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
     journal    = session.get("_journal")
 
     if journal is not None:
-        journal.turn_start(task)
+        _write_journal_record(session, {"type": "turn_start", "task": task})
 
     def _append_message(msg: dict[str, Any]) -> None:
         """Append a message to the history and durably journal it."""
-        messages.append(msg)
         if journal is not None:
-            journal.message(msg)
+            _write_journal_record(session, {"type": "message", "msg": msg})
+        messages.append(msg)
 
     now_ts = datetime.datetime.now().isoformat(timespec="seconds")
     if task is None:
@@ -2698,8 +2852,10 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
         messages[-1]["content"] = f"{old}\n\n{task}" if old else task
         messages[-1]["ts"] = now_ts
         if journal is not None:
-            # Republish the merged message durably.
-            journal.message(messages[-1])
+            # A merge replaces prior history; replay it as a replacement,
+            # rather than inventing a second submitted user message.
+            _write_journal_record(session, {"type": "reset_messages", "reason": "user_merge",
+                                            "messages": list(messages)})
     else:
         _append_message({"role": "user", "content": task, "ts": now_ts})
     if task is not None:
@@ -2892,7 +3048,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
         # Durable: every exit path (final answer, error, interrupt) closes the
         # turn in the journal so replay knows where the turn ended.
         if journal is not None:
-            journal.turn_end()
+            _write_journal_record(session, {"type": "turn_end"})
 
 
 # ── pricing check ─────────────────────────────────────────────────────────────
@@ -3268,6 +3424,8 @@ def run_task(
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
     durable: bool | None = None,
+    session_dir: str | Path | None = None,
+    durable_sink: DurableSink | None = None,
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
 ) -> SessionResult:
     """Run a single task against the agent and return a :class:`SessionResult`.
@@ -3297,7 +3455,7 @@ def run_task(
     :func:`create_client` would build from the schema.  The schema is still
     validated and used for tools, prompts and session state.
     """
-    if session_id is not None:
+    if session_id is not None and session_dir is None:
         schema = _bind_schema_to_resumed_session(schema, session_id)
     validate_schema(schema)
     client = client or create_client(schema)
@@ -3319,6 +3477,8 @@ def run_task(
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
         durable=durable,
+        session_dir=session_dir,
+        durable_sink=durable_sink,
     )
     try:
         return run_turn(client, schema["model"], session, task)
@@ -3326,6 +3486,9 @@ def run_task(
         _save_messages_snapshot(session)
         _log(session, {"type": "session_end", "session_id": session["session_id"],
                        "reason": "run_task_complete"})
+        journal = session.get("_journal")
+        if journal is not None:
+            journal.close()
 
 
 def run_agent(
@@ -3351,6 +3514,8 @@ def run_agent(
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
     durable: bool | None = None,
+    session_dir: str | Path | None = None,
+    durable_sink: DurableSink | None = None,
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
 ) -> SessionResult:
     """Run a one-shot agent from direct tool definitions.
@@ -3388,6 +3553,8 @@ def run_agent(
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
         durable=durable,
+        session_dir=session_dir,
+        durable_sink=durable_sink,
         client=client,
     )
 
@@ -3414,6 +3581,8 @@ def run(
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
     durable: bool | None = None,
+    session_dir: str | Path | None = None,
+    durable_sink: DurableSink | None = None,
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
 ) -> SessionResult:
     """Backward-compatible helper for :func:`run_task`.
@@ -3448,6 +3617,8 @@ def run(
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
         durable=durable,
+        session_dir=session_dir,
+        durable_sink=durable_sink,
         client=client,
     )
 
@@ -3520,10 +3691,12 @@ def _repl_setup(
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
     durable: bool | None = None,
+    session_dir: str | Path | None = None,
+    durable_sink: DurableSink | None = None,
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
 ) -> tuple[Any, ...]:
     """Common REPL setup: validate, create client, init session, return (client, session, model, hist_file)."""
-    if session_id is not None:
+    if session_id is not None and session_dir is None:
         schema = _bind_schema_to_resumed_session(schema, session_id)
     validate_schema(schema)
     client = client or create_client(schema)
@@ -3544,6 +3717,8 @@ def _repl_setup(
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
         durable=durable,
+        session_dir=session_dir,
+        durable_sink=durable_sink,
     )
     model = schema["model"]
 
@@ -3580,6 +3755,9 @@ def _repl_teardown(session: Session, hist_file: Path, resume_cmd: str) -> None:
     _save_messages_snapshot(session)
     _log(session, {"type": "session_end", "session_id": session["session_id"],
                    "reason": "repl_exit"})
+    journal = session.get("_journal")
+    if journal is not None:
+        journal.close()
     print(f"\n{DIM}Resume: {resume_cmd}{RESET}")
 
 
@@ -3705,6 +3883,8 @@ def run_repl(
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
     durable: bool | None = None,
+    session_dir: str | Path | None = None,
+    durable_sink: DurableSink | None = None,
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
 ) -> None:
     """Start an interactive REPL session against the agent (sync, no background thread).
@@ -3736,6 +3916,8 @@ def run_repl(
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
         durable=durable,
+        session_dir=session_dir,
+        durable_sink=durable_sink,
         client=client,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
@@ -3779,6 +3961,8 @@ def run_async_repl(
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
     durable: bool | None = None,
+    session_dir: str | Path | None = None,
+    durable_sink: DurableSink | None = None,
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
 ) -> None:
     """Start an interactive REPL session with a background input queue.
@@ -3809,6 +3993,8 @@ def run_async_repl(
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
         durable=durable,
+        session_dir=session_dir,
+        durable_sink=durable_sink,
         client=client,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])

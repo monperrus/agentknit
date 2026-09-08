@@ -37,12 +37,23 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime as _dt
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 
 # A conversation message / journal record (JSON-shaped dict).
 Msg = dict[str, Any]
 Args = dict[str, Any]
+
+
+class DurableSink(Protocol):
+    """Synchronous destination for the ordered session event stream.
+
+    ``append`` must not return until *record* is durable.  AgentKnit calls it
+    on the producer side of every boundary, before a handler, model request,
+    or tool can consume that record.
+    """
+
+    def append(self, record: dict[str, Any]) -> None: ...
 
 
 def new_call_id() -> str:
@@ -83,10 +94,73 @@ class JournalState:
 class SessionJournal:
     """Append-only, fsync-per-record write-ahead journal for one session."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, exclusive: bool = False) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fsync_directory()
+        self._lock_fd: int | None = None
+        if exclusive:
+            # A session directory has one ordered writer.  A non-blocking
+            # lock turns accidental concurrent ownership into a clear error
+            # instead of interleaved JSON records.
+            import fcntl
+            self._lock_fd = os.open(self.path.with_suffix(self.path.suffix + ".lock"),
+                                    os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(self._lock_fd)
+                self._lock_fd = None
+                raise RuntimeError(f"session journal is already open: {self.path}")
+        self._repair_torn_tail()
         self._seq = self._count_records()
+
+    def close(self) -> None:
+        """Release the optional one-writer lock."""
+        if self._lock_fd is None:
+            return
+        import fcntl
+        fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+        os.close(self._lock_fd)
+        self._lock_fd = None
+
+    def _fsync_directory(self) -> None:
+        """Make a newly-created journal directory durable on POSIX filesystems."""
+        try:
+            fd = os.open(self.path.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _repair_torn_tail(self) -> None:
+        """Drop only an incomplete final record; reject corruption before it."""
+        if not self.path.exists():
+            return
+        raw = self.path.read_bytes()
+        if not raw:
+            return
+        lines = raw.splitlines(keepends=True)
+        repaired = False
+        for index, line in enumerate(lines):
+            complete = line.endswith((b"\n", b"\r"))
+            try:
+                json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                if index == len(lines) - 1 and not complete:
+                    raw = b"".join(lines[:index])
+                    with self.path.open("wb") as f:
+                        f.write(raw)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    self._fsync_directory()
+                    repaired = True
+                    break
+                raise ValueError(f"corrupt session journal at record {index + 1}") from exc
+        if repaired:
+            return
 
     def _count_records(self) -> int:
         if not self.path.exists():
@@ -141,8 +215,8 @@ class SessionJournal:
 def replay_journal(path: str | Path) -> JournalState:
     """Reconstruct session state from a journal file.
 
-    Unknown or corrupt lines are skipped rather than fatal — only a torn
-    tail write can produce one, and a torn record was never acknowledged.
+    A torn tail is ignored because it was never acknowledged.  Corruption in
+    the middle is rejected: silently skipping it would make recovery lie.
     """
     state = JournalState()
     journal = Path(path)
@@ -153,15 +227,24 @@ def replay_journal(path: str | Path) -> JournalState:
     finished: dict[str, KnownToolResult] = {}
     open_turns = 0
 
-    with journal.open(encoding="utf-8") as f:
-        for line in f:
+    raw_lines = journal.read_bytes().splitlines(keepends=True)
+    for index, raw_line in enumerate(raw_lines):
+            complete = raw_line.endswith((b"\n", b"\r"))
+            try:
+                line = raw_line.decode("utf-8").strip()
+            except UnicodeDecodeError as exc:
+                if index == len(raw_lines) - 1 and not complete:
+                    break
+                raise ValueError(f"corrupt session journal at record {index + 1}") from exc
             line = line.strip()
             if not line:
                 continue
             try:
                 rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                if index == len(raw_lines) - 1 and not complete:
+                    break
+                raise ValueError(f"corrupt session journal at record {index + 1}") from exc
             if not isinstance(rec, dict):
                 continue
             rtype = rec.get("type")

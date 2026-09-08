@@ -263,11 +263,14 @@ class _Completions:
         return url, {auth_hdr: auth_val, "Content-Type": "application/json"}
 
     def _retry_post(self, url: str, headers: dict[str, str], payload: dict[str, Any],
-                    stream: bool = False, on_rate_limit_wait: "Callable[..., None] | None" = None) -> requests.Response:
+                    stream: bool = False, on_rate_limit_wait: "Callable[..., None] | None" = None,
+                    on_request_attempt: "Callable[[Any], None] | None" = None) -> requests.Response:
         read_timeout_retries = 0
         while True:
             self._client._rate_limiter.acquire()
             try:
+                if on_request_attempt is not None:
+                    on_request_attempt({"payload": payload})
                 resp = requests.post(url, headers=headers, json=payload,
                                      stream=stream, timeout=300)
             except requests.exceptions.ReadTimeout:
@@ -324,6 +327,8 @@ class _Completions:
                max_tokens: int | None = None,
                on_content_delta: "Callable[[str], None] | None" = None,
                on_reasoning_delta: "Callable[[str], None] | None" = None,
+               on_raw_response: "Callable[[Any], None] | None" = None,
+               on_request_attempt: "Callable[[Any], None] | None" = None,
                on_rate_limit_wait: "Callable[..., None] | None" = None) -> _Response:
         payload: dict[str, Any] = {"model": model, "messages": messages,
                          "temperature": temperature}
@@ -343,18 +348,25 @@ class _Completions:
         if on_content_delta is not None:
             return self._create_streaming(url, headers, payload,
                                           on_content_delta, on_reasoning_delta,
-                                          on_rate_limit_wait)
+                                          on_rate_limit_wait, on_raw_response,
+                                          on_request_attempt)
 
-        resp = self._retry_post(url, headers, payload, on_rate_limit_wait=on_rate_limit_wait)
+        resp = self._retry_post(url, headers, payload, on_rate_limit_wait=on_rate_limit_wait,
+                                on_request_attempt=on_request_attempt)
         if not resp.ok:
             print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
         resp.raise_for_status()
-        return _parse_response(resp.json())
+        data = resp.json()
+        if on_raw_response is not None:
+            on_raw_response({"kind": "payload", "payload": data})
+        return _parse_response(data)
 
     def _create_streaming(self, url: str, headers: dict[str, str], payload: dict[str, Any],
                           on_content_delta: "Callable[[str], None] | None" = None,
                           on_reasoning_delta: "Callable[[str], None] | None" = None,
-                          on_rate_limit_wait: "Callable[..., None] | None" = None) -> _Response:
+                          on_rate_limit_wait: "Callable[..., None] | None" = None,
+                          on_raw_response: "Callable[[Any], None] | None" = None,
+                          on_request_attempt: "Callable[[Any], None] | None" = None) -> _Response:
         payload = {**payload, "stream": True}
         assembled_content = ""
         assembled_reasoning = ""
@@ -365,16 +377,19 @@ class _Completions:
         # raises RateLimitError for a non-retryable one — it never returns
         # a 429 response here.
         resp = self._retry_post(url, headers, payload, stream=True,
-                                on_rate_limit_wait=on_rate_limit_wait)
+                                on_rate_limit_wait=on_rate_limit_wait,
+                                on_request_attempt=on_request_attempt)
         if not resp.ok:
             print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
             resp.raise_for_status()
 
         with resp:
             for raw_line in resp.iter_lines():
-                if not raw_line:
-                    continue
                 line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                if on_raw_response is not None:
+                    on_raw_response({"kind": "sse", "line": line})
+                if not line:
+                    continue
                 if line == "data: [DONE]":
                     break
                 if not line.startswith("data: "):
@@ -571,6 +586,8 @@ class _SubprocessCompletions:
                max_tokens: int | None = None,
                on_content_delta: "Callable[[str], None] | None" = None,
                on_reasoning_delta: "Callable[[str], None] | None" = None,
+               on_raw_response: "Callable[[Any], None] | None" = None,
+               on_request_attempt: "Callable[[Any], None] | None" = None,
                on_rate_limit_wait: "Callable[..., None] | None" = None) -> _Response:
         # No HTTP retry loop here — the subprocess binary owns its own
         # rate-limit handling, so on_rate_limit_wait is accepted but unused.
@@ -589,6 +606,8 @@ class _SubprocessCompletions:
         if extra_body:
             payload.update(extra_body)
 
+        if on_request_attempt is not None:
+            on_request_attempt({"payload": payload})
         proc = subprocess.run(
             [self._client._binary_path],
             input=json.dumps(payload),
@@ -604,6 +623,9 @@ class _SubprocessCompletions:
                 f"{proc.stderr}"
             )
         data = json.loads(proc.stdout)
+        if on_raw_response is not None:
+            on_raw_response({"kind": "subprocess", "stdout": proc.stdout,
+                             "stderr": proc.stderr})
         return _parse_response(data)
 
 

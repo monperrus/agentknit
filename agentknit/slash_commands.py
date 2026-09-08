@@ -143,7 +143,12 @@ def _handle_clear(session: Session, client: Any, model: str, args: str) -> None:
     session["messages"] = system_msgs
     journal = session.get("_journal")
     if journal is not None:
-        journal.reset_messages(session["messages"], reason="clear")
+        record = {"type": "reset_messages", "reason": "clear",
+                  "messages": list(session["messages"])}
+        journal.append(record)
+        sink = session.get("durable_sink")
+        if sink is not None and sink is not journal:
+            sink.append(dict(record))
     # Reset usage totals.
     session["usage_totals"] = {"prompt": 0, "completion": 0, "total": 0,
                                "cached": 0, "cache_write": 0}

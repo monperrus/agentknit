@@ -67,6 +67,7 @@ from ._core import (
 )
 
 from ._journal import (
+    DurableSink,
     SessionJournal,
     JournalState,
     PendingToolCall,
@@ -149,7 +150,7 @@ __all__ = [
     "compact_session", "_compact_session", "_maybe_compact",
     "_journal_path",
     # durable recovery
-    "SessionJournal", "JournalState", "PendingToolCall", "KnownToolResult",
+    "DurableSink", "SessionJournal", "JournalState", "PendingToolCall", "KnownToolResult",
     "new_call_id", "replay_journal",
     "Tool",
     "build_tool_spec",

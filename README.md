@@ -500,6 +500,36 @@ from agentknit import run_task
 result = run_task(schema, task, durable=False)
 ```
 
+### Explicit session directories and durable sinks
+
+Pass `session_dir` to keep one session's journal, snapshot, and event log in
+an explicit folder. This enables complete lifecycle capture: initial prompts,
+messages, model requests and responses, streaming frames, tool boundaries, and
+runtime events are committed before they are sent to a model, tool, renderer,
+or subscriber.
+
+```python
+from agentknit import run_task
+
+result = run_task(schema, task, session_dir="/srv/agent-sessions/job-42")
+```
+
+`durable_sink` accepts an object with a synchronous `append(record)` method.
+It receives the same ordered records after the built-in filesystem journal has
+been fsync'd and before downstream consumers run. Raising from `append` stops
+the producing operation, so queueing a background write does not satisfy the
+contract.
+
+```python
+class AuditSink:
+    def append(self, record: dict) -> None:
+        store_and_fsync(record)
+
+result = run_task(schema, task,
+                  session_dir="/srv/agent-sessions/job-42",
+                  durable_sink=AuditSink())
+```
+
 A `journal_recovered` event is emitted whenever a resume rebuilt state from
 the journal.
 

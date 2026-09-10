@@ -1131,6 +1131,18 @@ def _git_status_block() -> "str | None":
     return "\n".join(lines)
 
 
+def _scratchpad_dir(cwd: Path) -> Path:
+    """Per-working-directory scratchpad under the temp dir.
+
+    Slugged with the basename plus a short hash of the full path so two
+    projects sharing a directory name never collide.
+    """
+    import hashlib
+    import tempfile
+    digest = hashlib.sha1(str(cwd).encode()).hexdigest()[:8]
+    return Path(tempfile.gettempdir()) / f"agentknit-scratchpad-{cwd.name}-{digest}"
+
+
 def environment_context(model: str, version: "str | None" = None) -> str:
     """Build the environment-awareness block appended to the system prompt.
 
@@ -1170,7 +1182,7 @@ def environment_context(model: str, version: "str | None" = None) -> str:
     lines.append(f"Current date/time: {now.strftime('%Y-%m-%d %H:%M:%S')} "
                  f"({now.tzname() or 'local'} timezone)")
 
-    scratchpad = Path(tempfile.gettempdir()) / "agentknit-scratchpad"
+    scratchpad = _scratchpad_dir(Path.cwd())
     scratchpad.mkdir(parents=True, exist_ok=True)
     lines.append(f"Scratchpad (for temporary files): {scratchpad}")
 

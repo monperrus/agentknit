@@ -89,3 +89,14 @@ def test_os_and_arch_present() -> None:
     block = environment_context("test-model")
     assert platform.system() in block
     assert platform.machine() in block
+
+
+def test_scratchpad_unique_per_working_directory(tmp_path: Path) -> None:
+    from agentknit._core import _scratchpad_dir
+    a = _scratchpad_dir(tmp_path / "proj")
+    b = _scratchpad_dir(tmp_path / "other" / "proj")
+    # Same basename, different paths → different scratchpads.
+    assert a != b
+    assert "agentknit-scratchpad-proj-" in a.name
+    # Stable for the same cwd.
+    assert _scratchpad_dir(tmp_path / "proj") == a

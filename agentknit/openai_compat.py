@@ -266,7 +266,16 @@ class _Completions:
         auth_hdr = self._client._auth_header
         auth_val = (self._client._api_key if auth_hdr != "Authorization"
                     else f"Bearer {self._client._api_key}")
-        return url, {auth_hdr: auth_val, "Content-Type": "application/json"}
+        # X-Title is the OpenRouter-style attribution header: gateways and
+        # routers use it to label traffic by client. agentknit sets it so
+        # per-agent token accounting can tell agentknit traffic apart from
+        # claude-cli / codex_cli_rs (which identify via User-Agent).
+        headers = {auth_hdr: auth_val, "Content-Type": "application/json",
+                   "X-Title": "agentknit"}
+        extra_headers = getattr(self._client, "_extra_headers", None)
+        if extra_headers:
+            headers.update(extra_headers)
+        return url, headers
 
     def _retry_post(self, url: str, headers: dict[str, str], payload: dict[str, Any],
                     stream: bool = False, on_rate_limit_wait: "Callable[..., None] | None" = None,
@@ -585,10 +594,11 @@ class OpenAI:
             return cls._rate_limiters[base_url]
 
     def __init__(self, *, api_key: str, base_url: str, auth_header: str = "Authorization",
-                 max_rpm: int = 40) -> None:
+                 max_rpm: int = 40, extra_headers: dict[str, str] | None = None) -> None:
         self._api_key = api_key
         self._base_url = base_url
         self._auth_header = auth_header
+        self._extra_headers = dict(extra_headers) if extra_headers else None
         self.base_url = _BaseURL(base_url)
         self.chat = _Chat(self)
         # Acquire a per-base-url rate limiter (default 40 RPM for NVIDIA NIM).

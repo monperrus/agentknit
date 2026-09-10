@@ -1080,6 +1080,108 @@ def inline_system_prompt(tools: list[dict[str, Any]]) -> str:
     )
 
 
+def _git_config_value(key: str) -> "str | None":
+    """Read one git config value; None when git or the value is absent."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "config", "--get", key],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = out.stdout.strip()
+    return value or None
+
+
+def _git_status_block() -> "str | None":
+    """Git status lines for the system prompt; None outside a git repo."""
+    import subprocess
+    try:
+        inside = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if inside.returncode != 0:
+            return None
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        changed = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.splitlines()
+        last_commit = subprocess.run(
+            ["git", "log", "-1", "--pretty=format:%s"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    lines = [f"Git: on branch {branch or '(unknown)'}"]
+    if last_commit:
+        lines.append(f"  last commit: {last_commit}")
+    if changed:
+        lines.append(f"  changed files ({len(changed)}):")
+        lines.extend(f"    {line}" for line in changed[:20])
+        if len(changed) > 20:
+            lines.append(f"    … ({len(changed) - 20} more)")
+    else:
+        lines.append("  working tree clean")
+    return "\n".join(lines)
+
+
+def environment_context(model: str, version: "str | None" = None) -> str:
+    """Build the environment-awareness block appended to the system prompt.
+
+    Covers (per issue #31): user identity, git status, working directory,
+    OS/architecture, current date & timezone, scratchpad dir, model identity.
+    """
+    import getpass
+    import platform
+    import tempfile
+
+    lines = ["## Environment"]
+
+    # User identity: unix name + git identity when configured.
+    try:
+        unix_name = getpass.getuser()
+    except Exception:
+        unix_name = None
+    git_name = _git_config_value("user.name")
+    git_email = _git_config_value("user.email")
+    identity = ""
+    if unix_name:
+        identity += f"unix user: {unix_name}"
+    if git_name or git_email:
+        git_id = " ".join(x for x in (git_name, f"<{git_email}>" if git_email else "") if x)
+        identity += ("; " if identity else "") + f"git identity: {git_id}"
+    if identity:
+        lines.append(f"User: {identity}")
+
+    git_block = _git_status_block()
+    if git_block:
+        lines.append(git_block)
+
+    lines.append(f"Working directory: {Path.cwd()}")
+    lines.append(f"OS: {platform.system()} {platform.release()} ({platform.machine()})")
+
+    now = datetime.datetime.now().astimezone()
+    lines.append(f"Current date/time: {now.strftime('%Y-%m-%d %H:%M:%S')} "
+                 f"({now.tzname() or 'local'} timezone)")
+
+    scratchpad = Path(tempfile.gettempdir()) / "agentknit-scratchpad"
+    scratchpad.mkdir(parents=True, exist_ok=True)
+    lines.append(f"Scratchpad (for temporary files): {scratchpad}")
+
+    model_line = f"Model: {model}"
+    if version:
+        model_line += f" (version {version})"
+    lines.append(model_line)
+
+    return "\n".join(lines)
+
+
 def read_repl_input(prompt: str) -> str:
     """Read one REPL task, coalescing multiline clipboard paste into one turn."""
     # Do not use input() here. With readline enabled, input() can read ahead
@@ -2029,6 +2131,10 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     agents_md = Path.cwd() / "AGENTS.md"
     if agents_md.exists():
         sys_msg += "\n\n" + agents_md.read_text()
+
+    # Environment awareness: user identity, git status, cwd, OS, date, scratchpad.
+    sys_msg += "\n\n" + environment_context(model, schema.get("version"))
+
     session_id = resumed_from if resumed_from else uuid.uuid4().hex[:12]
     streaming = bool(
         (schema.get("provider_api_support") or {})

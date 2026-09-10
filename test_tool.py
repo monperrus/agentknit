@@ -427,3 +427,50 @@ def test_dispatch_missing_function():
     result, meta = dispatch("ghost", {}, td)
     assert "ERROR" in result
     assert "t_nonexistent" in result
+
+
+def test_dispatch_tool_exception_includes_type_and_frames():
+    """A raising tool yields a rich error: exception type + innermost frames."""
+    from agentknit._core import dispatch
+
+    def boom(**kwargs):
+        raise AttributeError("'bool' object has no attribute 'splitlines'")
+
+    result, meta = dispatch("weird", {}, {"weird": {"python_function": boom}})
+    assert result.startswith("ERROR: tool 'weird' raised AttributeError:")
+    assert "splitlines" in result
+    assert "boom" in result  # innermost frame
+    assert meta["result"] == result
+
+
+def test_dispatch_coerces_non_str_tool_result():
+    """A tool returning a non-str (e.g. a bool) is coerced, not crashed on."""
+    from agentknit._core import dispatch
+
+    def truthy(**kwargs):
+        return True, {"result": True}
+
+    result, meta = dispatch("truthy", {}, {"truthy": {"python_function": truthy}})
+    assert result == "True"
+    assert isinstance(meta["result"], str)
+
+
+def test_str_replace_accepts_bool_old_str(tmp_path):
+    """A model sending a boolean where the schema says string is coerced to
+    str instead of crashing with AttributeError."""
+    from agentknit.tool_library import t_update
+
+    f = tmp_path / "f.txt"
+    f.write_text("hello")
+    result, _ = t_update(path=str(f), old=True, new="x")  # type: ignore[arg-type]
+    assert result.startswith("ERROR: old string not found")
+
+
+def test_write_accepts_bool_content(tmp_path):
+    """write_file coerces non-str content instead of raising."""
+    from agentknit.tool_library import t_write
+
+    f = tmp_path / "g.txt"
+    result, _ = t_write(path=str(f), content=False)  # type: ignore[arg-type]
+    assert result.startswith("OK:")
+    assert f.read_text() == "False"

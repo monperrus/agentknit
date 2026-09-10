@@ -100,6 +100,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 import urllib.request
 import uuid
@@ -833,13 +834,26 @@ def dispatch(tool_name: str, args: dict[str, Any], tool_dispatch: dict[str, Any]
 
     try:
         result = fn(**kwargs)
-    except TypeError as e:
-        r = f"ERROR: calling {fn_name}(**{kwargs}): {e}"
+    except Exception as e:
+        # Include the exception type (not just str(e)) plus the innermost
+        # frames so tool bugs like "'bool' object has no attribute
+        # 'splitlines'" are immediately locatable.
+        tb = traceback.extract_tb(sys.exc_info()[2])
+        inner = ", ".join(f"{os.path.basename(f.filename)}:{f.lineno} in {f.name}"
+                          for f in tb[-3:])
+        r = (f"ERROR: tool {tool_name!r} raised {type(e).__name__}: {e} "
+             f"({fn_name}(**{kwargs!r}); {inner})")
         return r, {"result": r}
 
     # All library functions return (str, dict); handle plain str just in case.
     if isinstance(result, tuple):
-        return result
+        text, meta = result
+        # Coerce non-str results (e.g. a tool returning True instead of a
+        # string) — downstream formatters assume str and would crash.
+        if not isinstance(text, str):
+            text = str(text)
+            meta = {**meta, "result": text}
+        return text, meta
     return str(result), {"result": str(result)}
 
 
@@ -2629,7 +2643,13 @@ def _handle_tool_call(
         except Exception as exc:
             # The caller may choose how to surface the exception, but the
             # durable stream must record the observable failure first.
-            failure = f"ERROR: {exc}"
+            # Include the exception type and innermost frames so the model
+            # (and the human) can locate tool bugs from the result alone.
+            tb = traceback.extract_tb(sys.exc_info()[2])
+            inner = ", ".join(f"{os.path.basename(f.filename)}:{f.lineno} in {f.name}"
+                              for f in tb[-3:])
+            failure = (f"ERROR: tool {name!r} raised {type(exc).__name__}: {exc} "
+                       f"({inner})")
             if journal is not None:
                 _write_journal_record(session, {"type": "tool_end", "call_id": call_id,
                                                 "name": name, "result": failure,

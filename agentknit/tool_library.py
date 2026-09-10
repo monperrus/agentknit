@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import threading
+import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -106,6 +107,7 @@ def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tu
     #   even if the file has since changed on disk.  When offset/limit is used
     #   the tag carries those attributes so a partial read is self-describing.
     import hashlib
+    path = _coerce_str(path, "path")
     try:
         content = Path(os.path.expanduser(path)).read_text()
         lines = content.splitlines(keepends=True)
@@ -134,8 +136,28 @@ def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tu
         xml = f"<{checksum}{attrs}>{content}</{checksum}>"
         return xml, {"result": xml}
     except Exception as e:
-        r = f"ERROR: {e}"
-        return r, {"result": r}
+        return _tool_error("read_file", e)
+
+def _coerce_str(value: object, name: str) -> str:
+    """Best-effort str for model-supplied args (models sometimes send
+    booleans/None where the schema says string)."""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _tool_error(tool: str, exc: Exception) -> tuple[str, dict[str, object]]:
+    """Uniform internal-error envelope: exception type + message + innermost
+    frames, so the model (and the human) can locate tool bugs from the
+    result alone instead of a bare ``ERROR: 'bool' object has no attribute
+    'splitlines'``."""
+    tb = traceback.extract_tb(exc.__traceback__)
+    inner = ", ".join(
+        f"{os.path.basename(f.filename)}:{f.lineno} in {f.name}" for f in tb[-3:]
+    )
+    r = f"ERROR: {tool} internal error: {type(exc).__name__}: {exc} ({inner})"
+    return r, {"result": r}
+
 
 def t_write(path: str, content: str) -> tuple[str, dict[str, object]]:
     """Write (or overwrite) a file at the specified path with the given content.
@@ -151,6 +173,8 @@ def t_write(path: str, content: str) -> tuple[str, dict[str, object]]:
                 type: string
                 description: Content to write.
     """
+    path = _coerce_str(path, "path")
+    content = _coerce_str(content, "content")
     try:
         p = Path(os.path.expanduser(path))
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -163,8 +187,7 @@ def t_write(path: str, content: str) -> tuple[str, dict[str, object]]:
             "diff_summary": {"path": path, "added": added, "removed": 0},
         }
     except Exception as e:
-        r = f"ERROR: {e}"
-        return r, {"result": r}
+        return _tool_error("write_file", e)
 
 def _apply_patch_format(patch: str) -> tuple[str, dict[str, object]]:
     """Handle OpenAI-style apply_patch format.
@@ -239,8 +262,11 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "",
     with it True every occurrence is. Either way the exact byte sequence of
     *old_str* must be present in the file, else the edit is refused.
     """
+    path = _coerce_str(path, "path")
+    old = _coerce_str(old, "old_str")
+    new = _coerce_str(new, "new_str")
     if patch:
-        return _apply_patch_format(patch)
+        return _apply_patch_format(_coerce_str(patch, "patch"))
     try:
         p = Path(os.path.expanduser(path))
         text = p.read_text()
@@ -266,8 +292,7 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "",
             "diff_summary": {"path": path, "added": new_lines, "removed": old_lines},
         }
     except Exception as e:
-        r = f"ERROR: {e}"
-        return r, {"result": r}
+        return _tool_error("str_replace", e)
 
 def t_run(command: str) -> tuple[str, dict[str, object]]:
     """Execute a shell command and return its stdout, stderr, and exit code.
@@ -281,6 +306,7 @@ def t_run(command: str) -> tuple[str, dict[str, object]]:
                 description: Shell command to execute.
     """
     global _active_proc
+    command = _coerce_str(command, "command")
     proc: subprocess.Popen[str] | None = None
     try:
         proc = subprocess.Popen(
@@ -452,17 +478,19 @@ def t_ask_user_question(question: str = '', options: str = '') -> tuple[str, dic
 
 
 def t_list_dir(path: str) -> tuple[str, dict[str, object]]:
+    path = _coerce_str(path, "path")
     try:
         entries = sorted(Path(os.path.expanduser(path)).iterdir(), key=lambda p: (p.is_file(), p.name))
         lines = [("d  " if e.is_dir() else "f  ") + e.name for e in entries]
         result = "\n".join(lines) or "(empty)"
         return result, {"result": result}
     except Exception as e:
-        r = f"ERROR: {e}"
-        return r, {"result": r}
+        return _tool_error("list_dir", e)
 
 def t_search(path: str = ".", pattern: str = "") -> tuple[str, dict[str, object]]:
     global _active_proc
+    path = _coerce_str(path, "path")
+    pattern = _coerce_str(pattern, "pattern")
     proc: subprocess.Popen[str] | None = None
     try:
         proc = subprocess.Popen(
@@ -538,13 +566,13 @@ def t_search(path: str = ".", pattern: str = "") -> tuple[str, dict[str, object]
 
 def t_glob(pattern: str) -> tuple[str, dict[str, object]]:
     import glob as _glob
+    pattern = _coerce_str(pattern, "pattern")
     try:
         matches = sorted(_glob.glob(pattern, recursive=True))
         result = "\n".join(matches) or "(no matches)"
         return result, {"result": result, "matches": matches}
     except Exception as e:
-        r = f"ERROR: {e}"
-        return r, {"result": r}
+        return _tool_error("glob", e)
 
 
 # Functions that interactively ask the user something — excluded in --non-interactive mode.
@@ -694,8 +722,7 @@ def t_search_files(command: str = '') -> tuple[str, dict[str, object]]:
         
         return human, {"result": matches}
     except Exception as e:
-        err = f"ERROR: {e}"
-        return err, {"result": err}
+        return _tool_error("t_search_files", e)
 
 TOOL_LIBRARY['t_search_files'] = t_search_files
 
@@ -718,7 +745,6 @@ def t_find_files(pattern: str = '', recursive: str = '') -> tuple[str, dict[str,
             human = f"Found {len(files)} file(s):\n" + "\n".join(files)
         return (human, {"result": files})
     except Exception as e:
-        err = f"ERROR: {e}"
-        return (err, {"result": err})
+        return _tool_error("t_find_files", e)
 
 TOOL_LIBRARY['t_find_files'] = t_find_files

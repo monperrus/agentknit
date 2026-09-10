@@ -2050,6 +2050,10 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     # in the spec are the caller's explicit choice and are advertised.
     declared_aliases = dict(schema.get("aliases") or {})
     legacy_aliases = {a: c for a, c in _LEGACY_TOOL_ALIASES.items() if a not in declared_aliases}
+    # Only expand legacy aliases when their canonical tool is actually part of
+    # this session — a custom minimal toolset (e.g. a single renamed "shell"
+    # tool) must not inherit retired-name plumbing for tools it never had.
+    legacy_aliases = {a: c for a, c in legacy_aliases.items() if c in tool_dispatch}
     if legacy_aliases:
         tools, tool_dispatch = _expand_aliases(tools, tool_dispatch, legacy_aliases, advertise=False)
     if declared_aliases:

@@ -223,3 +223,42 @@ def test_legacy_named_spec_keeps_its_own_tool() -> None:
     advertised = [(t.get("function") or t)["name"] for t in session["tools"]]
     assert advertised == ["execute_shell_command"]
     assert session["tool_dispatch"]["execute_shell_command"]["python_function"] == "t_run"
+
+
+def test_legacy_alias_skipped_when_canonical_tool_absent() -> None:
+    """A custom minimal toolset must not inherit retired-name plumbing.
+
+    A spec with a single renamed shell tool (e.g. "shell" → t_run) has no
+    "exec_shell" dispatch entry; expanding the legacy alias there only
+    produced a spurious warning.
+    """
+    import agentknit
+
+    schema = {
+        "model": "test-model",
+        "endpoint": "http://example.invalid/v1",
+        "status": "default",
+        "inferred_tool_schema": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "shell",
+                    "description": "",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+        "behaviour": {"call_delivery_mode": "structured_tool_calls"},
+        "tool_dispatch": {
+            "shell": {"python_function": "t_run", "param_map": {"cmd": "command"}},
+        },
+    }
+    session = agentknit.init_session(schema)
+
+    advertised = [(t.get("function") or t)["name"] for t in session["tools"]]
+    assert advertised == ["shell"]
+    assert "execute_shell_command" not in session["tool_dispatch"]

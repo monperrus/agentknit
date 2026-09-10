@@ -128,6 +128,10 @@ class _FakeResponse:
     def json(self):
         return self._json
 
+    def raise_for_status(self):
+        if not self.ok:
+            raise requests.exceptions.HTTPError(f"{self.status_code} error")
+
 
 def _client(base_url: str = "https://example.test/v1") -> OpenAI:
     return OpenAI(api_key="x", base_url=base_url, max_rpm=1000)
@@ -274,3 +278,63 @@ def test_rate_limit_wait_callback_emits_session_event():
     assert data["delay"] == 2.5
     assert data["resume_at"] == resume_at.isoformat()
     assert data["fmt"] == "  [rate-limited] waiting 2.5s …"
+
+
+# ── 5xx automatic retry with backoff ────────────────────────────────────────
+
+def test_retry_post_retries_502_with_exponential_backoff():
+    client = _client()
+    resp_ok = _FakeResponse(200, {}, {"choices": []})
+    calls = [_FakeResponse(502, {}, text="Bad Gateway")] * 5 + [resp_ok]
+
+    with patch("agentknit.openai_compat.requests.post", side_effect=calls):
+        with patch("agentknit.openai_compat.time.sleep") as sleep:
+            resp = client.chat.completions._retry_post("https://x", {}, {})
+
+    assert resp is resp_ok
+    assert [call.args[0] for call in sleep.call_args_list] == [5, 10, 20, 40, 80]
+
+
+def test_retry_post_gives_up_after_five_5xx_retries():
+    client = _client()
+    resp_502 = _FakeResponse(502, {}, text="Bad Gateway")
+
+    with patch("agentknit.openai_compat.requests.post",
+               return_value=resp_502) as post:
+        with patch("agentknit.openai_compat.time.sleep") as sleep:
+            with pytest.raises(requests.exceptions.HTTPError):
+                client.chat.completions._retry_post("https://x", {}, {})
+
+    assert post.call_count == 6  # initial attempt + 5 retries
+    assert [call.args[0] for call in sleep.call_args_list] == [5, 10, 20, 40, 80]
+
+
+def test_retry_post_honours_retry_after_header_on_5xx():
+    client = _client()
+    resp_503 = _FakeResponse(503, {"retry-after": "30"}, text="overloaded")
+    resp_ok = _FakeResponse(200, {}, {"choices": []})
+    calls = [resp_503, resp_ok]
+
+    def _fake_post(*args, **kwargs):
+        return calls.pop(0)
+
+    with patch("agentknit.openai_compat.requests.post", side_effect=_fake_post):
+        with patch("agentknit.openai_compat.time.sleep") as sleep:
+            resp = client.chat.completions._retry_post("https://x", {}, {})
+
+    assert resp is resp_ok
+    assert [call.args[0] for call in sleep.call_args_list] == [30]
+
+
+def test_retry_post_does_not_retry_other_client_errors():
+    client = _client()
+    resp_400 = _FakeResponse(400, {}, text="bad request")
+
+    with patch("agentknit.openai_compat.requests.post",
+               return_value=resp_400) as post:
+        with patch("agentknit.openai_compat.time.sleep") as sleep:
+            resp = client.chat.completions._retry_post("https://x", {}, {})
+
+    assert resp is resp_400  # returned as-is; create() raises via raise_for_status
+    assert post.call_count == 1
+    assert not sleep.called

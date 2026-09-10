@@ -52,6 +52,12 @@ _MAX_AUTO_RETRY_SECONDS = 6 * 3600
 # five times after the initial attempt, waiting 1, 2, 4, 8, then 16 minutes.
 _MAX_READ_TIMEOUT_RETRIES = 5
 _READ_TIMEOUT_INITIAL_DELAY_SECONDS = 60
+# 5xx answers (502 Bad Gateway, 503 overloaded, …) are usually a proxy hiccup
+# that clears in seconds: retry five times after the initial attempt, waiting
+# 5, 10, 20, 40, then 80 seconds (or the server's Retry-After when given).
+_MAX_SERVER_ERROR_RETRIES = 5
+_SERVER_ERROR_INITIAL_DELAY_SECONDS = 5
+_RETRYABLE_STATUS_CODES = frozenset({500, 502, 503, 504, 529})
 
 
 # ── rate limiter (token-bucket) ───────────────────────────────────────────────
@@ -266,6 +272,7 @@ class _Completions:
                     stream: bool = False, on_rate_limit_wait: "Callable[..., None] | None" = None,
                     on_request_attempt: "Callable[[Any], None] | None" = None) -> requests.Response:
         read_timeout_retries = 0
+        server_error_retries = 0
         while True:
             self._client._rate_limiter.acquire()
             try:
@@ -281,6 +288,20 @@ class _Completions:
                 print(
                     f"  [read-timeout] request timed out — retry "
                     f"{read_timeout_retries}/{_MAX_READ_TIMEOUT_RETRIES} in {delay // 60}m …",
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
+            if resp.status_code in _RETRYABLE_STATUS_CODES:
+                if server_error_retries >= _MAX_SERVER_ERROR_RETRIES:
+                    print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
+                    resp.raise_for_status()
+                server_error_retries += 1
+                delay = (_retry_delay_seconds(resp.headers)
+                         or _SERVER_ERROR_INITIAL_DELAY_SECONDS * (2 ** (server_error_retries - 1)))
+                print(
+                    f"  [HTTP {resp.status_code}] transient server error — retry "
+                    f"{server_error_retries}/{_MAX_SERVER_ERROR_RETRIES} in {delay:.0f}s …",
                     flush=True,
                 )
                 time.sleep(delay)

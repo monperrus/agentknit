@@ -1151,7 +1151,6 @@ def environment_context(model: str, version: "str | None" = None) -> str:
     """
     import getpass
     import platform
-    import tempfile
 
     lines = ["## Environment"]
 

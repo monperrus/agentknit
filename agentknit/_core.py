@@ -834,10 +834,24 @@ def dispatch(tool_name: str, args: dict[str, Any], tool_dispatch: dict[str, Any]
 
     try:
         result = fn(**kwargs)
+    except TypeError as e:
+        # Argument mismatch (missing/wrongly-named/unexpected parameter) is
+        # the model's fault — describe the expected signature so it can fix
+        # and retry the call in the next iteration.
+        import inspect
+        try:
+            sig = str(inspect.signature(fn))
+        except (TypeError, ValueError):
+            sig = "(...)"
+        r = (f"ERROR: invalid arguments for tool {tool_name!r}: {e}. "
+             f"Expected signature: {fn_name}{sig}. "
+             f"You supplied: {sorted(args.keys())}. "
+             f"Correct the argument names/values and call the tool again.")
+        return r, {"result": r}
     except Exception as e:
-        # Include the exception type (not just str(e)) plus the innermost
-        # frames so tool bugs like "'bool' object has no attribute
-        # 'splitlines'" are immediately locatable.
+        # Internal tool failure — include the exception type (not just
+        # str(e)) plus the innermost frames so bugs like "'bool' object has
+        # no attribute 'splitlines'" are immediately locatable.
         tb = traceback.extract_tb(sys.exc_info()[2])
         inner = ", ".join(f"{os.path.basename(f.filename)}:{f.lineno} in {f.name}"
                           for f in tb[-3:])
@@ -3012,10 +3026,35 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                     else:
                         try:
                             args = json.loads(tc.function.arguments)
-                        except json.JSONDecodeError:
-                            args = {}
-                        if not isinstance(args, dict):
-                            args = {}
+                            if not isinstance(args, dict):
+                                raise ValueError("arguments must be a JSON object")
+                        except (json.JSONDecodeError, ValueError) as parse_exc:
+                            # Feed the malformed call back to the model so it
+                            # can emit corrected JSON on the next iteration
+                            # instead of silently dispatching with {} args.
+                            bad = tc.function.arguments or ""
+                            result = (f"ERROR: malformed tool call arguments for "
+                                      f"{tc.function.name!r}: {parse_exc}. "
+                                      f"Received: {bad[:200]!r}. "
+                                      f"Re-emit the tool call with valid JSON "
+                                      f"object arguments.")
+                            _write_journal_record(session, {
+                                "type": "tool_start", "call_id": tc.id,
+                                "name": tc.function.name, "args": {}})
+                            _write_journal_record(session, {
+                                "type": "tool_end", "call_id": tc.id,
+                                "name": tc.function.name, "result": result,
+                                "outcome": "error"})
+                            _emit(session, "tool_result", name=tc.function.name,
+                                  result=result, streamed=False, fmt=fmt_result(result))
+                            _log(session, {"type": "tool_error",
+                                           "name": tc.function.name,
+                                           "result": result,
+                                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                            _append_message({"role": "tool", "tool_call_id": tc.id,
+                                             "content": result,
+                                             "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                            continue
                     result = _handle_tool_call(tc.function.name, args, session,
                                                call_id=tc.id)
                     _append_message({"role": "tool", "tool_call_id": tc.id, "content": result,

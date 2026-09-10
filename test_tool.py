@@ -474,3 +474,72 @@ def test_write_accepts_bool_content(tmp_path):
     result, _ = t_write(path=str(f), content=False)  # type: ignore[arg-type]
     assert result.startswith("OK:")
     assert f.read_text() == "False"
+
+
+def test_dispatch_type_error_guides_model_to_fix():
+    """Wrong/missing args produce an actionable error naming the signature."""
+    from agentknit._core import dispatch
+
+    result, _ = dispatch("str_replace", {"path": "/x", "old_string": "a"},
+                         {"str_replace": {"python_function": "t_update",
+                                          "param_map": {"path": "path",
+                                                        "old_str": "old",
+                                                        "new_str": "new"}}})
+    assert result.startswith("ERROR: invalid arguments for tool 'str_replace'")
+    assert "t_update(" in result  # expected signature shown
+    assert "old_string" in result  # the offending key is listed
+    assert "call the tool again" in result
+
+
+def test_malformed_tool_call_json_fed_back_to_model(monkeypatch):
+    """Structured call with unparseable JSON arguments becomes a tool-role
+    error message (not a silent {} dispatch), so the model sees it and fixes
+    the call on the next iteration."""
+    import agentknit._core as core
+    from agentknit.openai_compat import (_Choice, _Function, _Message,
+                                         _Response, _ToolCall, _Usage)
+
+    calls: list[int] = []
+
+    def fake_complete(client, session, **kwargs):
+        def usage():
+            return _Usage(prompt_tokens=1, completion_tokens=1,
+                          total_tokens=2, has_cache_proof=True)
+        if calls:
+            resp = _Response([_Choice(_Message("assistant", "done", None))],
+                             usage())
+            resp.usage = usage()
+            return resp
+        calls.append(1)
+        tc = _ToolCall("c1", _Function("read_file", '{"path": '), type="function")
+        resp = _Response([_Choice(_Message("assistant", None, [tc]))], usage())
+        resp.usage = usage()
+        return resp
+
+    monkeypatch.setattr(core, "_complete", fake_complete)
+
+    import tempfile
+    from pathlib import Path
+
+    session = {
+        "messages": [],
+        "tools": [],
+        "structured": True,
+        "usage_totals": {"prompt": 0, "completion": 0, "total": 0,
+                         "cached": 0, "cache_write": 0},
+        "tool_dispatch": {"read_file": {"python_function": "t_read"}},
+        "non_interactive": True,
+        "cache_key": "test",
+        "options": ["exclude-prompt_cache_key"],
+        "on_event": lambda *a, **k: None,
+        "strict_cache_proof": False,
+        "log_path": Path(tempfile.mkdtemp()) / "log.jsonl",
+        "session_id": "test-session",
+    }
+
+    result = core.run_turn(object(), "test/model", session, "hi")
+    tool_msgs = [m for m in session["messages"] if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert "malformed tool call arguments" in tool_msgs[0]["content"]
+    assert "read_file" in tool_msgs[0]["content"]
+    assert result.final_reply == "done"  # turn recovered and finished

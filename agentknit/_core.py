@@ -77,6 +77,13 @@ Event types
     had expired (last message older than ``CACHE_COLD_GAP_SECONDS``).
     Strict cache-proof enforcement is relaxed for this case.  Data:
     ``age``, ``fmt``.
+``cache_proof_missing``
+    A call after the first exposed no cache accounting / no cache hit while
+    strict cache mode is on.  The turn continues automatically (the tokens
+    are already paid); the warning is meant to be shown temporarily, e.g. in
+    a status bar, until a later call reports a cache read or write (which
+    sets ``session["_cache_status"]`` back to ``"ok"``).  Data:
+    ``cached_tokens`` / ``prompt_tokens`` when available, ``fmt``.
 ``rate_limit_wait``
     Emitted before sleeping through a retryable HTTP 429.  Data:
     ``delay`` (seconds), ``resume_at`` (ISO timestamp), ``fmt``.
@@ -967,29 +974,54 @@ def _last_message_age_seconds(session: Session) -> float | None:
 
 
 def _enforce_cache_proof(session: Session, usage: object) -> None:
-    """Fail closed when strict cache mode does not observe a cache hit.
+    """Fail closed at the start of the session; warn-and-continue afterwards.
+
+    Strict cache mode only *raises* when the very first LLM call exposes no
+    cache-proof field: caching is then not working at all, and aborting is
+    cheap because nothing beyond one call has been paid for.  From the
+    second call on, the token price has already been paid, so a missing
+    cache proof is downgraded to a ``cache_proof_missing`` warning event and
+    the turn continues automatically.  ``session["_cache_status"]`` is set
+    to ``"missing"`` so a UI can show a temporary status-bar warning; it
+    flips to ``"ok"`` (clearing the warning) as soon as any call reports a
+    cache read or write.
 
     A resumed session whose last message is older than
     :data:`CACHE_COLD_GAP_SECONDS` is assumed to be a *cold resume*: the
     provider's prefix cache has expired through no fault of the caller, so
-    the first post-resume call is allowed to miss without raising.  A dim
-    notice is emitted instead so the output is not broken.
+    the first post-resume call is allowed to miss without even a warning
+    escalation.  A dim notice is emitted instead so the output is not broken.
 
     Below ``session["min_cacheable_tokens"]`` prompt tokens, providers cache
     nothing by design (e.g. Anthropic Claude Haiku ~4096, GPT-5.6-class
     ~1024) — such calls report ``cached_tokens == 0`` even though caching
     works fine for larger prompts.  If the current call's prompt is below
     that floor, a zero-cache response is treated as expected and skipped
-    rather than raised.  See :data:`DEFAULT_MIN_CACHEABLE_TOKENS`.
+    rather than warned about.  See :data:`DEFAULT_MIN_CACHEABLE_TOKENS`.
     """
     if not session.get("strict_cache_proof", True):
-        return
-    if session.get("llm_call_count", 0) <= 1:
         return
 
     has_cache_proof = getattr(usage, "has_cache_proof", False)
     cached_tokens = getattr(usage, "cached_tokens", 0) or 0
     prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    cache_creation = getattr(usage, "cache_creation_tokens", 0) or 0
+
+    # A genuine cache read or write proves prefix caching works; remember it
+    # so any temporary "no cache proof" status-bar warning can clear itself.
+    if has_cache_proof and (cached_tokens > 0 or cache_creation > 0):
+        session["_cache_status"] = "ok"
+
+    # Beginning of the session: the first call must expose cache accounting,
+    # otherwise strict cache mode cannot work at all.  Aborting here is
+    # cheap — nothing beyond this call has been paid for.
+    if session.get("llm_call_count", 0) <= 1:
+        if not has_cache_proof and cache_creation <= 0:
+            raise CacheProofError(
+                "Strict cache mode requires explicit cache accounting from the server "
+                "on the first LLM call, but this response exposed no cache-proof field."
+            )
+        return
 
     # Detect a cold resume: the caller paused long enough that the provider's
     # prefix cache has surely expired.  Don't break the turn for something
@@ -1006,11 +1038,17 @@ def _enforce_cache_proof(session: Session, usage: object) -> None:
         return
 
     if not has_cache_proof:
-        raise CacheProofError(
-            "Strict cache mode requires explicit cache accounting from the server "
-            "after the first LLM call, but this response exposed no cache-proof field."
+        # Past the first call the token price is already paid; aborting would
+        # only waste it.  Continue automatically with a temporary warning.
+        session["_cache_status"] = "missing"
+        notice = (
+            f"{YEL}⚠ No cache accounting from the server after the first call; "
+            f"continuing without strict cache proof (tokens for this turn are "
+            f"already paid). Warning clears on the next observed cache hit.{RESET}"
         )
-    cache_creation = getattr(usage, "cache_creation_tokens", 0) or 0
+        _emit(session, "cache_proof_missing", cached_tokens=cached_tokens,
+              prompt_tokens=prompt_tokens, fmt=notice)
+        return
     if cached_tokens <= 0 and cache_creation <= 0:
         min_cacheable = session.get("min_cacheable_tokens", DEFAULT_MIN_CACHEABLE_TOKENS) or 0
         if min_cacheable and prompt_tokens < min_cacheable:
@@ -1024,12 +1062,18 @@ def _enforce_cache_proof(session: Session, usage: object) -> None:
             return
         # Some servers only cache eligible prefixes of at least N tokens (e.g.
         # Anthropic Claude Haiku ~4096, GPT-5.6-class models ~1024). Configure
-        # session["min_cacheable_tokens"] to that floor to avoid this raising
-        # on legitimately small prompts.
-        raise CacheProofError(
-            "Strict cache mode requires cached_tokens > 0 after the first LLM call, "
-            "but the server reported no cache hit."
+        # session["min_cacheable_tokens"] to that floor to avoid warning on
+        # legitimately small prompts.  As above, warn instead of aborting —
+        # the turn's tokens are already paid for.
+        session["_cache_status"] = "missing"
+        notice = (
+            f"{YEL}⚠ No cache hit after the first call "
+            f"(prompt {prompt_tokens:,} tokens); continuing without strict cache "
+            f"proof. Warning clears on the next observed cache hit.{RESET}"
         )
+        _emit(session, "cache_proof_missing", cached_tokens=cached_tokens,
+              prompt_tokens=prompt_tokens, fmt=notice)
+        return
     if cached_tokens <= 0 and cache_creation > 0:
         # A cache WRITE is just as much proof that prefix caching works: this is
         # the first call whose prefix crossed the provider's minimum cacheable
@@ -1929,6 +1973,10 @@ class Session(TypedDict):
     _content_was_streamed: NotRequired[bool]
     _durable_capture: NotRequired[bool]
     _cache_cold_warned: NotRequired[bool]
+    # "ok" once a cache read/write has been observed, "missing" when a
+    # post-first-call response exposed no cache proof.  A UI can surface
+    # "missing" as a temporary status-bar warning and clear it on "ok".
+    _cache_status: NotRequired[str]
     _continue_requested: NotRequired[bool]
 
 
@@ -2189,6 +2237,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         "max_output_tokens": max_output_tokens or schema.get("max_output_tokens"),
         "strict_cache_proof": strict_cache_proof,
         "llm_call_count":  0,
+        "_cache_status":   "ok",
         "on_event":        on_event or _default_event_handler,
         "streaming":       streaming,
         "options":         schema.get("options") or [],
@@ -3099,11 +3148,15 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                     _emit(session, "cache_cold", age=int(age or 0), fmt=notice)
                     session["_cache_cold_warned"] = True
                 else:
-                    err = ("Strict cache mode requires usage metadata on every LLM call after the first, "
-                           "but the server returned no usage block.")
-                    _emit_and_log_error(session, RuntimeError(err), err,
-                                        f"\n{RED}Error: {err}{RESET}", client=client)
-                    return _session_result(session)
+                    # Tokens for this call are already paid; aborting would
+                    # only waste them.  Continue with a temporary warning.
+                    session["_cache_status"] = "missing"
+                    notice = (
+                        f"{YEL}⚠ No usage metadata from the server after the first call; "
+                        f"continuing without strict cache proof. Warning clears on the "
+                        f"next observed cache hit.{RESET}"
+                    )
+                    _emit(session, "cache_proof_missing", fmt=notice)
             _apply_compaction_policy(client, model, session, usage, phase="mid_turn")
 
             if total_tokens > max_tokens:

@@ -87,12 +87,18 @@ in the same script — no monkey-patching of `create_client`.
 
 `agentknit` now runs in strict cache-proof mode by default.
 
-After the first LLM call in a session, every later call must return explicit
-server-side cache accounting with a nonzero cache hit. If the provider does
-not expose cache-proof fields, or reports `cached_tokens = 0`, the run aborts.
+The **first** LLM call of a session must return explicit server-side cache
+accounting (a cache-proof field or a cache write). If it does not, caching
+cannot work at all and the run aborts — cheaply, before anything else has
+been paid for. This is fail-closed by design: models that cannot prove cache
+reuse should be treated as unsupported for cache-sensitive workloads.
 
-This is fail-closed by design: models that cannot prove cache reuse should be
-treated as unsupported for cache-sensitive workloads.
+After the first call, a response with no cache accounting (or no cache hit
+on a prompt above the provider's minimum cacheable size) no longer aborts:
+the turn's tokens are already paid, so the run continues automatically and
+emits a temporary `cache_proof_missing` warning instead. UIs can surface it
+in a status bar via `session["_cache_status"]` (`"missing"` while the
+warning is active, back to `"ok"` on the next observed cache hit).
 
 The usage layer normalizes several provider response shapes into one check,
 including:

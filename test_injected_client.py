@@ -37,7 +37,8 @@ class RecordingOpenAI(SubprocessOpenAI):
         self.requests.append({"model": model, "messages": list(messages),
                               **kwargs})
         msg = _Message(role="assistant", content=self._reply, tool_calls=None)
-        usage = _Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+        usage = _Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2,
+                       has_cache_proof=True)
         return _Response(choices=[_Choice(msg)], usage=usage)
 
 

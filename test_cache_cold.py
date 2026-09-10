@@ -1,9 +1,13 @@
 """Tests for the cold-resume cache-proof relaxation in agentknit._core.
 
-Strict cache-proof mode normally aborts a turn when the provider reports no
-cache hit after the first LLM call.  When a session is resumed after a long
-pause, the provider's prefix cache has expired through no fault of the
-caller, so enforcing the check would spuriously break the output.  These
+Strict cache-proof mode only aborts on the *first* LLM call of a session —
+if the server exposes no cache accounting at all, caching cannot work and
+stopping is cheap.  From the second call on, the turn's tokens are already
+paid for, so a missing cache proof only emits a temporary
+``cache_proof_missing`` warning (surfaced via ``session["_cache_status"]``)
+and the turn continues automatically.  When a session is resumed after a
+long pause, the provider's prefix cache has expired through no fault of the
+caller, so even the warning is softened to a ``cache_cold`` notice.  These
 tests pin the behaviour described in :func:`_enforce_cache_proof`.
 """
 
@@ -25,6 +29,8 @@ from agentknit.exceptions import CacheProofError
 
 class _Usage:
     """Minimal stand-in for the Usage object produced by openai_compat."""
+
+    cache_creation_tokens = 0
 
     def __init__(self, *, has_cache_proof: bool = False, cached_tokens: int = 0) -> None:
         self.has_cache_proof = has_cache_proof
@@ -51,6 +57,7 @@ def _session(
         "strict_cache_proof": strict,
         "on_event": _on_event,
         "_event_handlers": {},
+        "_cache_status": "ok",
     }
 
 
@@ -78,7 +85,7 @@ def test_age_seconds_ignores_garbage_timestamp():
     assert _last_message_age_seconds(session) is None
 
 
-# ── _enforce_cache_proof: disabled / first call ──────────────────────────────
+# ── _enforce_cache_proof: disabled ───────────────────────────────────────────
 
 def test_enforce_noop_when_strict_disabled():
     session = _session(last_ts=_iso(10_000), strict=False)
@@ -86,40 +93,69 @@ def test_enforce_noop_when_strict_disabled():
     _enforce_cache_proof(session, _Usage(has_cache_proof=False, cached_tokens=0))
 
 
-def test_enforce_noop_on_first_call():
-    session = _session(last_ts=_iso(10_000), llm_call_count=1)
-    _enforce_cache_proof(session, _Usage(has_cache_proof=False, cached_tokens=0))
+# ── _enforce_cache_proof: first call (start of session) ──────────────────────
 
-
-# ── _enforce_cache_proof: hot path still raises ──────────────────────────────
-
-def test_enforce_raises_on_miss_within_cache_window():
-    # Recent message: cache should still be warm, so a miss is a real error.
-    session = _session(last_ts=_iso(60))
+def test_enforce_raises_on_first_call_without_cache_proof():
+    # Beginning of the session: no cache accounting at all means caching
+    # cannot work, and aborting is cheap — only one call has been paid for.
+    session = _session(last_ts=_iso(60), llm_call_count=1)
     with pytest.raises(CacheProofError):
         _enforce_cache_proof(session, _Usage(has_cache_proof=False, cached_tokens=0))
 
 
-def test_enforce_raises_when_no_cache_proof_within_window():
-    session = _session(last_ts=_iso(60))
-    with pytest.raises(CacheProofError):
-        _enforce_cache_proof(session, _Usage(has_cache_proof=False, cached_tokens=123))
+def test_enforce_ok_on_first_call_with_cache_proof():
+    session = _session(last_ts=_iso(60), llm_call_count=1)
+    _enforce_cache_proof(session, _Usage(has_cache_proof=True, cached_tokens=0))
+
+
+def test_enforce_ok_on_first_call_cache_write():
+    class _U(_Usage):
+        cache_creation_tokens = 100
+    session = _session(last_ts=_iso(60), llm_call_count=1)
+    _enforce_cache_proof(session, _U(has_cache_proof=False, cached_tokens=0))
+    assert session["_cache_status"] == "ok"
+
+
+# ── _enforce_cache_proof: after the first call → warn and continue ───────────
+
+def test_enforce_warns_on_miss_within_cache_window():
+    # Recent message: cache should still be warm, but the turn's tokens are
+    # already paid, so continue with a temporary warning instead of aborting.
+    session, events = _capturing_session(_iso(60))
+    _enforce_cache_proof(session, _Usage(has_cache_proof=False, cached_tokens=0))
+    assert [e[0] for e in events] == ["cache_proof_missing"]
+    assert session["_cache_status"] == "missing"
+
+
+def test_enforce_warns_when_no_cache_proof_within_window():
+    session, events = _capturing_session(_iso(60))
+    _enforce_cache_proof(session, _Usage(has_cache_proof=False, cached_tokens=123))
+    assert [e[0] for e in events] == ["cache_proof_missing"]
+    assert session["_cache_status"] == "missing"
+
+
+def test_cache_hit_clears_temporary_warning():
+    session, events = _capturing_session(_iso(60))
+    _enforce_cache_proof(session, _Usage(has_cache_proof=False, cached_tokens=0))
+    assert session["_cache_status"] == "missing"
+    _enforce_cache_proof(session, _Usage(has_cache_proof=True, cached_tokens=999))
+    assert session["_cache_status"] == "ok"
 
 
 # ── _enforce_cache_proof: cold resume ────────────────────────────────────────
-
-def test_cold_resume_does_not_raise_on_miss():
-    session, events = _capturing_session(_iso(CACHE_COLD_GAP_SECONDS + 600))
-    # No raise, and a cache_cold event is emitted.
-    _enforce_cache_proof(session, _Usage(has_cache_proof=False, cached_tokens=0))
-    assert events and events[0][0] == "cache_cold"
-
 
 def _capturing_session(last_ts: str | None, **kw) -> tuple[dict, list[tuple[str, dict]]]:
     events: list[tuple[str, dict]] = []
     session = _session(last_ts=last_ts, **kw)
     session["on_event"] = lambda et, data: events.append((et, data))
     return session, events
+
+
+def test_cold_resume_does_not_raise_on_miss():
+    session, events = _capturing_session(_iso(CACHE_COLD_GAP_SECONDS + 600))
+    # No raise, and a cache_cold event is emitted.
+    _enforce_cache_proof(session, _Usage(has_cache_proof=False, cached_tokens=0))
+    assert events and events[0][0] == "cache_cold"
 
 
 def test_cold_resume_emits_cache_cold_event():
@@ -138,9 +174,10 @@ def test_cold_resume_with_real_cache_hit_does_not_warn():
     assert "_cache_cold_warned" not in session
 
 
-def test_boundary_just_under_threshold_still_raises():
-    # One second under the threshold: still "warm", so a miss raises.
+def test_boundary_just_under_threshold_warns_not_cold():
+    # One second under the threshold: still "warm", so the miss gets the
+    # (temporary) missing-proof warning rather than the cold-resume notice.
     session, events = _capturing_session(_iso(CACHE_COLD_GAP_SECONDS - 1))
-    with pytest.raises(CacheProofError):
-        _enforce_cache_proof(session, _Usage(has_cache_proof=False, cached_tokens=0))
-    assert not events
+    _enforce_cache_proof(session, _Usage(has_cache_proof=False, cached_tokens=0))
+    assert [e[0] for e in events] == ["cache_proof_missing"]
+    assert session["_cache_status"] == "missing"

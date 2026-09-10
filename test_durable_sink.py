@@ -69,7 +69,7 @@ def test_request_is_committed_before_submit(tmp_path: Path) -> None:
             usage = SimpleNamespace(prompt_tokens=1, completion_tokens=1,
                                     total_tokens=2, cached_tokens=0,
                                     cache_creation_tokens=0,
-                                    has_cache_proof=False)
+                                    has_cache_proof=True)
             return SimpleNamespace(choices=[SimpleNamespace(message=msg)], usage=usage,
                                    provider=None, reasoning=None)
 

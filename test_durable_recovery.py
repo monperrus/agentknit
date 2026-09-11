@@ -76,6 +76,23 @@ def test_handle_tool_call_writes_tool_start_and_end(tmp_path, monkeypatch):
     assert types == ["tool_start", "tool_end"]
 
 
+def test_handle_tool_call_unknown_tool_feeds_error_back(tmp_path, monkeypatch):
+    """Unknown tool: error becomes the tool result, loop continues (no SystemExit)."""
+    session = _session(tmp_path, monkeypatch)
+    monkeypatch.setattr(core._tool_module, "_tool_context",
+                        MagicMock(session_id="s", tool_dispatch={}))
+
+    result = _handle_tool_call("exec_command", {"command": "ls"}, session)
+
+    assert result.startswith("ERROR: no dispatch entry for tool 'exec_command'")
+    assert "'read_file'" in result  # available tools are listed
+    state = replay_journal(_journal_path("test/model", session["session_id"]))
+    assert state.pending_tool_calls == []
+    lines = _journal_path("test/model", session["session_id"]).read_text().splitlines()
+    types = [json.loads(ln)["type"] for ln in lines]
+    assert types == ["tool_start", "tool_end"]
+
+
 def test_handle_tool_call_crash_mid_tool_leaves_pending(tmp_path, monkeypatch):
     session = _session(tmp_path, monkeypatch)
     session["tool_dispatch"]["read_file"] = {

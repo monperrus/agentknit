@@ -3008,20 +3008,14 @@ def _handle_tool_call(
                     name, args, entry, session={"session_id": session.get("session_id", "")})
             streamed = bool(log_data.pop("streamed", False))
         except FatalToolDispatchError as e:
-            result = str(e)
-            # A fatal outcome is still an outcome: recovery must never leave
-            # this call looking merely in-flight.
-            if journal is not None:
-                _write_journal_record(session, {"type": "tool_end", "call_id": call_id,
-                                                "name": name, "result": result,
-                                                "outcome": "fatal_error"})
-            _emit(session, "tool_result", name=name, result=result, streamed=False,
-                  fmt=fmt_result(result))
-            _log(session, {"type": "fatal_error", "name": name,
-                           "python_function": pf_name,
-                           "result": result,
-                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-            raise SystemExit(2) from e
+            # Unknown tool name: the model's mistake, not a crash. Feed the
+            # error back as the tool result so the model can retry with a
+            # tool that actually exists; the loop must continue.
+            available = ", ".join(sorted(repr(t) for t in tool_dispatch)) or "(none)"
+            result = (f"{e}. Available tools: {available}. "
+                      f"Call one of the available tools instead.")
+            log_data = {"result": result}
+            streamed = False
         except Exception as exc:
             # The caller may choose how to surface the exception, but the
             # durable stream must record the observable failure first.

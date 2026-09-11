@@ -4,3 +4,4 @@ dist/
 build/
 *.pyc
 agent_spec_*.json
+plan*.md

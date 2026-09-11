@@ -8,6 +8,7 @@ Features:
 * Fail-closed strict cache-proof mode for saving your $$$$$
 * Rich event system (`tool_call`, `content_delta`, `usage`, …) for logging/TUI/dashboards
 * Automatic context compaction keeps long sessions inside the token budget
+* Model-facing [token awareness](https://www.monperrus.net/martin/token-awareness): a true countdown in the model's context, with a checkpoint reminder before compaction
 * Bubblewrap-sandboxed tool execution for untrusted replay workloads
 * `rtk` integration cuts shell tool output tokens by 60–90%
 

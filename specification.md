@@ -32,6 +32,24 @@ An agent spec is a JSON file that describes how agentknit should connect to a mo
 | `behaviour` | object | no | Agent behaviour knobs (see [Behaviour object](#behaviour-object)). |
 | `options` | array of strings | no | Extra feature flags (see [Options](#options)). |
 | `max_output_tokens` | integer | no | Override the default `max_tokens` value sent with every API request. |
+| `context_window` | integer | no | Declared context window size of the model in tokens.  Currently used as the default denominator for the token-awareness countdown (see [Token awareness](#token-awareness)); raising it past the compaction trigger is deliberate over-provisioning — compaction still runs at the trigger. |
+
+### Token awareness
+
+Model-facing token awareness (see [Token Awareness in Coding Agents](https://www.monperrus.net/martin/token-awareness)): the *true* token count, injected into the model's own context so it can pace itself and checkpoint before compaction.  Three injections, all derived exclusively from the server-reported `usage.prompt_tokens` — never padded or fabricated:
+
+1. Session start: the system prompt gains `<budget:token_budget>{budget}</budget:token_budget>` plus a capacity-framed persistence instruction ("when it fills, agentknit automatically compacts … this is normal operation, not a deadline").
+2. After every Nth LLM call (default every call), the next tool-result message is suffixed with `<system_warning>Token usage: {prompt}/{budget}; {remaining} remaining</system_warning>` — Claude-API semantics, without creating extra messages.  Turns that end with a plain-text reply get nothing.
+3. When `remaining` crosses below `token_awareness_reminder_tokens` (edge-triggered), a `<context_window_reminder>` checkpoint protocol is appended once: write progress notes, keep working, compaction is normal.  It re-arms after remaining rises back above the threshold (post-compaction, the countdown re-opens naturally).
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `token_awareness_enabled` | boolean | no | Master switch (default `true`).  When `false` none of the three injections happens. |
+| `token_awareness_budget_tokens` | integer | no | Countdown denominator declared in the system prompt.  Resolution order: explicit value → `context_window` → `compaction_trigger_tokens` (100k default) — always a true, operative number. |
+| `token_awareness_reminder_tokens` | integer | no | Remaining-tokens threshold that fires the checkpoint reminder (default `6144`, matching Codex's `reminder_threshold_tokens`). |
+| `token_awareness_update_every` | integer | no | Inject the countdown every Nth LLM call (default `1`). |
+
+All four are also accepted as keyword arguments to `init_session` / `run_task` / `run`.  A `token_budget` event (`used`, `budget`, `remaining`, `below_reminder_threshold`) is emitted alongside `usage`, and usage log records gain `token_budget_remaining`.
 | `provider` | string | no | OpenRouter provider hint pinned for the session. |
 | `provider_api_support` | object | no | Capability map written by llmprobe; `provider_api_support.streaming.supported` enables streaming. |
 

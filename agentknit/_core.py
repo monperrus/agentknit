@@ -197,6 +197,36 @@ CACHE_COLD_GAP_SECONDS = 3600
 # prompts don't spuriously trip strict cache-proof mode.
 DEFAULT_MIN_CACHEABLE_TOKENS = 0
 
+# Token awareness (model-facing): inject the true token count into the
+# model's own context so it can pace itself and checkpoint before
+# compaction.  The default budget is the compaction trigger — literally
+# the window the model experiences between compactions, so the number is
+# both true and operative.  100k is a "reasonable" budget in TALE's terms
+# (their token-elasticity backfires happened at 10–250 tokens).  The
+# reminder threshold matches Codex's reminder_threshold_tokens.
+DEFAULT_TOKEN_AWARENESS_REMINDER_TOKENS = 6144
+
+_TOKEN_AWARENESS_SYSTEM = (
+    "<budget:token_budget>{budget}</budget:token_budget>\n"
+    "Your context window holds {budget} tokens; the usage counter after each "
+    "tool call shows how full it currently is. When it fills, agentknit "
+    "automatically compacts older context into a summary and you continue in "
+    "fresh space — this is normal operation, not a deadline. Do not stop "
+    "tasks early or take shortcuts due to context capacity; there is always "
+    "enough room to finish properly."
+)
+
+_TOKEN_AWARENESS_REMINDER = (
+    "<context_window_reminder>\n"
+    "Your context window is nearly full; {remaining} tokens remain before "
+    "compaction. Write concise progress notes in your next reply — goal, "
+    "decisions, progress, learnings, next steps — then keep working. "
+    "Agentknit will compact earlier context into a summary and you continue "
+    "in fresh space. Do not stop the task; compaction is normal operation, "
+    "not a deadline.\n"
+    "</context_window_reminder>"
+)
+
 _COMPACTION_PROMPT = (
     "Summarize the conversation above into a dense, structured summary "
     "optimized for continuing a coding task. Preserve all state needed to "
@@ -1350,6 +1380,46 @@ def _open_log(model: str, session_id: str, session_dir: str | Path | None = None
     return path
 
 
+def _token_awareness_injection(session: Session, usage: object) -> str | None:
+    """Model-facing countdown text to suffix onto the next tool result.
+
+    Derived exclusively from the server-reported prompt size of the last
+    call — never padded or fabricated (a fake counter is a bug, not a
+    feature).  Returns None when the feature is off, when usage data is
+    missing, or when this call is skipped by ``update_every``.
+    """
+    if not session.get("token_awareness_enabled"):
+        return None
+    prompt_tok = getattr(usage, "prompt_tokens", 0) or 0
+    if prompt_tok <= 0:
+        return None
+    budget = session.get("token_awareness_budget_tokens", 0) or 0
+    if budget <= 0:
+        return None
+    update_every = max(1, session.get("token_awareness_update_every", 1) or 1)
+    if session.get("llm_call_count", 0) % update_every != 0:
+        return None
+    remaining = max(0, budget - prompt_tok)
+    reminder_threshold = session.get("token_awareness_reminder_tokens", 0) or 0
+    # Edge-triggered: fire the checkpoint reminder once when remaining
+    # crosses below the threshold; re-arm after it rises back above
+    # (post-compaction, the countdown re-opens naturally).
+    last_remaining = session.get("token_awareness_last_remaining")
+    below = remaining < reminder_threshold
+    crossed = below and not (
+        last_remaining is not None and last_remaining < reminder_threshold)
+    session["token_awareness_last_remaining"] = remaining
+    _emit(session, "token_budget", used=prompt_tok, budget=budget,
+          remaining=remaining, below_reminder_threshold=below,
+          fmt=f"{DIM}{MAG}[budget] {remaining:,}/{budget:,} tokens remaining"
+              f"{' (below reminder threshold)' if below else ''}{RESET}")
+    warning = (f"<system_warning>Token usage: {prompt_tok}/{budget}; "
+               f"{remaining} remaining</system_warning>")
+    if crossed:
+        warning += "\n" + _TOKEN_AWARENESS_REMINDER.format(remaining=remaining)
+    return warning
+
+
 def _log(session: Session, record: "dict[str, Any]") -> None:
     record["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
     record["cwd"] = os.getcwd()
@@ -1437,6 +1507,15 @@ def _save_messages_snapshot(session: Session) -> None:
             "tools": tool_names,
             "agentknit_commit": _agentknit_commit(),
             "auth": dict(session.get("auth") or {}),
+            # Token-awareness knobs so a resumed session keeps identical
+            # countdown semantics (informational; runtime state lives in
+            # the session dict itself).
+            "token_awareness": {
+                "enabled": bool(session.get("token_awareness_enabled")),
+                "budget_tokens": session.get("token_awareness_budget_tokens"),
+                "reminder_tokens": session.get("token_awareness_reminder_tokens"),
+                "update_every": session.get("token_awareness_update_every"),
+            },
         },
         "messages": annotated,
     }
@@ -1977,6 +2056,15 @@ class Session(TypedDict):
     compaction_policy: "str | Callable[..., bool]"
     compaction_min_chars: int
     compaction_last_prompt_tokens: int
+    # token awareness (model-facing countdown)
+    # NotRequired: sessions snapshotted before token awareness existed lack
+    # these keys; the restore path backfills defaults (enabled, counting
+    # down from the compaction trigger).  New sessions always set all five.
+    token_awareness_enabled: NotRequired[bool]          # master switch (default on)
+    token_awareness_budget_tokens: NotRequired[int]     # countdown denominator
+    token_awareness_reminder_tokens: NotRequired[int]   # checkpoint-protocol threshold
+    token_awareness_update_every: NotRequired[int]      # inject every Nth LLM call
+    token_awareness_last_remaining: NotRequired[int | None]  # edge-trigger state; None = no observation yet
     # durability
     # NotRequired: sessions saved before the durable-recovery feature lack
     # this key; the restore path defaults it to True.
@@ -2016,6 +2104,10 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                  compaction_policy: "str | Callable[..., bool] | None" = None,
                  compaction_min_chars: int | None = None,
                  min_cacheable_tokens: int | None = None,
+                 token_awareness_enabled: bool | None = None,
+                 token_awareness_budget_tokens: int | None = None,
+                 token_awareness_reminder_tokens: int | None = None,
+                 token_awareness_update_every: int | None = None,
                  durable: bool | None = None,
                  session_dir: str | Path | None = None,
                  durable_sink: DurableSink | None = None,
@@ -2150,6 +2242,17 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                                            restored.get("session_dir"))
         # Reset compaction state so the new session starts fresh.
         restored["compaction_last_prompt_tokens"] = 0
+        # Old snapshots predate token awareness: backfill defaults so the
+        # restored session stays valid (enabled, counting down from the
+        # compaction trigger — the window actually experienced).
+        restored.setdefault("token_awareness_enabled", True)
+        restored.setdefault("token_awareness_budget_tokens",
+                            restored.get("compaction_trigger_tokens",
+                                         DEFAULT_COMPACTION_TRIGGER_TOKENS))
+        restored.setdefault("token_awareness_reminder_tokens",
+                            DEFAULT_TOKEN_AWARENESS_REMINDER_TOKENS)
+        restored.setdefault("token_awareness_update_every", 1)
+        restored.setdefault("token_awareness_last_remaining", None)
         # Replace event handler if a new one was provided.
         if on_event is not None:
             restored["on_event"] = on_event
@@ -2175,6 +2278,14 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             restored["compaction_min_chars"] = compaction_min_chars
         if min_cacheable_tokens is not None:
             restored["min_cacheable_tokens"] = min_cacheable_tokens
+        if token_awareness_enabled is not None:
+            restored["token_awareness_enabled"] = token_awareness_enabled
+        if token_awareness_budget_tokens is not None:
+            restored["token_awareness_budget_tokens"] = token_awareness_budget_tokens
+        if token_awareness_reminder_tokens is not None:
+            restored["token_awareness_reminder_tokens"] = token_awareness_reminder_tokens
+        if token_awareness_update_every is not None:
+            restored["token_awareness_update_every"] = token_awareness_update_every
         if durable is not None:
             restored["durable"] = durable
         # Reopen (or start) the session journal on restore.
@@ -2216,6 +2327,31 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
 
     # Environment awareness: user identity, git status, cwd, OS, date, scratchpad.
     sys_msg += "\n\n" + environment_context(model, schema.get("version"))
+
+    # Token awareness: resolve the four knobs (explicit kwarg → schema →
+    # default) before building the system prompt, which declares the budget.
+    ta_enabled = (
+        token_awareness_enabled if token_awareness_enabled is not None
+        else schema.get("token_awareness_enabled", True)
+    )
+    ta_budget = (
+        token_awareness_budget_tokens if token_awareness_budget_tokens is not None
+        else schema.get("token_awareness_budget_tokens")
+        or schema.get("context_window")
+        or (compaction_trigger_tokens if compaction_trigger_tokens is not None
+            else schema.get("compaction_trigger_tokens", DEFAULT_COMPACTION_TRIGGER_TOKENS))
+    )
+    ta_reminder = (
+        token_awareness_reminder_tokens if token_awareness_reminder_tokens is not None
+        else schema.get("token_awareness_reminder_tokens",
+                        DEFAULT_TOKEN_AWARENESS_REMINDER_TOKENS)
+    )
+    ta_update_every = max(1, int(
+        token_awareness_update_every if token_awareness_update_every is not None
+        else schema.get("token_awareness_update_every", 1)
+    ))
+    if ta_enabled:
+        sys_msg += "\n\n" + _TOKEN_AWARENESS_SYSTEM.format(budget=ta_budget)
 
     session_id = resumed_from if resumed_from else uuid.uuid4().hex[:12]
     streaming = bool(
@@ -2290,6 +2426,11 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             min_cacheable_tokens if min_cacheable_tokens is not None
             else schema.get("min_cacheable_tokens", DEFAULT_MIN_CACHEABLE_TOKENS)
         ),
+        "token_awareness_enabled": bool(ta_enabled),
+        "token_awareness_budget_tokens": int(ta_budget),
+        "token_awareness_reminder_tokens": int(ta_reminder),
+        "token_awareness_update_every": ta_update_every,
+        "token_awareness_last_remaining": None,
         # Durable recovery: append-only WAL of every in-turn state change.
         "durable": (
             True if session_dir is not None else
@@ -3124,6 +3265,16 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
 
     total_tokens = 0
     max_tokens   = DEFAULT_MAX_TOKENS
+    # Pending model-facing token-awareness injection (countdown + optional
+    # checkpoint reminder), suffixed onto the next tool-result message.
+    pending_ta: str | None = None
+
+    def _with_pending_ta(text: str) -> str:
+        nonlocal pending_ta
+        if pending_ta:
+            text = f"{text}\n\n{pending_ta}"
+            pending_ta = None
+        return text
 
     def _check_cancelled() -> None:
         if cancel is None or not cancel.cancelled:
@@ -3161,6 +3312,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             usage = getattr(resp, "usage", None)
             if usage:
                 session["llm_call_count"] = session.get("llm_call_count", 0) + 1
+                pending_ta = _token_awareness_injection(session, usage)
                 _enforce_cache_proof(session, usage)
                 prompt_tok     = getattr(usage, "prompt_tokens", 0) or 0
                 completion_tok = getattr(usage, "completion_tokens", 0) or 0
@@ -3192,6 +3344,10 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                                "total_tokens":       getattr(usage, "total_tokens", 0) or 0,
                                "cached_tokens":      getattr(usage, "cached_tokens", 0) or 0,
                                "cache_creation_tokens": getattr(usage, "cache_creation_tokens", 0) or 0,
+                               **({"token_budget_remaining":
+                                   max(0, (session.get("token_awareness_budget_tokens", 0) or 0)
+                                       - (getattr(usage, "prompt_tokens", 0) or 0))}
+                                  if session.get("token_awareness_enabled") else {}),
                                "ts": datetime.datetime.now().isoformat(timespec="seconds")})
             elif session.get("strict_cache_proof", True) and session.get("llm_call_count", 0) >= 1:
                 age = _last_message_age_seconds(session)
@@ -3283,12 +3439,13 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                                            "result": result,
                                            "ts": datetime.datetime.now().isoformat(timespec="seconds")})
                             _append_message({"role": "tool", "tool_call_id": tc.id,
-                                             "content": result,
+                                             "content": _with_pending_ta(result),
                                              "ts": datetime.datetime.now().isoformat(timespec="seconds")})
                             continue
                     result = _handle_tool_call(tc.function.name, args, session,
                                                call_id=tc.id)
-                    _append_message({"role": "tool", "tool_call_id": tc.id, "content": result,
+                    _append_message({"role": "tool", "tool_call_id": tc.id,
+                                     "content": _with_pending_ta(result),
                                      "ts": datetime.datetime.now().isoformat(timespec="seconds")})
                 continue
 
@@ -3303,7 +3460,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                     results = []
                     for name, args in calls:
                         result = _handle_tool_call(name, args, session)
-                        results.append(f"[{name}] {result}")
+                        results.append(f"[{name}] {_with_pending_ta(result)}")
                     _append_message({"role": "user",
                                      "content": "Tool results:\n" + "\n\n".join(results),
                                      "ts": datetime.datetime.now().isoformat(timespec="seconds")})

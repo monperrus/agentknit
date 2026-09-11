@@ -142,6 +142,40 @@ def test_normalise_for_resume_flatten_never_leaks_raw_result_json() -> None:
     assert content == "prior tool use: write_file({\"path\": \"/tmp/x\"}) -> ok"
 
 
+def test_normalise_for_resume_backfills_missing_tool_result() -> None:
+    """An assistant tool_call without a following tool message (crash between
+    the API reply and tool execution) gets a placeholder tool message so
+    strict providers (DeepSeek: HTTP 400 'insufficient tool messages') accept
+    the resumed transcript."""
+    from agentknit._core import _normalise_for_resume
+    msgs = [
+        {"role": "assistant",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "exec_shell", "arguments": "{}"}},
+                        {"id": "c2", "type": "function",
+                         "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+    ]
+    out = _normalise_for_resume(msgs)
+    assert [m.get("tool_call_id") for m in out if m.get("role") == "tool"] == ["c1", "c2"]
+    assert "interrupted" in out[2]["content"]
+    flat = _normalise_for_resume(msgs, flatten=True)
+    assert all("tool_calls" not in m for m in flat)
+    assert any("unknown" in m.get("content", "") or "interrupted" in m.get("content", "")
+               for m in flat)
+
+
+def test_normalise_for_resume_drops_dangling_tool_message() -> None:
+    """A tool message whose call id matches no pending call is dropped."""
+    from agentknit._core import _normalise_for_resume
+    msgs = [
+        {"role": "assistant", "content": "hi"},
+        {"role": "tool", "tool_call_id": "ghost", "content": "ok"},
+    ]
+    out = _normalise_for_resume(msgs)
+    assert all(m.get("role") != "tool" for m in out)
+
+
 def test_run_turn_dispatches_custom_call_without_json(monkeypatch) -> None:
     """_run_turn dispatches the raw custom input as {'input': ...}."""
     from agentknit._core import _run_turn

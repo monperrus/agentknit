@@ -1560,6 +1560,79 @@ def _summarise_tool_outcome(content: Any) -> str:
     return "ok"
 
 
+def _repair_tool_call_pairing(
+    msgs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Guarantee every ``tool_call`` has a ``tool`` message and vice versa.
+
+    Walks the transcript; after each assistant message carrying
+    ``tool_calls`` ensures the following messages include one ``tool``
+    response per call id, inserting a placeholder result for any id that
+    never got one (crash between the API reply and tool execution).
+    ``tool`` messages whose id matches no pending call are dropped.
+    """
+    repaired: list[dict[str, Any]] = []
+    outstanding: list[str] = []
+    outstanding_names: dict[str, str] = {}
+    for m in msgs:
+        role = m.get("role")
+        if role == "assistant":
+            # A new assistant message closes any prior tool-call block;
+            # ids never answered must be backfilled before it.
+            for cid in outstanding:
+                repaired.append({
+                    "role": "tool",
+                    "tool_call_id": cid,
+                    "content": ("[tool result lost: the session was "
+                                "interrupted before this tool call "
+                                "completed; verify state before retrying]"),
+                    "ts": m.get("ts"),
+                })
+            outstanding = []
+            outstanding_names = {}
+            for tc in m.get("tool_calls") or []:
+                cid = tc.get("id")
+                if cid:
+                    outstanding.append(str(cid))
+                    fn = tc.get("function") or {}
+                    custom = tc.get("custom") or {}
+                    outstanding_names[str(cid)] = (
+                        custom.get("name") or fn.get("name") or "?")
+            repaired.append(m)
+        elif role == "tool":
+            cid = str(m.get("tool_call_id") or "")
+            if cid in outstanding:
+                outstanding.remove(cid)
+                repaired.append(m)
+            # else: dangling tool message (its assistant call was lost or
+            # already answered) — drop it.
+        else:
+            # user/system message: backfill first so the tool block stays
+            # contiguous.
+            for cid in outstanding:
+                repaired.append({
+                    "role": "tool",
+                    "tool_call_id": cid,
+                    "content": (f"[tool result lost: {outstanding_names.get(cid, '?')} "
+                                "was interrupted before completing; verify "
+                                "state before retrying]"),
+                    "ts": m.get("ts"),
+                })
+            outstanding = []
+            outstanding_names = {}
+            repaired.append(m)
+    for cid in outstanding:
+        repaired.append({
+            "role": "tool",
+            "tool_call_id": cid,
+            "content": (f"[tool result lost: {outstanding_names.get(cid, '?')} "
+                        "was interrupted before completing; verify state "
+                        "before retrying]"),
+            "ts": None,
+        })
+    return repaired
+
+
 def _normalise_for_resume(
     msgs: list[dict[str, Any]], *, flatten: bool = False,
 ) -> list[dict[str, Any]]:
@@ -1596,8 +1669,21 @@ def _normalise_for_resume(
             normalised[-1]["ts"] = m.get("ts")
         else:
             normalised.append(dict(m))
-    if not flatten:
-        return normalised
+    if flatten:
+        normalised = _flatten_tool_calls(normalised)
+    # Structural repair: strict providers (DeepSeek, OpenAI) reject any
+    # assistant ``tool_calls`` not followed by a ``tool`` message per call
+    # id, and any ``tool`` message without a preceding matching call.  A
+    # crash between the assistant turn and the tool results (or a torn
+    # journal) produces exactly those orphans — synthesize placeholder
+    # results and drop dangling tool messages so resume is always API-safe.
+    normalised = _repair_tool_call_pairing(normalised)
+    return normalised
+
+
+def _flatten_tool_calls(
+    normalised: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     # Flatten tool call / result pairs into a single neutral summary line
     # per call, keyed on tool_call_id so the call and its outcome merge
     # even though they arrive as separate messages.

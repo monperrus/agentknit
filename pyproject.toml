@@ -4,7 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentknit"
-version = "0.1.0"
+# Placeholder. The published version is decided at release time by
+# pyproject-bump-pypi, which reads the current version from PyPI and bumps
+# that; this value is only a fallback for a package PyPI has never seen.
+#
+# It is deliberately high rather than 0.0.0: agentknit-tui requires
+# "agentknit>=0.2.0,<1", so a lower placeholder makes a locally built pair
+# uninstallable together and forces --no-deps on anyone working across both
+# repositories.
+version = "0.999.0"
 description = "Build reliable coding agents for any OpenAI-compatible /chat/completions endpoint—with spec-driven tools, observability, cache verification, context compaction, and sandboxing. Less glue code, fewer crossed fingers."
 readme = "README.md"
 license = {text = "MIT"}

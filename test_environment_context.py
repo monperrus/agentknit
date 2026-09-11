@@ -97,6 +97,31 @@ def test_os_and_arch_present() -> None:
     assert platform.machine() in block
 
 
+def test_cores_and_ram_present() -> None:
+    from agentknit._core import _cpu_count, _total_ram_gib
+    msg = _sys_msg(_MINIMAL_SCHEMA)
+    cpus = _cpu_count()
+    ram = _total_ram_gib()
+    if cpus:
+        assert f"CPU cores: {cpus}" in msg
+    if ram:
+        assert f"RAM: {ram:.1f} GiB" in msg
+    # Every environment we test on reports at least one of the two.
+    assert cpus or ram
+
+
+def test_ram_parsed_from_meminfo(tmp_path: Path) -> None:
+    from agentknit._core import _total_ram_gib
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(
+        "MemTotal:       16400384 kB\n"
+        "MemFree:         1234567 kB\n"
+    )
+    # 16400384 KiB / 1024 / 1024 == 15.64 GiB
+    assert _total_ram_gib(meminfo) == 16400384 / (1024 * 1024)
+    assert _total_ram_gib(tmp_path / "missing") is None
+
+
 def test_scratchpad_unique_per_working_directory(tmp_path: Path) -> None:
     from agentknit._core import _scratchpad_dir
     a = _scratchpad_dir(tmp_path / "proj")

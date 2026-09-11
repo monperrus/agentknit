@@ -1239,11 +1239,42 @@ def _scratchpad_dir(cwd: Path) -> Path:
     return Path(tempfile.gettempdir()) / f"agentknit-scratchpad-{cwd.name}-{digest}"
 
 
+def _cpu_count() -> "int | None":
+    """Usable cores: scheduler affinity when available, else os.cpu_count()."""
+    import os
+    try:  # Linux containers: affinity may be lower than the machine's cores.
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count()
+
+
+def _total_ram_gib(meminfo: "Path | None" = None) -> "float | None":
+    """Total physical RAM in GiB, best-effort and dependency-free."""
+    try:  # Linux.
+        with (meminfo or Path("/proc/meminfo")).open() as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kib = float(line.split()[1])
+                    return kib / (1024 * 1024)
+    except OSError:
+        pass
+    try:  # macOS.
+        import subprocess
+        out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                             text=True, timeout=5)
+        if out.returncode == 0:
+            return int(out.stdout.strip()) / (1024 ** 3)
+    except Exception:
+        pass
+    return None
+
+
 def environment_context(model: str, version: "str | None" = None) -> str:
     """Build the environment-awareness block appended to the system prompt.
 
     Covers (per issue #31): user identity, git status, working directory,
-    OS/architecture, current date & timezone, scratchpad dir, model identity.
+    OS/architecture, CPU/RAM, current date & timezone, scratchpad dir,
+    model identity.
     """
     import getpass
     import platform
@@ -1272,6 +1303,12 @@ def environment_context(model: str, version: "str | None" = None) -> str:
 
     lines.append(f"Working directory: {Path.cwd()}")
     lines.append(f"OS: {platform.system()} {platform.release()} ({platform.machine()})")
+    cpus = _cpu_count()
+    if cpus:
+        lines.append(f"CPU cores: {cpus}")
+    ram = _total_ram_gib()
+    if ram:
+        lines.append(f"RAM: {ram:.1f} GiB")
 
     now = datetime.datetime.now().astimezone()
     lines.append(f"Current date/time: {now.strftime('%Y-%m-%d %H:%M:%S')} "

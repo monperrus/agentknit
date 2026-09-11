@@ -1,10 +1,10 @@
 """API-key resolution in create_client/_get_key_for_schema.
 
 Covers the resolution order documented in specification.md:
-keyring → key_env → OPENROUTER_API_KEY, plus the rule that a missing key
-must never trigger OpenRouter key *rotation* machinery when the endpoint is
-not openrouter.ai (issue: OPENROUTER_API_KEY must not be required for
-third-party endpoints).
+keyring → key_env → API_KEY → OPENROUTER_API_KEY, plus the rule that a
+missing key must never trigger OpenRouter key *rotation* machinery when the
+endpoint is not openrouter.ai (issue: OPENROUTER_API_KEY must not be required
+for third-party endpoints).
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ OR = "https://openrouter.ai/api/v1"
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
     monkeypatch.delenv("Z_AI_KEY", raising=False)
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
 
@@ -83,8 +84,41 @@ def test_non_openrouter_no_key_source_no_rotation(monkeypatch) -> None:
     assert not called
 
 
+def test_non_openrouter_generic_api_key(monkeypatch) -> None:
+    """API_KEY is the generic channel: no provider's name in it."""
+    monkeypatch.setenv("API_KEY", "generic")
+    monkeypatch.setattr(_core, "get_api_key", lambda: (_ for _ in ()).throw(
+        AssertionError("rotation must not run")))
+    assert _core._get_key_for_schema({"endpoint": ZAI}) == "generic"
+
+
+def test_generic_api_key_wins_over_openrouter(monkeypatch) -> None:
+    """With both set, the generic name wins.
+
+    A machine with OPENROUTER_API_KEY exported for OpenRouter work must not
+    send that key to a third-party endpoint once the operator has said, by
+    setting API_KEY, which key that endpoint takes.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("API_KEY", "the-endpoints-own-key")
+    monkeypatch.setattr(_core, "get_api_key", lambda: (_ for _ in ()).throw(
+        AssertionError("rotation must not run")))
+    assert _core._get_key_for_schema({"endpoint": ZAI}) == "the-endpoints-own-key"
+
+
+def test_generic_api_key_does_not_divert_openrouter(monkeypatch) -> None:
+    """An OpenRouter endpoint still rotates, whatever API_KEY holds."""
+    monkeypatch.setenv("API_KEY", "generic")
+    monkeypatch.setattr(_core, "get_api_key", lambda: "rotated")
+    assert _core._get_key_for_schema({"endpoint": OR}) == "rotated"
+
+
 def test_non_openrouter_plain_openrouter_env(monkeypatch) -> None:
-    """Third-party endpoint may use OPENROUTER_API_KEY as a plain channel."""
+    """OPENROUTER_API_KEY still works as a plain channel.
+
+    Kept on purpose: wrappers exported it as the generic channel before there
+    was a generic name.
+    """
     monkeypatch.setenv("OPENROUTER_API_KEY", "plain")
     monkeypatch.setattr(_core, "get_api_key", lambda: (_ for _ in ()).throw(
         AssertionError("rotation must not run")))

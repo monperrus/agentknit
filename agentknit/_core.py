@@ -3548,11 +3548,13 @@ def _get_key_for_schema(schema: "dict[str, Any]") -> str:
       1. keyring_service + keyring_username in the spec → keyring lookup,
          then the env var named by the uppercased username
       2. key_env in the spec → read that env variable
-      3. Default: OPENROUTER_API_KEY.  For OpenRouter endpoints this goes
-         through ensure_api_key() (balance check + rotation); for any other
-         endpoint it is read as a plain key (env → keyring) without the
-         OpenRouter management machinery.  Wrappers targeting third-party
-         endpoints may export OPENROUTER_API_KEY as a generic channel.
+      3. Default, by endpoint:
+         - OpenRouter endpoints: OPENROUTER_API_KEY through ensure_api_key()
+           (balance check + rotation).
+         - Any other endpoint: API_KEY, read as a plain key (env →
+           password-get) without the OpenRouter management machinery, then
+           OPENROUTER_API_KEY, which wrappers exported as a generic channel
+           before API_KEY existed and which is kept for them.
 
     A configured-but-unresolvable source (1 or 2) raises AuthenticationError
     naming that source — an OpenRouter key is never silently substituted.
@@ -3602,15 +3604,23 @@ def _get_key_for_schema(schema: "dict[str, Any]") -> str:
     if _endpoint_is_openrouter(endpoint):
         return get_api_key()
 
-    # Non-OpenRouter endpoint with no configured key source: accept a plain
-    # OPENROUTER_API_KEY (env → keyring) without balance checks or rotation.
+    # Non-OpenRouter endpoint with no configured key source: a plain key
+    # (env → password-get), without balance checks or rotation.
+    #
+    # API_KEY is the generic name and the one to reach for. OPENROUTER_API_KEY
+    # is read after it because wrappers have been exporting it as the generic
+    # channel since before there was one -- a single provider's name doing
+    # duty for every provider. It keeps working; new callers should not learn
+    # it.
     from .keys import _get_raw_key
-    val = _get_raw_key("OPENROUTER_API_KEY")
-    if val:
-        return val
+    for env_name in ("API_KEY", "OPENROUTER_API_KEY"):
+        val = _get_raw_key(env_name)
+        if val:
+            return val
     raise AuthenticationError(
-        f"No API key source configured for non-OpenRouter endpoint {endpoint!r}. "
-        "Set 'key_env' or 'keyring_service'+'keyring_username' in the spec."
+        f"No API key source configured for endpoint {endpoint!r}. "
+        "Set API_KEY, or 'key_env' or 'keyring_service'+'keyring_username' "
+        "in the spec."
     )
 
 

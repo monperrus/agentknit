@@ -3154,7 +3154,16 @@ def _handle_tool_call(
             # Unknown tool name: the model's mistake, not a crash. Feed the
             # error back as the tool result so the model can retry with a
             # tool that actually exists; the loop must continue.
-            available = ", ".join(sorted(repr(t) for t in tool_dispatch)) or "(none)"
+            # Dispatch-only legacy aliases are hidden from the list: the model
+            # was never offered them, so recommending one back would be noise.
+            # A pre-rename spec whose *only* shell tool is the retired name
+            # (canonical absent) keeps it listed.
+            callable_names = [
+                t for t in tool_dispatch
+                if not (t in _LEGACY_TOOL_ALIASES
+                        and _LEGACY_TOOL_ALIASES[t] in tool_dispatch)
+            ]
+            available = ", ".join(sorted(repr(t) for t in callable_names)) or "(none)"
             result = (f"{e}. Available tools: {available}. "
                       f"Call one of the available tools instead.")
             log_data = {"result": result}

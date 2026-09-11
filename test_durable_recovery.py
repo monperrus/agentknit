@@ -327,3 +327,21 @@ def test_resume_without_journal_falls_back_to_snapshot(tmp_path, monkeypatch):
     contents = [m.get("content") for m in session2["messages"]
                 if m.get("role") != "system"]
     assert any("from snapshot" in c for c in contents if c)
+
+
+def test_handle_tool_call_unknown_tool_hides_dispatch_only_legacy_alias(tmp_path, monkeypatch):
+    """The available-tools hint must not recommend dispatch-only retired names.
+
+    Legacy aliases are invisible plumbing: the model never saw them, so
+    listing them in an error only invites the model to adopt a retired name.
+    """
+    session = _session(tmp_path, monkeypatch)
+    session["tool_dispatch"]["exec_shell"] = {"python_function": "t_run", "param_map": {}}
+    session["tool_dispatch"]["execute_shell_command"] = {"python_function": "t_run", "param_map": {}}
+    monkeypatch.setattr(core._tool_module, "_tool_context",
+                        MagicMock(session_id="s", tool_dispatch={}))
+
+    result = _handle_tool_call("bogus_tool", {}, session)
+
+    assert "Available tools: 'exec_shell'" in result
+    assert "execute_shell_command" not in result

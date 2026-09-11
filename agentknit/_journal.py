@@ -78,6 +78,13 @@ class KnownToolResult:
     name: str
     result: str
 
+    def summary(self, max_chars: int = 200) -> str:
+        """Short one-line digest, safe to inline into a recovery note."""
+        text = " ".join(str(self.result).split())
+        if len(text) > max_chars:
+            return text[:max_chars] + f"…[+{len(text) - max_chars} chars]"
+        return text
+
 
 @dataclass
 class JournalState:

@@ -163,9 +163,70 @@ def test_resume_recovers_journal_state_over_stale_snapshot(tmp_path, monkeypatch
     assert "journal_recovered" in kinds
     contents = [m.get("content") for m in session2["messages"]]
     assert "deploy" in contents
-    # The tool ran and finished — its result is re-injected, never re-run.
+    # The tool ran and finished — its result digest is re-injected, never
+    # re-run.
     notes = [c for c in contents if c and "RECOVERY NOTE" in c]
     assert any("deploy ok" in n and "as observed" in n for n in notes)
+
+
+def test_resume_skips_unreceived_results_from_before_compaction(tmp_path, monkeypatch):
+    """Results of calls summarized away by compaction must not be re-injected.
+
+    A long session can finish hundreds of tools; if compaction replaced the
+    transcript, re-injecting every finished call's raw result resurrects
+    context the session deliberately dropped (observed: a >2.5 MB recovery
+    note that survived /compact and overflowed DeepSeek's 1M window).
+    """
+    monkeypatch.setattr(core, "LOG_BASE", tmp_path)
+    schema = _schema(tmp_path)
+
+    session = init_session(schema)
+    sid = session["session_id"]
+    j = SessionJournal(_journal_path("test/model", sid))
+    j.turn_start("work")
+    j.message({"role": "user", "content": "work"})
+    j.message({"role": "assistant", "tool_calls": [
+        {"id": "old", "type": "function",
+         "function": {"name": "t_run", "arguments": "{}"}}]})
+    j.tool_start("old", "t_run", {})
+    j.tool_end("old", "HUGE" * 500_000, name="t_run")
+    # Compaction replaced the history; the old call id is gone.
+    j.reset_messages([{"role": "system", "content": "sys"},
+                      {"role": "assistant", "content": "summary",
+                       "compacted_summary": True}],
+                     reason="compaction")
+
+    session2 = init_session(schema, resumed_from=sid)
+    total = sum(len(m.get("content") or "") for m in session2["messages"])
+    assert total < 10_000
+    assert not any("HUGE" in (m.get("content") or "")
+                   for m in session2["messages"])
+
+
+def test_resume_unreceived_results_note_is_capped(tmp_path, monkeypatch):
+    """Even for live calls, the recovery note carries digests, not payloads."""
+    monkeypatch.setattr(core, "LOG_BASE", tmp_path)
+    schema = _schema(tmp_path)
+
+    session = init_session(schema)
+    sid = session["session_id"]
+    j = SessionJournal(_journal_path("test/model", sid))
+    j.turn_start("work")
+    j.message({"role": "user", "content": "work"})
+    big_args = " ".join(f"x{i}" for i in range(5000))
+    for i in range(30):
+        cid = f"c{i}"
+        j.message({"role": "assistant", "tool_calls": [
+            {"id": cid, "type": "function",
+             "function": {"name": "t_run", "arguments": "{}"}}]})
+        j.tool_start(cid, "t_run", {})
+        j.tool_end(cid, "R" * 5000, name="t_run")
+
+    session2 = init_session(schema, resumed_from=sid)
+    notes = [m.get("content") or "" for m in session2["messages"]
+             if "RECOVERY NOTE" in (m.get("content") or "")]
+    assert notes
+    assert all(len(n) <= core._UNRECEIVED_RESULTS_MAX_CHARS + 500 for n in notes)
 
 
 def test_resume_flags_pending_tool_calls(tmp_path, monkeypatch):

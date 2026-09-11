@@ -152,6 +152,13 @@ _PENDING_TOOL_NOTE = (
     "before re-running any of them."
 )
 
+# Cap for the unreceived-results recovery note: the note exists to restore
+# awareness of a handful of lost results, never to replay raw tool output —
+# unbounded results (a long-running session can finish hundreds of calls)
+# would otherwise dwarf the resumed context itself.
+_UNRECEIVED_RESULTS_MAX_CHARS = 4000
+_UNRECEIVED_RESULT_MAX_CHARS = 200
+
 
 def _agentknit_commit() -> str:
     """Return the agentknit commit id (git HEAD) behind this process.
@@ -2627,19 +2634,39 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                     "ts": datetime.datetime.now().isoformat(timespec="seconds"),
                 })
             if journal_state.unreceived_results:
-                results = "\n".join(
-                    f"- {r.name or r.call_id}: {r.result}"
-                    for r in journal_state.unreceived_results)
-                session["messages"].append({
-                    "role": "user",
-                    "content": (
-                        "SYSTEM RECOVERY NOTE: These tool calls completed just "
-                        "before the crash but their results were never shown "
-                        "to you; treat these results as observed:\n"
-                        f"{results}"
-                    ),
-                    "ts": datetime.datetime.now().isoformat(timespec="seconds"),
-                })
+                # Only results for calls still part of the resumed
+                # conversation are relevant, and only as digests — full
+                # payloads would blow the context window (a session with
+                # hundreds of finished calls produced a >2.5 MB note that
+                # survived compaction and exceeded DeepSeek's 1M limit).
+                relevant = [
+                    r for r in journal_state.unreceived_results
+                    if r.call_id in {
+                        str(tc.get("id"))
+                        for m in session["messages"]
+                        for tc in (m.get("tool_calls") or [])
+                    }
+                ]
+                if relevant:
+                    results = "\n".join(
+                        f"- {r.name or r.call_id}: "
+                        f"{r.summary(_UNRECEIVED_RESULT_MAX_CHARS)}"
+                        for r in relevant)
+                    if len(results) > _UNRECEIVED_RESULTS_MAX_CHARS:
+                        results = (results[:_UNRECEIVED_RESULTS_MAX_CHARS]
+                                   + "\n…[truncated]")
+                    session["messages"].append({
+                        "role": "user",
+                        "content": (
+                            "SYSTEM RECOVERY NOTE: These tool calls completed "
+                            "just before the crash but their results were "
+                            "never shown to you; treat these result digests "
+                            "as observed (re-run the tool if you need the "
+                            "full output):\n"
+                            f"{results}"
+                        ),
+                        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                    })
     return session
 
 

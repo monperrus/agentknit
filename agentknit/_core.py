@@ -1014,9 +1014,15 @@ def _enforce_cache_proof(session: Session, usage: object) -> None:
 
     # Beginning of the session: the first call must expose cache accounting,
     # otherwise strict cache mode cannot work at all.  Aborting here is
-    # cheap — nothing beyond this call has been paid for.
+    # cheap — nothing beyond this call has been paid for.  Providers with a
+    # minimum cacheable prefix (session["min_cacheable_tokens"]) are exempt
+    # when the first prompt is below that floor: their cache silently skips
+    # small prompts, so the absence of accounting is expected, not broken.
     if session.get("llm_call_count", 0) <= 1:
         if not has_cache_proof and cache_creation <= 0:
+            min_cacheable = session.get("min_cacheable_tokens", DEFAULT_MIN_CACHEABLE_TOKENS) or 0
+            if min_cacheable and prompt_tokens < min_cacheable:
+                return
             raise CacheProofError(
                 "Strict cache mode requires explicit cache accounting from the server "
                 "on the first LLM call, but this response exposed no cache-proof field."

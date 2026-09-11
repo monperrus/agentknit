@@ -1290,7 +1290,22 @@ def environment_context(model: str, version: "str | None" = None) -> str:
     from . import __version__ as _harness_version
     lines.append(f"Harness: agentknit {_harness_version}")
 
+    lines.append("")
+    lines.append(attribution_block(model))
+
     return "\n".join(lines)
+
+
+def attribution_block(model: str) -> str:
+    """Git/PR attribution instructions appended to the system prompt."""
+    return (
+        "## Attribution\n"
+        "Attribution for git commits and pull requests you create from here on:\n"
+        "- End git commit messages with:\n"
+        f"Co-Authored-By: agentknit+{model} <agentknit+{model}@monperrus.com>\n"
+        "- End pull request descriptions with:\n"
+        "🤖 Generated with [agentknit](https://github.com/monperrus/agentknit)"
+    )
 
 
 def read_repl_input(prompt: str) -> str:

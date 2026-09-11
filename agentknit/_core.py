@@ -2179,6 +2179,8 @@ class Session(TypedDict):
     durable: NotRequired[bool]
     session_dir: NotRequired[Path]
     durable_sink: NotRequired[DurableSink | None]
+    # NotRequired: absent (None) means the tool library's built-in default TTL.
+    tool_ttl_seconds: NotRequired[int | None]  # TTL budget (s) for one sync tool exec
     # ── runtime-only state (set after construction) ──────────────────
     log_path: NotRequired[Path]      # JSONL transcript path (always set in practice)
     auth: NotRequired[dict[str, Any]]          # auth *configuration* (never the key itself)
@@ -2212,6 +2214,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                  compaction_policy: "str | Callable[..., bool] | None" = None,
                  compaction_min_chars: int | None = None,
                  min_cacheable_tokens: int | None = None,
+                 tool_ttl_seconds: int | None = None,
                  token_awareness_enabled: bool | None = None,
                  token_awareness_budget_tokens: int | None = None,
                  token_awareness_reminder_tokens: int | None = None,
@@ -2271,6 +2274,13 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     than a failure when the prompt is below this floor. Defaults to the
     schema's ``min_cacheable_tokens`` or ``0`` (no minimum — any zero-cache
     call after the first is treated as a genuine miss).
+
+    ``tool_ttl_seconds`` — time-to-live budget (seconds) for one synchronous
+    tool execution.  The synchronous shell tool (``exec_shell``) is capped a
+    little below this (TTL minus a safety margin) so a timed-out command
+    still leaves room to stream partial output back.  Defaults to the
+    schema's ``tool_ttl_seconds``; when neither is set, a built-in default
+    applies (see ``DEFAULT_TOOL_TTL_S`` in :mod:`agentknit.tool_library`).
 
     ``durable`` — enable durable recovery (default ``True``).  Every message
     append, tool call and tool result inside a turn is written to an
@@ -2533,6 +2543,10 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         "min_cacheable_tokens": (
             min_cacheable_tokens if min_cacheable_tokens is not None
             else schema.get("min_cacheable_tokens", DEFAULT_MIN_CACHEABLE_TOKENS)
+        ),
+        "tool_ttl_seconds": (
+            tool_ttl_seconds if tool_ttl_seconds is not None
+            else schema.get("tool_ttl_seconds")
         ),
         "token_awareness_enabled": bool(ta_enabled),
         "token_awareness_budget_tokens": int(ta_budget),
@@ -3121,6 +3135,7 @@ def _handle_tool_call(
 
     _tool_module._tool_context.session_id = session.get("session_id")
     _tool_module._tool_context.tool_dispatch = tool_dispatch
+    _tool_module._tool_context.tool_ttl_seconds = session.get("tool_ttl_seconds")
 
     if is_ask and non_interactive:
         result = "ERROR: user interaction is disabled (--non-interactive)"

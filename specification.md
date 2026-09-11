@@ -77,6 +77,12 @@ Key resolution order: `keyring_service`+`keyring_username` → `key_env` → `AP
 |---|---|---|---|
 | `max_rpm` | integer | no | Client-side requests-per-minute cap passed to the OpenAI client constructor (e.g. `40` for NVIDIA NIM free tier). |
 
+### Tools
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `tool_ttl_seconds` | integer | no | Time-to-live budget (seconds) for one synchronous tool execution. The synchronous shell tool (`exec_shell`) is capped a little below this (TTL − 20 s, minimum 1 s) so a timed-out command still leaves a margin to stream partial output back. When unset, the built-in default TTL is 600 s, i.e. `exec_shell` runs at most 580 s. |
+
 ### Durability
 
 | Field | Type | Required | Description |

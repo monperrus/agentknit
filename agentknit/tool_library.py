@@ -57,6 +57,7 @@ __all__ = [  # re-exports (mypy --no-implicit-reexport)
     "async_completion_queue", "enable_nohup",
     "get_async_command_for_output_path", "nohup_tool_specs",
     "t_execute_async", "t_nohup", "t_query_exec", "t_nohup_wait",
+    "DEFAULT_TOOL_TTL_S", "EXEC_SHELL_MARGIN_S",
 ]
 
 # Optional reference to the active _InputCollector (set by _core REPL loop).
@@ -294,6 +295,25 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "",
     except Exception as e:
         return _tool_error("str_replace", e)
 
+# Default time-to-live (seconds) for one synchronous tool execution when the
+# agent spec does not configure one.  exec_shell's max time is kept a little
+# below the TTL (EXEC_SHELL_MARGIN_S), so a timed-out command still leaves a
+# margin to stream partial output back before the turn budget is exhausted.
+DEFAULT_TOOL_TTL_S = 600
+EXEC_SHELL_MARGIN_S = 20
+
+
+def _exec_shell_timeout_s() -> int:
+    """Max wall-clock time for one exec_shell call: TTL minus the margin."""
+    try:
+        ttl = getattr(_tool_context, "tool_ttl_seconds", None)
+    except Exception:
+        ttl = None
+    if not isinstance(ttl, (int, float)) or ttl <= 0:
+        ttl = DEFAULT_TOOL_TTL_S
+    return max(1, int(ttl) - EXEC_SHELL_MARGIN_S)
+
+
 def t_run(command: str) -> tuple[str, dict[str, object]]:
     """Execute a shell command and return its stdout, stderr, and exit code.
 
@@ -307,6 +327,7 @@ def t_run(command: str) -> tuple[str, dict[str, object]]:
     """
     global _active_proc
     command = _coerce_str(command, "command")
+    timeout_s = _exec_shell_timeout_s()
     proc: subprocess.Popen[str] | None = None
     try:
         proc = subprocess.Popen(
@@ -334,7 +355,7 @@ def t_run(command: str) -> tuple[str, dict[str, object]]:
         t_err.start()
 
         try:
-            proc.wait(timeout=60)
+            proc.wait(timeout=timeout_s)
         except KeyboardInterrupt:
             # Signal handler already SIGKILLed the process; just wait briefly.
             try:
@@ -379,14 +400,14 @@ def t_run(command: str) -> tuple[str, dict[str, object]]:
             for e in getattr(_tool_context, "tool_dispatch", {}).values()
         )
         hint = (
-            "The command did not finish within 60 seconds. "
+            f"The command did not finish within {timeout_s} seconds. "
             "For long-running commands, use 'nohup <command> &' to run in the "
             "background."
         )
         if _exec_async_available:
             hint += " Or use t_execute_async to start the command asynchronously."
         result = json.dumps({
-            "error": "command timed out after 60 s",
+            "error": f"command timed out after {timeout_s} s",
             "stdout": out,
             "stderr": err,
             "hint": hint,

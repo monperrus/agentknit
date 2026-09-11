@@ -43,6 +43,12 @@ def test_model_version_shown_when_present() -> None:
     assert "Model: test-model (version 2024-06-01)" in msg
 
 
+def test_harness_name_and_version_present() -> None:
+    import agentknit
+    msg = _sys_msg(_MINIMAL_SCHEMA)
+    assert f"Harness: agentknit {agentknit.__version__}" in msg
+
+
 def test_git_status_in_git_repo(tmp_path: Path) -> None:
     subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
     subprocess.run(["git", "config", "user.name", "Tester"], cwd=tmp_path,

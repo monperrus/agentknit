@@ -1234,6 +1234,10 @@ def environment_context(model: str, version: "str | None" = None) -> str:
         model_line += f" (version {version})"
     lines.append(model_line)
 
+    # Harness identity: local import avoids a circular import with __init__.
+    from . import __version__ as _harness_version
+    lines.append(f"Harness: agentknit {_harness_version}")
+
     return "\n".join(lines)
 
 

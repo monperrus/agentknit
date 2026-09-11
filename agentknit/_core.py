@@ -4609,6 +4609,13 @@ def parse_args() -> argparse.Namespace:
                    help="Cap max output tokens per request. Overrides the spec's "
                         "max_output_tokens. Useful for models with a huge default "
                         "output that would otherwise reserve large credit holds.")
+    p.add_argument("--context-window", type=int, dest="context_window", default=None,
+                   metavar="N",
+                   help="Set/override the model's context window in tokens. Applied "
+                        "on top of the loaded spec (including the default in-memory "
+                        "spec for run:// models), so face launchers can declare the "
+                        "window without materializing a temp spec file. Feeds the "
+                        "token-awareness budget and context-window reminders.")
     p.add_argument("--no-strict-cache-proof", action="store_true",
                    help="Disable the default fail-closed cache-proof check that "
                         "requires a nonzero cache hit on every LLM call after the first.")
@@ -4637,6 +4644,10 @@ def main() -> None:
             # A resumed session must continue on the endpoint it was run on,
             # not on whatever --endpoint / the OpenRouter default resolves to.
             schema = _bind_schema_to_resumed_session(schema, args.session)
+        if args.context_window is not None:
+            if args.context_window <= 0:
+                sys.exit(f"{RED}--context-window must be a positive integer{RESET}")
+            schema["context_window"] = args.context_window
         validate_schema(schema)
         check_and_display_pricing(schema)
     except AgentSpecDisabledError as e:

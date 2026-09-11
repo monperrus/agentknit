@@ -32,7 +32,7 @@ An agent spec is a JSON file that describes how agentknit should connect to a mo
 | `behaviour` | object | no | Agent behaviour knobs (see [Behaviour object](#behaviour-object)). |
 | `options` | array of strings | no | Extra feature flags (see [Options](#options)). |
 | `max_output_tokens` | integer | no | Override the default `max_tokens` value sent with every API request. |
-| `context_window` | integer | no | Declared context window size of the model in tokens.  Currently used as the default denominator for the token-awareness countdown (see [Token awareness](#token-awareness)); raising it past the compaction trigger is deliberate over-provisioning — compaction still runs at the trigger. |
+| `context_window` | integer | no | Declared context window size of the model in tokens.  Currently used as the default denominator for the token-awareness countdown (see [Token awareness](#token-awareness)); raising it past the compaction trigger is deliberate over-provisioning — compaction still runs at the trigger.  Also settable via the `--context-window N` CLI flag, applied on top of the loaded spec (works with `run://` models without a spec file). |
 
 ### Token awareness
 

@@ -129,7 +129,8 @@ def test_maybe_compact_at_threshold():
     client = _make_fake_client("summary")
     usage = _FakeUsage(prompt_tokens=DEFAULT_COMPACTION_TRIGGER_TOKENS)
     _maybe_compact(client, "m", session, usage)
-    assert len(client.calls) == 1
+    # Two calls: pre-compaction preservation + summary.
+    assert len(client.calls) == 2
 
 
 def test_maybe_compact_does_not_retrigger_immediately():
@@ -144,10 +145,10 @@ def test_maybe_compact_does_not_retrigger_immediately():
     client = _make_fake_client("summary")
     usage = _FakeUsage(prompt_tokens=DEFAULT_COMPACTION_TRIGGER_TOKENS)
     _maybe_compact(client, "m", session, usage)
-    assert len(client.calls) == 1
+    assert len(client.calls) == 2
     # Same token count again — should NOT trigger a second compaction.
     _maybe_compact(client, "m", session, usage)
-    assert len(client.calls) == 1
+    assert len(client.calls) == 2
 
 
 def test_maybe_compact_retriggers_after_growth():
@@ -162,16 +163,16 @@ def test_maybe_compact_retriggers_after_growth():
     client = _make_fake_client("summary")
     usage1 = _FakeUsage(prompt_tokens=DEFAULT_COMPACTION_TRIGGER_TOKENS)
     _maybe_compact(client, "m", session, usage1)
-    assert len(client.calls) == 1
+    assert len(client.calls) == 2
     # Slightly higher token count — should NOT trigger (needs 25 % hysteresis).
     usage2 = _FakeUsage(prompt_tokens=DEFAULT_COMPACTION_TRIGGER_TOKENS + 1)
     _maybe_compact(client, "m", session, usage2)
-    assert len(client.calls) == 1
+    assert len(client.calls) == 2
     # Growth beyond the 25 % hysteresis — should trigger again.
     hysteresis = DEFAULT_COMPACTION_TRIGGER_TOKENS // 4
     usage3 = _FakeUsage(prompt_tokens=DEFAULT_COMPACTION_TRIGGER_TOKENS + hysteresis + 1)
     _maybe_compact(client, "m", session, usage3)
-    assert len(client.calls) == 2
+    assert len(client.calls) == 4
 
 
 # ── _compact_session ──────────────────────────────────────────────────────────
@@ -386,7 +387,8 @@ def test_policy_every_turn_compacts_at_turn_end_unconditionally():
     client = _make_fake_client("summary")
     usage = _FakeUsage(prompt_tokens=10)  # far below any threshold
     _apply_compaction_policy(client, "m", session, usage, phase="turn_end")
-    assert len(client.calls) == 1
+    # pre-compaction + summary
+    assert len(client.calls) == 2
     assert session["messages"][1].get("compacted_summary") is True
 
 
@@ -402,7 +404,7 @@ def test_policy_every_turn_keeps_threshold_backstop_mid_turn():
     _apply_compaction_policy(client, "m", session,
                              _FakeUsage(prompt_tokens=DEFAULT_COMPACTION_TRIGGER_TOKENS),
                              phase="mid_turn")
-    assert len(client.calls) == 1
+    assert len(client.calls) == 2
 
 
 def test_policy_threshold_is_default_and_ignores_turn_end():
@@ -437,8 +439,76 @@ def test_policy_callable_receives_phase_and_decides():
     _apply_compaction_policy(client, "m", session, None, phase="mid_turn")
     assert len(client.calls) == 0
     _apply_compaction_policy(client, "m", session, None, phase="turn_end")
-    assert len(client.calls) == 1
+    assert len(client.calls) == 2
     assert seen == ["mid_turn", "turn_end"]
+
+
+def test_compact_session_two_phases():
+    """Compaction runs a pre-compaction preservation call before summarizing."""
+    session = _make_session(messages=[
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+    ])
+    client = _make_fake_client("model reply")
+    _compact_session(client, "m", session)
+    # Phase 1: pre-compaction; phase 2: summary.
+    assert len(client.calls) == 2
+    # Phase 1's last message is the preservation prompt.
+    phase1_msgs = client.calls[0]["messages"]
+    assert "compaction" in phase1_msgs[-1]["content"].lower()
+    assert "before" in phase1_msgs[-1]["content"].lower() or "about to" in phase1_msgs[-1]["content"].lower()
+    # Phase 2's prompt includes the phase-1 user/assistant exchange and ends
+    # with the summarization prompt.
+    phase2_msgs = client.calls[1]["messages"]
+    assert phase2_msgs[-3]["content"] == phase1_msgs[-1]["content"]
+    assert phase2_msgs[-2] == {"role": "assistant", "content": "model reply"}
+    assert "Summarize the conversation above" in phase2_msgs[-1]["content"]
+
+
+def test_compact_session_pre_compaction_failure_still_summarizes():
+    """A failing pre-compaction call must not block the summary phase."""
+    session = _make_session(messages=[
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+    ])
+
+    class _FlakyClient:
+        def __init__(self):
+            self.calls = []
+
+        class _Chat:
+            def __init__(self, outer):
+                self._outer = outer
+
+            class _Completions:
+                def __init__(self, outer):
+                    self._outer = outer
+
+                def create(self, **kwargs):
+                    self._outer.calls.append(kwargs)
+                    if len(self._outer.calls) == 1:
+                        raise RuntimeError("boom")
+                    return _FakeResponse("summary")
+
+            @property
+            def completions(self):
+                return self._Completions(self._outer)
+
+        @property
+        def chat(self):
+            return self._Chat(self)
+
+    client = _FlakyClient()
+    result = _compact_session(client, "m", session)
+    assert result is True
+    assert len(client.calls) == 2
+    assert session["messages"][1].get("compacted_summary") is True
+    assert session["messages"][1]["content"] == "summary"
 
 
 def test_compact_session_turn_count():

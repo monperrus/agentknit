@@ -215,6 +215,15 @@ _COMPACTION_PROMPT = (
     "- Report each fact once. Keep uncertainty expressed as uncertainty.\n"
 )
 
+_PRE_COMPACTION_PROMPT = (
+    "Context compaction is about to run: the earlier part of this "
+    "conversation will soon be replaced by a summary. Before that happens, "
+    "write down everything you will need to keep working on this task "
+    "afterwards — key facts, decisions made, current state of the work, "
+    "important file contents or identifiers, and the immediate next steps. "
+    "Anything you do not record now may be lost. Reply briefly once done."
+)
+
 BOLD = "\033[1m"
 DIM = "\033[2m"
 CYAN = "\033[36m"
@@ -2587,6 +2596,11 @@ def compact_session(
     is summarized by the model and replaced with a single assistant message
     tagged with ``compacted_summary=true`` metadata.
 
+    Compaction runs in two phases: first a *pre-compaction* prompt asks the
+    model to record everything it needs to keep working (the reply is kept
+    as an assistant message), then the summary phase summarizes the prefix
+    *including* that recorded state.
+
     If ``compaction_min_chars`` is set on the session, compaction is skipped
     when the compactable text is shorter than that — summarizing a tiny
     history costs an LLM call and can *grow* the context.
@@ -2633,7 +2647,40 @@ def compact_session(
         if compactable_chars < min_chars:
             return False
 
-    # Build a temporary message list for the compaction call.
+    # ── Phase 1: pre-compaction preservation prompt ─────────────────────────
+    # Give the model a chance to record important state as an assistant
+    # message *before* the prefix is summarized away.  Failure here is
+    # non-fatal — we still proceed to the summary phase.
+    pre_compaction_messages = list(prefix)
+    pre_compaction_messages.append({"role": "user", "content": _PRE_COMPACTION_PROMPT})
+    request_started_at = time.monotonic()
+    try:
+        _persist_record(session, {"type": "model_request", "purpose": "pre_compaction",
+                                  "request": {"model": model, "messages": pre_compaction_messages,
+                                              "temperature": 0,
+                                              "max_tokens": session.get(
+                                                  "compaction_target_tokens",
+                                                  DEFAULT_COMPACTION_TARGET_TOKENS)}})
+        pre_resp = client.chat.completions.create(
+            model=model,
+            messages=pre_compaction_messages,
+            temperature=0,
+            max_tokens=session.get("compaction_target_tokens", DEFAULT_COMPACTION_TARGET_TOKENS),
+            on_rate_limit_wait=_rate_limit_wait_callback(session),
+        )
+        _persist_record(session, {"type": "model_response", "purpose": "pre_compaction",
+                                  "response": {"content": pre_resp.choices[0].message.content}})
+        pre_content = (pre_resp.choices[0].message.content or "").strip()
+    except Exception as exc:
+        _emit(session, "compaction_preparation_skipped", reason=str(exc))
+        pre_content = ""
+    if pre_content:
+        prefix = prefix + [
+            {"role": "user", "content": _PRE_COMPACTION_PROMPT},
+            {"role": "assistant", "content": pre_content},
+        ]
+
+    # ── Phase 2: summarize the (now augmented) prefix ───────────────────────
     compaction_messages = list(prefix)
     compaction_messages.append({"role": "user", "content": _COMPACTION_PROMPT})
 

@@ -1151,8 +1151,8 @@ def fmt_result(text: str, streamed: bool = False) -> str:
         # short summary instead of repeating the full content.
         return DIM + "  (output streamed above)" + RESET
     lines = text.splitlines()
-    head = lines[:20]
-    tail = f"\n{DIM}  … ({len(lines)-20} more lines){RESET}" if len(lines) > 20 else ""
+    head = lines[:40]
+    tail = f"\n{DIM}  … ({len(lines)-40} more lines){RESET}" if len(lines) > 40 else ""
     return DIM + "\n".join("  " + line for line in head) + RESET + tail
 
 

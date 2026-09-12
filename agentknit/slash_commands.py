@@ -103,6 +103,9 @@ class SlashCommandRegistry:
             return False
 
         parts = stripped[1:].split(None, 1)  # split off command name
+        if not parts:  # bare "/" — a common typo for /help, not a crash
+            print(f"{RED}Empty command. Type /help for available commands.{RESET}")
+            return True
         cmd_name = parts[0].lower()
         cmd_args = parts[1] if len(parts) > 1 else ""
 

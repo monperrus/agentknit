@@ -53,3 +53,13 @@ def test_repl_loop_body_retries_turn_on_slash_c(monkeypatch):
     _core._repl_loop_body("/c", client=None, session=session, model="m")
 
     assert calls == [None]
+
+
+def test_dispatch_bare_slash_does_not_crash(capsys):
+    """A bare "/" (typo for /help) is handled gracefully, not an IndexError."""
+    session = {"messages": [{"role": "system", "content": "sys"}]}
+    handled = REGISTRY.dispatch("/", session, client=None, model="m")
+
+    assert handled is True  # consumed as a command, model not invoked
+    out = capsys.readouterr().out
+    assert "Empty command" in out

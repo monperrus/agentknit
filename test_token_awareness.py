@@ -280,3 +280,61 @@ def test_snapshot_metadata_records_knobs(monkeypatch, tmp_path) -> None:
     assert ta["budget_tokens"] == 250000
     assert ta["reminder_tokens"] == 6144
     assert ta["update_every"] == 1
+
+
+def test_resume_strips_stale_usage_warnings_keeps_latest() -> None:
+    """On resume, mid-history Token usage warnings are stale readings and
+    must be stripped; only the most recent one survives."""
+    from agentknit._core import _normalise_for_resume
+
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "a1",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "t", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1",
+         "content": "res1\n\n<system_warning>Token usage: 100/1000; "
+                    "900 remaining</system_warning>"},
+        {"role": "assistant", "content": "a2",
+         "tool_calls": [{"id": "c2", "type": "function",
+                         "function": {"name": "t", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c2",
+         "content": "res2\n\n<system_warning>Token usage: 200/1000; "
+                    "800 remaining</system_warning>"},
+    ]
+    out = _normalise_for_resume(msgs)
+    contents = [m.get("content") or "" for m in out]
+    # The older reading is stripped entirely.
+    assert contents[3] == "res1"
+    # The latest reading survives verbatim.
+    assert "Token usage: 200/1000" in contents[5]
+    # No warning left anywhere else.
+    assert sum("Token usage" in c for c in contents) == 1
+
+
+def test_resume_strips_warning_with_checkpoint_reminder() -> None:
+    """A stale warning carrying the near-full checkpoint reminder is
+    removed as one block."""
+    from agentknit._core import _normalise_for_resume
+
+    stale = ("res\n\n<system_warning>Token usage: 990/1000; 10 remaining"
+             "</system_warning>\n<context_window_reminder>\nnearly full\n"
+             "</context_window_reminder>")
+    out = _normalise_for_resume([
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "a1",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "t", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": stale},
+        {"role": "assistant", "content": "a2",
+         "tool_calls": [{"id": "c2", "type": "function",
+                         "function": {"name": "t", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c2",
+         "content": "later\n\n<system_warning>Token usage: 50/1000; "
+                    "950 remaining</system_warning>"},
+    ])
+    assert out[3]["content"] == "res"
+    assert "context_window_reminder" not in out[3]["content"]
+    assert "Token usage: 50/1000" in out[5]["content"]

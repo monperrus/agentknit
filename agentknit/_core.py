@@ -223,8 +223,15 @@ _TOKEN_AWARENESS_SYSTEM = (
     "enough room to finish properly."
 )
 
-_TOKEN_AWARENESS_REMINDER = (
-    "<context_window_reminder>\n"
+# Matches an injected token-awareness warning inside a message, for
+# stripping stale readings on resume (see _normalise_for_resume).
+_TA_WARNING_RE = re.compile(
+    r"\n*<system_warning>Token usage:[^<]*(?:</system_warning>)?"
+    r"(?:\s*<context_window_reminder>.*?</context_window_reminder>)?",
+    re.DOTALL,
+)
+
+_TOKEN_AWARENESS_REMINDER = (    "<context_window_reminder>\n"
     "Your context window is nearly full; {remaining} tokens remain before "
     "compaction. Write concise progress notes in your next reply — goal, "
     "decisions, progress, learnings, next steps — then keep working. "
@@ -1724,7 +1731,25 @@ def _normalise_for_resume(
     ``[Tool result: {...}]`` JSON teaches it that producing tool-result
     payloads is its own job, and it will start fabricating them (see
     issue #25).
+
+    Stale token-awareness warnings (``<system_warning>Token usage: …``)
+    are stripped from every message except the one carrying the most
+    recent reading: mid-history readings are superseded by the latest
+    one, and re-injecting them on every resume would fabricate
+    progressively wrong counters.
     """
+    # Keep only the latest token-awareness reading across the transcript.
+    last_ta_idx = -1
+    for i, m in enumerate(msgs):
+        if _TA_WARNING_RE.search(m.get("content") or ""):
+            last_ta_idx = i
+    if last_ta_idx >= 0:
+        msgs = [
+            (dict(m, content=_TA_WARNING_RE.sub("", m["content"]).rstrip())
+             if i != last_ta_idx and isinstance(m.get("content"), str)
+             else m)
+            for i, m in enumerate(msgs)
+        ]
     # Normalise: merge consecutive user messages so the API's strict
     # user/assistant alternation is preserved.
     normalised: list[dict[str, Any]] = []

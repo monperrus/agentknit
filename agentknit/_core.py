@@ -2899,6 +2899,15 @@ def _complete(client: openai.OpenAI | SubprocessOpenAI, session: Session, **kwar
             **stream_callbacks,
         )
         if streamed:
+            # Reasoning always precedes content in the SSE stream, so flush
+            # the reasoning sequence first: event consumers that buffer
+            # deltas (e.g. the TUI) wait for `reasoning_stream_end` to write
+            # the trace, and would otherwise drop it whenever content also
+            # streamed.  The empty `fmt` keeps the terminal renderer a no-op —
+            # there, the first content delta already terminated the
+            # `[thinking]` line with its own newline prefix.
+            if reasoned:
+                _emit(session, "reasoning_stream_end", no_newline=True, fmt="")
             _emit(session, "content_stream_end", no_newline=True, fmt="\n")
             session["_content_was_streamed"] = True
         elif reasoned:

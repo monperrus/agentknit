@@ -388,7 +388,7 @@ generic `on_event` handler.
 | `content_delta` | Streaming text chunk from the model | `text`, `first`, `no_newline`, `fmt` |
 | `reasoning_delta` | Streaming reasoning trace | `text`, `first`, `no_newline`, `fmt` |
 | `content_stream_end` | End of a streaming content sequence | `no_newline`, `fmt` |
-| `reasoning_stream_end` | End of a streaming reasoning sequence | `no_newline`, `fmt` |
+| `reasoning_stream_end` | End of a streaming reasoning sequence; emitted *before* `content_stream_end` when both streamed, since reasoning precedes content in the SSE stream | `no_newline`, `fmt` |
 | `usage` | Per-turn token usage report | `prompt`, `completion`, `total`, `cached`, `cache_write`, `fmt` |
 | `session_usage` | Cumulative session usage at final answer | `prompt`, `completion`, `total`, `cached`, `cache_write`, `fmt` |
 | `error` | API or dispatch error | `text`, `error_class`, `http_status`, `error_code`, `error_message`, `elapsed_s`, `adapter`, `fmt` |

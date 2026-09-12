@@ -5,8 +5,17 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
-from agentknit._core import subscribe, unsubscribe, on, _emit, _default_event_handler, _handle_tool_call
+from agentknit._core import (
+    _complete,
+    _default_event_handler,
+    _emit,
+    _handle_tool_call,
+    on,
+    subscribe,
+    unsubscribe,
+)
 from agentknit.tool_library import t_write, t_update
 
 
@@ -282,3 +291,48 @@ def test_tool_result_files_is_none_for_read():
     assert len(received) == 1
     assert received[0].get("files") is None
     assert received[0].get("diff_summary") is None
+
+
+# ── streaming reasoning flush ────────────────────────────────────────────────
+
+def test_reasoning_flushed_before_content_stream_end():
+    """`reasoning_stream_end` must precede `content_stream_end`.
+
+    Event consumers that buffer reasoning deltas (e.g. the TUI log) only write
+    the trace when `reasoning_stream_end` arrives.  z.ai streams reasoning
+    *before* content, so when both are present the reasoning sequence must be
+    terminated first — otherwise consumers that reset their buffer on
+    `content_stream_end` drop the trace entirely.
+    """
+    events: list[tuple[str, dict]] = []
+    session = _make_session()
+    session.update(cache_key="k", options=[], usage_totals={}, llm_call_count=0,
+                   session_id="s", _journal=None, log_path=None, session_dir=None)
+    session["streaming"] = True
+    session["_content_was_streamed"] = False
+    session["on_event"] = lambda et, data: events.append((et, data))
+
+    class Completions:
+        def create(self, *, on_content_delta=None, on_reasoning_delta=None, **kwargs):
+            on_reasoning_delta("thinking ")
+            on_reasoning_delta("hard")
+            on_content_delta("answer")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(
+                    content="answer", tool_calls=None))],
+                usage=None, provider=None, reasoning="thinking hard")
+
+    client = SimpleNamespace(base_url=SimpleNamespace(host=""),
+                             chat=SimpleNamespace(completions=Completions()))
+    _complete(client, session, model="m", messages=[])
+
+    kinds = [et for et, _ in events]
+    assert kinds.count("reasoning_delta") == 2
+    assert "reasoning_stream_end" in kinds
+    assert "content_stream_end" in kinds
+    assert kinds.index("reasoning_stream_end") < kinds.index("content_stream_end")
+    # The terminal renderer already ended the [thinking] line via the content
+    # delta's newline prefix, so the flush fmt must stay a no-op there.
+    assert events[kinds.index("reasoning_stream_end")][1]["fmt"] == ""
+    # Order vs content deltas: reasoning deltas all precede content deltas.
+    assert kinds[:2] == ["reasoning_delta", "reasoning_delta"]

@@ -975,8 +975,8 @@ def extract_inline_calls(text: str) -> list[tuple[str, dict[str, Any]]]:
 
 def fmt_call(name: str, args: dict[str, Any]) -> str:
     pretty = ", ".join(f"{k}={v!r}" for k, v in args.items())
-    if len(pretty) > 200:
-        pretty = pretty[:200] + "…"
+    if len(pretty) > 400:
+        pretty = pretty[:400] + "…"
     return f"{CYAN}{BOLD}▶ {name}({pretty}){RESET}"
 
 def fmt_usage(usage: object, *, compaction_trigger: int | None = None) -> str:

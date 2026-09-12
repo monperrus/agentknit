@@ -127,7 +127,7 @@ from .tool import Tool, build_tool_spec, register_tools_in_library
 from .exceptions import (
     AgentSpecDisabledError, AgentSpecInvalidError,
     PricingLimitExceededError, AuthenticationError, CacheProofError,
-    RateLimitError,
+    ContextWindowExceededError, RateLimitError,
 )
 from .slash_commands import REGISTRY as _slash_registry
 from ._journal import (
@@ -2929,6 +2929,36 @@ def compact_session(
     """
     messages = session["messages"]
     keep = session.get("compaction_keep_last_turns", DEFAULT_COMPACTION_KEEP_LAST_TURNS)
+    # Adaptively shrink the kept suffix when the provider rejects the summary
+    # request as too large: with a mis-sized trigger the history can be so big
+    # that even keep_last_turns=2 overflows the window.  The loop below drops
+    # to keep=0 (only the system prompt + summary survive) if needed.
+    # Phase 2 can legitimately reject an oversized summary request; the
+    # retry loop in compact_session() then shrinks `keep`.
+    while True:
+        try:
+            if _compact_once(client, model, session, messages, keep):
+                return True
+        except ContextWindowExceededError:
+            pass  # fall through to the keep-shrink below
+        else:
+            return False  # skipped, nothing compactable
+        if keep <= 0:
+            return False
+        keep = 0 if keep <= 1 else keep // 2
+        _emit(session, "compaction_retry", keep=keep,
+              fmt=f"{DIM}{MAG}[compaction] request too large; retrying with "
+                  f"keep_last_turns={keep}{RESET}")
+
+
+def _compact_once(
+    client: openai.OpenAI | SubprocessOpenAI,
+    model: str,
+    session: Session,
+    messages: list[dict[str, Any]],
+    keep: int,
+) -> bool:
+    """One compaction attempt keeping the last *keep* raw messages."""
 
     # Find the boundary: keep system prompt + last `keep` non-system messages.
     non_system_indices = [i for i, m in enumerate(messages) if m.get("role") != "system"]
@@ -3026,6 +3056,10 @@ def compact_session(
                             log_type="compaction_error", error_kind="rate_limit")
         return False
     except Exception as exc:
+        if _is_context_window_error(exc):
+            # Summary request itself is too large: signal the caller to
+            # retry with a smaller kept suffix.
+            raise ContextWindowExceededError(str(exc)) from exc
         err = f"Compaction failed: {exc}"
         _emit_and_log_error(session, exc, err, f"\n{RED}{err}{RESET}",
                             client=client, request_started_at=request_started_at,
@@ -3071,6 +3105,47 @@ def compact_session(
                    "ts": datetime.datetime.now().isoformat(timespec="seconds")})
     _save_messages_snapshot(session)
     return True
+
+
+_CONTEXT_LIMIT_RE = re.compile(
+    r"context.?length|context.?window|token.?limit|maximum.?context|"
+    r"too.?many.?tokens|prompt.?is.?too.?long|exceeds?.?(the)?.?model|"
+    r"request.?too.?large|input.?too.?long|reduce.?the.?length",
+    re.IGNORECASE,
+)
+
+
+def _is_context_window_error(exc: BaseException) -> bool:
+    """Return True when *exc* is a provider rejection for an over-limit prompt.
+
+    Detects, in order: our own :class:`ContextWindowExceededError`, then any
+    exception carrying a 400/413 status whose message mentions a context /
+    token limit (covers the OpenAI SDK's ``BadRequestError`` and simple
+    ``RuntimeError("... [HTTP 400] ...")`` wrappers raised by subprocess
+    clients).  Rate limits (429) never match.
+    """
+    if isinstance(exc, ContextWindowExceededError):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status = None
+    text = str(exc)
+    if status is None:
+        # Subprocess/simple clients embed the status in the message, e.g.
+        # ``RuntimeError("... [HTTP 400] ...")`` or the OpenAI SDK's
+        # ``"Error code: 413 - ..."`` — recover it from the text.
+        m = re.search(r"\bHTTP\s*(\d{3})\b|\bError code:\s*(\d{3})\b", text,
+                      re.IGNORECASE)
+        if m:
+            status = int(m.group(1) or m.group(2))
+    if status not in (400, 413):
+        return False
+    return bool(_CONTEXT_LIMIT_RE.search(text))
 
 
 # Backward-compatible alias for the pre-public name.
@@ -3448,6 +3523,11 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
 
     total_tokens = 0
     max_tokens   = DEFAULT_MAX_TOKENS
+    # Consecutive context-window rejections this turn.  Each rejection
+    # triggers a compaction+retry; a second consecutive rejection means the
+    # kept suffix alone no longer fits (pathological single tool result),
+    # so we stop rather than loop forever.
+    context_overflow_retries = 0
     # Pending model-facing token-awareness injection (countdown + optional
     # checkpoint reminder), suffixed onto the next tool-result message.
     pending_ta: str | None = None
@@ -3484,12 +3564,40 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                                     error_kind="rate_limit")
                 return _session_result(session)
             except Exception as exc:
+                if _is_context_window_error(exc):
+                    # The request never reached the model — the prompt exceeds
+                    # the provider's token limit (e.g. the compaction trigger
+                    # was misconfigured above the true context window, or a
+                    # tool result jumped the size between measurements).
+                    # Retry is only possible after shrinking the history.
+                    err = f"Context window exceeded: {exc}"
+                    _emit_and_log_error(session, exc, err,
+                                        f"\n{YEL}{err}{RESET}",
+                                        client=client,
+                                        request_started_at=request_started_at,
+                                        error_kind="context_window_exceeded")
+                    context_overflow_retries += 1
+                    compacted = compact_session(client, model, session)
+                    session["compaction_last_prompt_tokens"] = 0
+                    messages = session["messages"]
+                    if compacted and context_overflow_retries < 3:
+                        _emit(session, "context_overflow_retry",
+                              retries=context_overflow_retries,
+                              fmt=f"{DIM}{MAG}[context overflow] compacted; "
+                                  f"retrying the request{RESET}")
+                        continue
+                    _emit(session, "context_overflow_abort",
+                          retries=context_overflow_retries,
+                          fmt=f"\n{RED}Context window still exceeded after "
+                              f"compaction; aborting turn.{RESET}")
+                    return _session_result(session)
                 err = f"API error: {exc}"
                 _emit_and_log_error(session, exc, err, f"\n{RED}Error: {err}{RESET}",
                                     client=client, request_started_at=request_started_at)
                 return _session_result(session)
             _check_cancelled()
             msg   = resp.choices[0].message
+            context_overflow_retries = 0
 
             # Accumulate token usage from the response and surface it to the user.
             usage = getattr(resp, "usage", None)

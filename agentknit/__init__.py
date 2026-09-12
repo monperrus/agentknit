@@ -9,6 +9,7 @@ from .exceptions import (
     PricingLimitExceededError,
     AuthenticationError,
     CacheProofError,
+    ContextWindowExceededError,
     RateLimitError,
 )
 
@@ -63,6 +64,7 @@ from ._core import (
     compact_session,
     _compact_session,
     _maybe_compact,
+    _is_context_window_error,
     _journal_path,
 )
 
@@ -129,7 +131,7 @@ __all__ = [
     "extract_tool_specs_from_module",
     "AgentProbeError", "AgentSpecDisabledError", "AgentSpecInvalidError",
     "PricingLimitExceededError", "AuthenticationError", "CacheProofError",
-    "RateLimitError",
+    "ContextWindowExceededError", "RateLimitError",
     "main", "run",
     "validate_schema", "create_client", "run_task", "run_agent", "run_repl", "run_async_repl",
     "SessionResult", "Session", "CancelToken", "EventCallback", "_default_event_handler",
@@ -148,6 +150,7 @@ __all__ = [
     "_bind_schema_to_resumed_session", "_port_snapshot_to_model",
     "_handle_tool_call", "_complete",
     "compact_session", "_compact_session", "_maybe_compact",
+    "_is_context_window_error",
     "_journal_path",
     # durable recovery
     "DurableSink", "SessionJournal", "JournalState", "PendingToolCall", "KnownToolResult",

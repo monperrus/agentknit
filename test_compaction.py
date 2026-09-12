@@ -529,3 +529,78 @@ def test_compact_session_turn_count():
     # The compacted portion had 4 non-system messages (u1,a1,u2,a2).
     # Summary replaces them, so we have 1 system + 1 summary + 2 kept = 4.
     assert session["messages"][1].get("compacted_summary") is True
+
+
+# ── context-window overflow handling ──────────────────────────────────────────
+
+def test_is_context_window_error_detects_sdk_and_plain_errors():
+    """HTTP 400/413 with a token-limit message is a context-window error."""
+    from agentknit._core import _is_context_window_error
+    from agentknit import ContextWindowExceededError
+
+    class _SDKError(Exception):
+        status_code = 400
+
+    assert _is_context_window_error(ContextWindowExceededError("nope"))
+    assert _is_context_window_error(_SDKError(
+        '[HTTP 400] {"error":{"message":"Invalid request: Your request '
+        'exceeded model token limit: 1048576 (requested: 1680796)"}}'))
+    assert _is_context_window_error(RuntimeError(
+        "Error code: 413 - request too large"))
+    assert _is_context_window_error(_SDKError(
+        "This model's maximum context length is 128000 tokens"))
+    # Non-context 400s and rate limits never match.
+    assert not _is_context_window_error(_SDKError("invalid api key"))
+    assert not _is_context_window_error(RuntimeError("HTTP 429 rate limited"))
+    assert not _is_context_window_error(ValueError("no status at all"))
+
+
+def test_compact_session_shrinks_keep_on_context_overflow():
+    """When the summary request itself is too large, keep shrinks and retries."""
+    from agentknit import ContextWindowExceededError
+
+    session = _make_session(messages=[
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+    ])
+
+    class _OverflowOnceClient:
+        """Fails the summary phase (2nd call) once, then succeeds."""
+
+        def __init__(self):
+            self.calls = []
+
+        class _Chat:
+            def __init__(self, outer):
+                self._outer = outer
+
+            class _Completions:
+                def __init__(self, outer):
+                    self._outer = outer
+
+                def create(self, **kwargs):
+                    self._outer.calls.append(kwargs)
+                    n = len(self._outer.calls)
+                    if n == 2:
+                        raise ContextWindowExceededError(
+                            "[HTTP 400] request exceeded model token limit",
+                            status_code=400)
+                    return _FakeResponse("summary" if n > 2 else "pre-notes")
+
+            def __init__(self, outer):
+                self.completions = self._Completions(outer)
+
+        @property
+        def chat(self):
+            return self._Chat(self)
+
+    client = _OverflowOnceClient()
+    assert _compact_session(client, "m", session) is True
+    # pre-compaction + failed summary + pre-compaction (keep=1) + summary.
+    assert len(client.calls) == 4
+    assert session["messages"][1].get("compacted_summary") is True
+    # With keep=1, only the last raw message survives after the summary.
+    assert session["messages"][-1]["content"] == "a2"

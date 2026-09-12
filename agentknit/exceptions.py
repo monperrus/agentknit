@@ -37,6 +37,24 @@ class PricingLimitExceededError(AgentProbeError):
         self.limit         = limit
 
 
+class ContextWindowExceededError(AgentProbeError):
+    """Raised (or detected) when the provider rejects the request because the
+    prompt exceeds the model's token limit (typically HTTP 400/413).
+
+    This is a per-request fit problem, not a rate limit: retrying the same
+    payload can never succeed.  The agent loop treats it as a signal to
+    compact the history and retry immediately.
+    """
+
+    def __init__(self, message: str, *, status_code: int = 400,
+                 requested_tokens: int | None = None,
+                 limit_tokens: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.requested_tokens = requested_tokens
+        self.limit_tokens = limit_tokens
+
+
 class CacheProofError(AgentProbeError):
     """Raised when strict cache-proof mode does not observe a cache hit."""
 

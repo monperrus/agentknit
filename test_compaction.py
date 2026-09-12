@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
-
 from agentknit._core import (
     compact_session,
     _compact_session,
@@ -573,29 +571,28 @@ def test_compact_session_shrinks_keep_on_context_overflow():
         def __init__(self):
             self.calls = []
 
-        class _Chat:
-            def __init__(self, outer):
-                self._outer = outer
-
             class _Completions:
-                def __init__(self, outer):
-                    self._outer = outer
+                def __init__(comp_self, outer):
+                    comp_self._outer = outer
 
-                def create(self, **kwargs):
-                    self._outer.calls.append(kwargs)
-                    n = len(self._outer.calls)
+                def create(comp_self, **kwargs):
+                    self.calls.append(kwargs)
+                    n = len(self.calls)
                     if n == 2:
                         raise ContextWindowExceededError(
                             "[HTTP 400] request exceeded model token limit",
                             status_code=400)
                     return _FakeResponse("summary" if n > 2 else "pre-notes")
 
-            def __init__(self, outer):
-                self.completions = self._Completions(outer)
+            class _Chat:
+                def __init__(chat_self, outer):
+                    chat_self.completions = _Completions(outer)
+
+            self._chat = _Chat(self)
 
         @property
         def chat(self):
-            return self._Chat(self)
+            return self._chat
 
     client = _OverflowOnceClient()
     assert _compact_session(client, "m", session) is True

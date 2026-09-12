@@ -1566,6 +1566,14 @@ def _save_messages_snapshot(session: Session) -> None:
             "tools": tool_names,
             "agentknit_commit": _agentknit_commit(),
             "auth": dict(session.get("auth") or {}),
+            # Compaction knobs so a resumed session keeps the trigger that
+            # matches its context window (informational; runtime state lives
+            # in the session dict itself).
+            "compaction": {
+                "enabled": bool(session.get("compaction_enabled", True)),
+                "trigger_tokens": session.get("compaction_trigger_tokens"),
+                "target_tokens": session.get("compaction_target_tokens"),
+            },
             # Token-awareness knobs so a resumed session keeps identical
             # countdown semantics (informational; runtime state lives in
             # the session dict itself).
@@ -3128,6 +3136,9 @@ def _is_context_window_error(exc: BaseException) -> bool:
         return True
     status = getattr(exc, "status_code", None)
     if status is None:
+        # urllib.error.HTTPError exposes .status / .code, not .status_code.
+        status = getattr(exc, "status", None) or getattr(exc, "code", None)
+    if status is None:
         response = getattr(exc, "response", None)
         status = getattr(response, "status_code", None)
     try:
@@ -3145,7 +3156,21 @@ def _is_context_window_error(exc: BaseException) -> bool:
             status = int(m.group(1) or m.group(2))
     if status not in (400, 413):
         return False
-    return bool(_CONTEXT_LIMIT_RE.search(text))
+    if _CONTEXT_LIMIT_RE.search(text):
+        return True
+    # The plain-urllib transport (openai_compat.OpenAI) raises
+    # ``HTTPError("400 Client Error: Bad Request for url: ...")`` whose
+    # message carries no body.  Read the provider's error body from the
+    # exception itself and match against that too.
+    try:
+        body = exc.read()  # type: ignore[attr-defined]
+        if isinstance(body, bytes):
+            body = body.decode("utf-8", "replace")
+        if body and _CONTEXT_LIMIT_RE.search(str(body)):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 # Backward-compatible alias for the pre-public name.

@@ -176,3 +176,25 @@ def test_non_context_400_still_aborts(monkeypatch) -> None:
     _run(monkeypatch, client, session)
     # No compaction happened: history untouched, turn aborted.
     assert len(session["messages"]) == n_before
+
+
+def test_httperror_body_detection() -> None:
+    """urllib.error.HTTPError (raised by openai_compat.OpenAI) exposes the
+    provider's error body via .read(); the message alone has no details."""
+    import io as _io
+    import urllib.error
+    from agentknit._core import _is_context_window_error
+
+    body = ('{"error":{"message":"Invalid request: Your request exceeded '
+            'model token limit: 1048576 (requested: 1680796)"}}').encode()
+    err = urllib.error.HTTPError(
+        "https://api.kimi.com/coding/v1/chat/completions", 400, "Bad Request",
+        {}, _io.BytesIO(body))
+    assert str(err) == ("HTTP Error 400: Bad Request")
+    assert _is_context_window_error(err)
+
+    # A 400 whose body is NOT about context limits must not match.
+    other = urllib.error.HTTPError(
+        "https://api.test/v1/chat/completions", 400, "Bad Request",
+        {}, _io.BytesIO(b'{"error":{"message":"invalid api key"}}'))
+    assert not _is_context_window_error(other)

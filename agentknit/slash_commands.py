@@ -136,6 +136,35 @@ class SlashCommandRegistry:
 
 # ── built-in command handlers ─────────────────────────────────────────────────
 
+def _handle_hooks(session: Session, client: Any, model: str, args: str) -> None:
+    """List configured hooks: event, matcher, handler, source."""
+    from .hooks import HOOKS_NEVER_FIRE
+
+    entries = session.get("hooks") or []
+    if not entries:
+        print("No hooks configured. Add ~/.agentknit/hooks.json, "
+              "<git-root>/.agentknit/hooks.json, spec behaviour.hooks, "
+              "or register_hook().")
+        return
+    if not session.get("hooks_enabled", True):
+        print(f"{YEL}hooks are disabled for this session (hooks_enabled=false){RESET}")
+    by_event: dict[str, list[Any]] = {}
+    for e in entries:
+        by_event.setdefault(e.event, []).append(e)
+    for event in sorted(by_event):
+        marker = f" {DIM}(never fires: no such lifecycle point yet){RESET}" \
+            if event in HOOKS_NEVER_FIRE else ""
+        print(f"{BOLD}{event}{RESET}{marker}")
+        for e in by_event[event]:
+            print(f"  {e.matcher or '*':<24} {e.handler.describe()}"
+                  f"  {DIM}[{e.source}]{RESET}")
+    state = session.get("_hook_state") or {}
+    pending = len(state.get("pending_context") or [])
+    queued = len(state.get("async_results") or [])
+    if pending or queued:
+        print(f"{DIM}pending context: {pending}, queued async results: {queued}{RESET}")
+
+
 def _handle_clear(session: Session, client: Any, model: str, args: str) -> None:
     """Reset the session message history, keeping only the system prompt."""
     # Keep the first message (the system prompt).
@@ -157,6 +186,9 @@ def _handle_clear(session: Session, client: Any, model: str, args: str) -> None:
                                "cached": 0, "cache_write": 0}
     # Reset compaction watermark so the next growth cycle can trigger again.
     session["compaction_last_prompt_tokens"] = 0
+    # SessionEnd hooks fire for /clear with reason="clear" (advisory).
+    from ._core import _fire_session_end
+    _fire_session_end(session, "clear")
     print(f"{GREEN}Context cleared. Session history has been reset.{RESET}")
 
 
@@ -340,6 +372,11 @@ REGISTRY.register(SlashCommand(
     handler=_handle_usage,
 ))
 REGISTRY.register(SlashCommand(
+    name="hooks",
+    description="List configured lifecycle hooks and their sources.",
+    handler=_handle_hooks,
+))
+REGISTRY.register(SlashCommand(
     name="help",
     description="Show this help message.",
     handler=_handle_help,
@@ -356,6 +393,7 @@ _HANDLERS: dict[str, Callable[..., object]] = {
     "compact": _handle_compact,
     "model":   _handle_model,
     "usage":   _handle_usage,
+    "hooks":   _handle_hooks,
     "help":    _handle_help,
 }
 
@@ -363,7 +401,7 @@ _HANDLERS: dict[str, Callable[..., object]] = {
 def t_slash_command(command: str, args: str = "") -> tuple[str, dict[str, object]]:
     """Run a slash command and return its output as a tool result.
 
-    command must be one of: clear, compact, model, usage, help.
+    command must be one of: clear, compact, model, usage, hooks, help.
     For 'model', pass a model-id in args to switch; omit to list.
 
     Populate :data:`slash_tool_ctx` with the live session, client, and model
@@ -390,7 +428,7 @@ from .tool import Tool as _Tool  # noqa: E402
 
 SLASH_COMMAND_TOOL = _Tool(
     "slash_command",
-    "Run a slash command. command: one of clear, compact, model, usage, help. "
+    "Run a slash command. command: one of clear, compact, model, usage, hooks, help. "
     "For 'model', pass a model-id in args to switch; omit args to list.",
     t_slash_command,
     parameters={
@@ -398,7 +436,7 @@ SLASH_COMMAND_TOOL = _Tool(
         "properties": {
             "command": {
                 "type": "string",
-                "enum": ["clear", "compact", "model", "usage", "help"],
+                "enum": ["clear", "compact", "model", "usage", "hooks", "help"],
                 "description": "Slash command to run.",
             },
             "args": {

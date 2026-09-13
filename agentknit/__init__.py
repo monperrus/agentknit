@@ -78,6 +78,16 @@ from ._journal import (
     replay_journal,
 )
 
+from .hooks import (
+    HookBlock,
+    HookDecision,
+    HookEntry,
+    HookHandler,
+    RawHookResult,
+    load_hooks,
+    register_hook,
+)
+
 from .tool import (
     Tool,
     build_tool_spec,
@@ -155,6 +165,9 @@ __all__ = [
     # durable recovery
     "DurableSink", "SessionJournal", "JournalState", "PendingToolCall", "KnownToolResult",
     "new_call_id", "replay_journal",
+    # hooks (Claude Code / Codex-compatible)
+    "HookBlock", "HookDecision", "HookEntry", "HookHandler",
+    "RawHookResult", "load_hooks", "register_hook",
     "Tool",
     "build_tool_spec",
     "register_tools_in_library",

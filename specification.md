@@ -102,6 +102,8 @@ Key resolution order: `keyring_service`+`keyring_username` → `key_env` → `AP
 | Key | Values | Description |
 |---|---|---|
 | `call_delivery_mode` | `"structured_tool_calls"` (default) / `"inline"` | `"structured_tool_calls"` uses the API's native function-calling mechanism.  `"inline"` injects a text-based tool schema into the system prompt and parses tool calls from the model's plain-text output. |
+| `hooks` | object / string / array | Claude Code / Codex-compatible lifecycle hooks: an inline hooks config (event map or full `{"hooks": {...}}` shape), a path to a `hooks.json`-shaped file, or a list of either. Layers merge additively with `<git-root>/.agentknit/hooks.json` and `~/.agentknit/hooks.json`. See the Hooks section of the README for the event set and the exit-code / JSON output contract. |
+| `hooks_enabled` | boolean, default `true` | Master switch for all hooks, whatever their source. Also settable as a top-level spec key, an `init_session`/`run_task` kwarg, and the CLI's `--no-hooks`. |
 | `resume_rejects_stale_tool_call_ids` | boolean, default `false` | Set `true` only for providers that reject tool-call IDs minted in a previous API session on resume (HTTP 400 "Upstream request failed" — seen on opencode.ai / deepseek-v4-flash-free). When `true`, resumed history has its `tool_calls` / tool results flattened into a neutral `prior tool use: name(args) -> ok` summary line instead of being replayed as structured messages. Leave `false` (the default) so resumed history keeps real structured tool calls — flattening unconditionally teaches the model that tool results are plain text it can write itself, which it will then fabricate (see [issue #25](https://github.com/monperrus/agentknit/issues/25)). |
 
 ---

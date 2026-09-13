@@ -130,6 +130,14 @@ from .exceptions import (
     ContextWindowExceededError, RateLimitError,
 )
 from .slash_commands import REGISTRY as _slash_registry
+from .hooks import (
+    HookDecision,
+    HookEntry,
+    canonical_tool_name,
+    translate_updated_input,
+    load_hooks as _load_hooks,
+    run_hooks as _run_hooks,
+)
 from ._journal import (
     DurableSink,
     SessionJournal,
@@ -336,9 +344,21 @@ def _sigint_handler(sig: int, frame: object) -> None:
     When the agent is executing a tool (run_turn is active), immediately
     SIGKILL the current subprocess (if any) then raise KeyboardInterrupt so
     run_turn unwinds back to the REPL.  When idle at the prompt, do nothing.
+
+    Before aborting, Interrupt hooks fire (advisory, 1 s budget): they can
+    record the interruption or clean up work a hook started, but cannot
+    prevent the interrupt.
     """
     if not _in_turn:
         return
+    _active_session = getattr(_sigint_handler, "session", None)
+    if _active_session is not None:
+        try:
+            _fire_hooks(_active_session, "Interrupt",
+                        turn_id=(_active_session.get("_hook_state") or {})
+                        .get("turn_id"))
+        except Exception:
+            pass
     proc = _tool_module._active_proc
     if proc is not None:
         try:
@@ -1197,6 +1217,20 @@ def _git_config_value(key: str) -> "str | None":
     return value or None
 
 
+def _git_root() -> Path:
+    """Root of the enclosing git work tree, or cwd when not in one."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return Path.cwd()
+    root = out.stdout.strip()
+    return Path(root) if root else Path.cwd()
+
+
 def _git_status_block() -> "str | None":
     """Git status lines for the system prompt; None outside a git repo."""
     import subprocess
@@ -1244,6 +1278,90 @@ def _scratchpad_dir(cwd: Path) -> Path:
     import tempfile
     digest = hashlib.sha1(str(cwd).encode()).hexdigest()[:8]
     return Path(tempfile.gettempdir()) / f"agentknit-scratchpad-{cwd.name}-{digest}"
+
+
+# ── hooks integration ─────────────────────────────────────────────────────────
+
+def _hooks_enabled(session: Session) -> bool:
+    """True when the session has hooks and they are not disabled."""
+    return bool(session.get("hooks_enabled", True)) and bool(session.get("hooks"))
+
+
+def _hook_notify(session: Session) -> "Callable[[str, dict[str, Any]], None]":
+    """Event callback for hook infrastructure messages (status/warning)."""
+    def _notify(event_type: str, data: dict[str, Any]) -> None:
+        _emit(session, event_type, **data)
+    return _notify
+
+
+def _fire_hooks(session: Session, event: str, matcher_values: "list[str]" = [],
+                **extra: Any) -> HookDecision:
+    """Run the session's matching hooks for *event*; never raises.
+
+    Builds the common input payload (the shared Claude/Codex field set plus
+    agentknit aliases), dispatches through :func:`agentknit.hooks.run_hooks`,
+    surfaces ``systemMessage`` and errors as ``hook_warning`` events and
+    ``hook_error`` log records, and queues ``additionalContext`` as pending
+    model-facing context.  Returns the combined decision (an empty
+    ``HookDecision`` when hooks are disabled or none match).
+    """
+    if not _hooks_enabled(session):
+        return HookDecision()
+    cwd = str(session.get("_cwd") or Path.cwd())
+    payload: dict[str, Any] = {
+        "session_id": session.get("session_id", ""),
+        "transcript_path": str(session.get("log_path") or "") or None,
+        "cwd": cwd,
+        "hook_event_name": event,
+        "model": session.get("model", ""),
+        "permission_mode": "dontAsk" if session.get("non_interactive") else "default",
+        "scratchpad_dir": str(_scratchpad_dir(Path(cwd))),
+        "prompt_id": (session.get("_hook_state") or {}).get("turn_id"),
+    }
+    payload.update(extra)
+    state = session.setdefault("_hook_state", {})
+    decision = _run_hooks(
+        session.get("hooks") or [], event, payload,
+        cwd=cwd, matcher_values=matcher_values, state=state,
+        spill_dir=session.get("session_dir") or (session.get("log_path") or Path()).parent,
+        notify=_hook_notify(session),
+    )
+    if decision.error:
+        _emit(session, "hook_warning", text=decision.error,
+              fmt=f"{YEL}⚠ hook error: {decision.error}{RESET}")
+        _log(session, {"type": "hook_error", "event": event,
+                       "error": decision.error,
+                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+    if decision.system_message and decision.error != decision.system_message:
+        _emit(session, "hook_warning", text=decision.system_message,
+              fmt=f"{YEL}[hook] {decision.system_message}{RESET}")
+    if decision.additional_context:
+        state.setdefault("pending_context", []).append(decision.additional_context)
+    return decision
+
+
+def _hook_tool_payload_fields(session: Session, name: str, args: dict[str, Any],
+                              call_id: str) -> dict[str, Any]:
+    """Event-specific fields for PreToolUse / PostToolUse."""
+    return {
+        "tool_name": canonical_tool_name(name),
+        "agentknit_tool_name": name,
+        "tool_input": args,
+        "tool_use_id": call_id,
+    }
+
+
+def _drain_pending_hook_context(session: Session) -> str | None:
+    """Pop queued ``additionalContext`` from async hooks, if any."""
+    state = session.get("_hook_state") or {}
+    queued = state.pop("async_results", None) or []
+    texts = [q["context"] for q in queued if q.get("context")]
+    for q in queued:
+        if q.get("system_message") and not _hooks_enabled(session):
+            pass
+    if not texts:
+        return None
+    return "\n".join(texts)
 
 
 def _cpu_count() -> "int | None":
@@ -2234,6 +2352,11 @@ class Session(TypedDict):
     compaction_policy: "str | Callable[..., bool]"
     compaction_min_chars: int
     compaction_last_prompt_tokens: int
+    # hooks (Claude Code / Codex-compatible lifecycle hooks)
+    # NotRequired: sessions snapshotted before hooks existed lack these keys;
+    # the restore path backfills defaults (empty list, enabled).
+    hooks: NotRequired[list[HookEntry]]
+    hooks_enabled: NotRequired[bool]
     # token awareness (model-facing countdown)
     # NotRequired: sessions snapshotted before token awareness existed lack
     # these keys; the restore path backfills defaults (enabled, counting
@@ -2259,6 +2382,10 @@ class Session(TypedDict):
     _event_handlers: NotRequired[dict[str, list[EventCallback]]]
     _content_was_streamed: NotRequired[bool]
     _durable_capture: NotRequired[bool]
+    # hooks runtime state: turn id (prompt_id), stop_hook_active guard,
+    # pending additionalContext, and results of async hooks.
+    _hook_state: NotRequired[dict[str, Any]]
+    _cwd: NotRequired[Path]
     _cache_cold_warned: NotRequired[bool]
     # "ok" once a cache read/write has been observed, "missing" when a
     # post-first-call response exposed no cache proof.  A UI can surface
@@ -2292,6 +2419,8 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                  durable: bool | None = None,
                  session_dir: str | Path | None = None,
                  durable_sink: DurableSink | None = None,
+                 hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
+                 hooks_enabled: bool | None = None,
                  ) -> "Session":
     """Build a stateful session dict (:class:`Session`).
 
@@ -2369,6 +2498,18 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     ordered lifecycle stream.  It is called only after the built-in journal
     commits, and before any event handler, model request, or tool dispatch
     consumes that record.  Exceptions stop the operation that produced it.
+
+    ``hooks`` — Claude Code / Codex-compatible lifecycle hooks.  Accepts a
+    path to a ``hooks.json``-shaped file, an inline config dict, or a list
+    of either; layers merge additively with the user-level
+    (``~/.agentknit/hooks.json``) and project-level
+    (``<git-root>/.agentknit/hooks.json``) files discovered automatically.
+    Python hooks can be added programmatically via
+    :func:`agentknit.hooks.register_hook` (strictly equivalent to a command
+    hook — both go through the same normalization).
+
+    ``hooks_enabled`` — master switch (default ``True``).  ``False``
+    disables all hooks for the session.
     """
     # A resumed session must run (and re-save its snapshot) on the endpoint
     # it was created on — bind here so every caller is covered, including
@@ -2476,6 +2617,15 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             restored["token_awareness_update_every"] = token_awareness_update_every
         if durable is not None:
             restored["durable"] = durable
+        # Hooks: restored sessions keep their configured hooks unless the
+        # caller passes an explicit override; load-from-source happens in
+        # _collect_hook_layers for fresh sessions, so a restore keeps the
+        # entries that were already parsed into the session dict.
+        if hooks_enabled is not None:
+            restored["hooks_enabled"] = hooks_enabled
+        if hooks is not None:
+            _load_hooks(cast("dict[str, Any]", restored), hooks)
+        restored.setdefault("hooks_enabled", True)
         # Reopen (or start) the session journal on restore.
         restored["_journal"] = (
             SessionJournal(_journal_path(restored.get("model") or "unknown",
@@ -2548,6 +2698,27 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         .get("supported", False)
     )
     session_start_ts = datetime.datetime.now().isoformat(timespec="seconds")
+    # ── hooks: discover config layers, merge additively ───────────────────
+    from .hooks import parse_hooks_config as _parse_hooks_config
+    behaviour_hooks = behaviour.get("hooks")
+    hook_sources: list[Any] = []
+    # Explicit kwarg first, then the spec's behaviour hooks, then the
+    # project layer (<git-root>/.agentknit/hooks.json) and the user layer.
+    if hooks is not None:
+        hook_sources.append(hooks)
+    if behaviour_hooks:
+        hook_sources.append(behaviour_hooks)
+    hook_sources.append(_git_root() / ".agentknit" / "hooks.json")
+    hook_sources.append(Path.home() / ".agentknit" / "hooks.json")
+    session_hooks: list[HookEntry] = []
+    for source in hook_sources:
+        entries, warnings = _parse_hooks_config(source)
+        session_hooks.extend(entries)
+        for w in warnings:
+            # Missing files are normal (layers are optional); anything else
+            # is a real config problem worth surfacing at startup.
+            if "not found" not in w:
+                print(f"{YEL}⚠ hooks: {w}{RESET}", file=sys.stderr)
     session = cast(Session, {
         "messages":        [{"role": "system", "content": sys_msg,
                              "ts": session_start_ts}],
@@ -2636,6 +2807,15 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             ) else None,
         "durable_sink": durable_sink,
         "_durable_capture": session_dir is not None or durable_sink is not None,
+        # ── hooks ────────────────────────────────────────────────────────
+        "hooks": session_hooks,
+        "hooks_enabled": (
+            hooks_enabled if hooks_enabled is not None
+            else schema.get("hooks_enabled", True)
+        ),
+        "_hook_state": {"turn_id": None, "stop_hook_active": False,
+                        "pending_context": [], "async_results": []},
+        "_cwd": Path.cwd(),
     })
     # The system prompt becomes durable before the session can send it or
     # report any startup event.
@@ -2649,6 +2829,17 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                    "sandbox_policy": (tool_executor.policy.metadata()  # type: ignore[union-attr]
                                       if getattr(tool_executor, "policy", None) else None),
                    "ts": session_start_ts})
+    # SessionStart hooks: context-only, cannot block.  additionalContext is
+    # appended to the system prompt (developer context at conversation
+    # start); the pending-queue path is for mid-conversation events.
+    _ss = _fire_hooks(session, "SessionStart",
+                      matcher_values=["resume" if resumed_from else "startup"],
+                      source="resume" if resumed_from else "startup")
+    _ss_ctx = _ss.additional_context
+    _async_ctx = _drain_pending_hook_context(session)
+    for _ctx in (_ss_ctx, _async_ctx):
+        if _ctx:
+            session["messages"][0]["content"] += "\n\n" + _ctx
     if resumed_from:
         flatten_resume = bool(behaviour.get("resume_rejects_stale_tool_call_ids"))
         if session_dir is not None:
@@ -2976,6 +3167,17 @@ def compact_session(
     Returns ``True`` if the history was compacted, ``False`` if skipped.
     """
     messages = session["messages"]
+    # ── PreCompact hooks ───────────────────────────────────────────────
+    # A block (or continue:false) skips this compaction; the hysteresis
+    # watermark is not updated, so the next growth cycle re-triggers.
+    trigger_kind = ("manual" if prompt_tokens is None and
+                    not session.get("compaction_last_prompt_tokens") else "auto")
+    pre = _fire_hooks(session, "PreCompact", matcher_values=[trigger_kind],
+                      trigger=trigger_kind)
+    if pre.block or pre.stop:
+        _emit(session, "compaction_skipped", reason="PreCompact hook",
+              fmt=f"{DIM}[compaction] skipped by PreCompact hook{RESET}")
+        return False
     keep = session.get("compaction_keep_last_turns", DEFAULT_COMPACTION_KEEP_LAST_TURNS)
     # Server-reported prompt size at the trigger moment, for the user-facing
     # message.  Passed by the caller when known; falls back to the session
@@ -2991,7 +3193,8 @@ def compact_session(
     # retry loop in compact_session() then shrinks `keep`.
     while True:
         try:
-            if _compact_once(client, model, session, messages, keep):
+            if _compact_once(client, model, session, messages, keep,
+                             trigger_kind=trigger_kind):
                 return True
         except ContextWindowExceededError:
             pass  # fall through to the keep-shrink below
@@ -3011,6 +3214,7 @@ def _compact_once(
     session: Session,
     messages: list[dict[str, Any]],
     keep: int,
+    trigger_kind: str = "auto",
 ) -> bool:
     """One compaction attempt keeping the last *keep* raw messages."""
 
@@ -3158,6 +3362,9 @@ def _compact_once(
                    "summary": summary,
                    "ts": datetime.datetime.now().isoformat(timespec="seconds")})
     _save_messages_snapshot(session)
+    # ── PostCompact hooks (advisory + additionalContext) ────────────────
+    _fire_hooks(session, "PostCompact", matcher_values=[trigger_kind],
+                trigger=trigger_kind)
     return True
 
 
@@ -3302,6 +3509,57 @@ def _handle_tool_call(
     entry = tool_dispatch.get(name) or {}
     is_ask = entry.get("python_function") in _ASK_USER_FNS
 
+    # ── PreToolUse hooks ───────────────────────────────────────────────
+    # Fired *before* the journal write-ahead so a rewritten updatedInput is
+    # what gets journaled in tool_start — durable replay then shows the
+    # args that actually ran, with no extra journal machinery.  A deny
+    # (exit 2 / permissionDecision deny) writes tool_end with
+    # outcome=hook_deny and returns the reason as the tool result.
+    pre = _fire_hooks(session, "PreToolUse",
+                      matcher_values=[canonical_tool_name(name), name],
+                      **_hook_tool_payload_fields(session, name, args, call_id))
+    _ask_hook_confirm = None
+    if pre.permission_decision == "deny" or pre.block:
+        reason = (pre.reason or pre.permission_decision_reason
+                  or "tool call blocked by PreToolUse hook")
+        result = f"ERROR: tool call denied by hook: {reason}"
+        journal = session.get("_journal")
+        if journal is not None:
+            _write_journal_record(session, {"type": "tool_start", "call_id": call_id,
+                                            "name": name, "args": args})
+            _write_journal_record(session, {"type": "tool_end", "call_id": call_id,
+                                            "name": name, "result": result,
+                                            "outcome": "hook_deny"})
+        _emit(session, "tool_call", name=name, args=args, fmt=fmt_call(name, args))
+        _emit(session, "tool_result", name=name, result=result, streamed=False,
+              files=None, diff_summary=None, fmt=fmt_result(result))
+        _log(session, {"type": "tool_result", "name": name,
+                       "python_function": getattr(entry.get("python_function"),
+                                                  "__name__",
+                                                  entry.get("python_function")),
+                       "result": result, "hook": "PreToolUse:deny",
+                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+        return result
+    if pre.updated_input is not None:
+        # Claude/Codex updatedInput replaces the whole input object.  Alias
+        # translation maps Claude argument names onto agentknit's native
+        # ones (file_path→path, old_string→old_str, …).
+        try:
+            args = translate_updated_input(pre.updated_input)
+        except Exception as exc:  # non-blocking: proceed with original args
+            _emit(session, "hook_warning", text=str(exc),
+                  fmt=f"{YEL}⚠ hook updatedInput rejected: {exc}{RESET}")
+        else:
+            _log(session, {"type": "tool_call_rewritten", "name": name,
+                           "args": args,
+                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+    if pre.permission_decision == "ask" and not non_interactive:
+        # Map "ask" onto agentknit's interactive surface: confirm with the
+        # user before dispatch (the ask_user machinery pauses the input
+        # collector when one is running).
+        _ask_hook_confirm = pre.permission_decision_reason or (
+            f"hook asks for confirmation before {name}")
+
     journal = session.get("_journal")
     if journal is not None:
         # Write-ahead: persisted before the tool runs, so a crash between
@@ -3325,6 +3583,43 @@ def _handle_tool_call(
         log_data: dict[str, Any] = {"result": result}
         streamed = False
     else:
+        if _ask_hook_confirm is not None:
+            # PreToolUse "ask": confirm with the user before dispatch.
+            collector = _tool_module._input_collector
+            if collector is not None:
+                collector.pause()
+            try:
+                answer = input(f"{YEL}? {_ask_hook_confirm}{RESET} "
+                               f"[y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+                print()
+            finally:
+                if collector is not None:
+                    collector.resume()
+            if answer not in ("y", "yes"):
+                result = ("ERROR: tool call denied by user "
+                          "(PreToolUse hook asked)")
+                log_data = {"result": result}
+                streamed = False
+                journal = session.get("_journal")
+                if journal is not None:
+                    _write_journal_record(session, {"type": "tool_end",
+                                                    "call_id": call_id,
+                                                    "name": name,
+                                                    "result": result,
+                                                    "outcome": "hook_ask_deny"})
+                _emit(session, "tool_result", name=name, result=result,
+                      streamed=False, files=None, diff_summary=None,
+                      fmt=fmt_result(result))
+                _log(session, {"type": "tool_result", "name": name,
+                               "python_function": getattr(
+                                   entry.get("python_function"), "__name__",
+                                   entry.get("python_function")),
+                               "result": result, "hook": "PreToolUse:ask-deny",
+                               "ts": datetime.datetime.now().isoformat(
+                                   timespec="seconds")})
+                return result
         try:
             executor = session.get("tool_executor")
             if executor is None:
@@ -3379,6 +3674,23 @@ def _handle_tool_call(
             command = _tool_module.get_async_command_for_output_path(path)
             if command:
                 fmt = fmt_read_result_with_command(command, result, streamed=streamed)
+
+    # ── PostToolUse hooks ──────────────────────────────────────────────
+    # Cannot undo the tool; decision:block / exit 2 replaces the result the
+    # model sees with the reason, updatedToolOutput replaces the text.
+    post = _fire_hooks(session, "PostToolUse",
+                       matcher_values=[canonical_tool_name(name), name],
+                       **_hook_tool_payload_fields(session, name, args, call_id),
+                       tool_response=result)
+    if post.updated_tool_output is not None:
+        result = post.updated_tool_output
+        streamed = False
+        fmt = fmt_result(result, streamed=False)
+    if post.block:
+        reason = post.reason or "tool output rejected by PostToolUse hook"
+        result = f"ERROR: PostToolUse hook rejected this tool result: {reason}"
+        streamed = False
+        fmt = fmt_result(result, streamed=False)
 
     if journal is not None:
         # Persisted only after the side effects have happened: a tool_end
@@ -3540,6 +3852,8 @@ def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Sess
 
     global _in_turn
     _in_turn = True
+    # Interrupt hooks need the live session; SIGINT may arrive mid-turn.
+    _sigint_handler.session = session  # type: ignore[attr-defined]
     try:
         if tool_executor is not None:
             session["tool_executor"] = tool_executor
@@ -3551,6 +3865,7 @@ def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Sess
         if timer is not None:
             timer.cancel()
         _in_turn = False
+        _sigint_handler.session = None  # type: ignore[attr-defined]
 
 
 def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Session, task: str | None,
@@ -3560,6 +3875,26 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
     tools      = session["tools"]
     structured = session["structured"]
     journal    = session.get("_journal")
+
+    # Per-turn hook state: fresh prompt_id, reset the Stop-continuation guard.
+    hook_state = session.setdefault("_hook_state", {})
+    hook_state["turn_id"] = uuid.uuid4().hex
+    hook_state["stop_hook_active"] = False
+
+    # ── UserPromptSubmit hooks ─────────────────────────────────────────
+    # Fires before the task message is appended; block rejects the prompt
+    # (nothing is sent to the model) and the reason becomes final_reply.
+    if task is not None:
+        ups = _fire_hooks(session, "UserPromptSubmit", prompt=task)
+        if ups.block or ups.stop:
+            reason = (ups.stop_reason or ups.reason
+                      or "prompt blocked by UserPromptSubmit hook")
+            notice = f"Prompt rejected by hook: {reason}"
+            _log(session, {"type": "user_prompt_blocked", "reason": reason,
+                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+            _emit(session, "hook_warning", text=notice,
+                  fmt=f"{YEL}{notice}{RESET}")
+            return _session_result_with_reply(session, notice)
 
     if journal is not None:
         _write_journal_record(session, {"type": "turn_start", "task": task})
@@ -3608,6 +3943,16 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
         if pending_ta:
             text = f"{text}\n\n{pending_ta}"
             pending_ta = None
+        # Hook additionalContext rides the same suffix path (Claude-API
+        # semantics: no extra messages, cache-friendly).  Async hooks'
+        # informational output is drained at this safe point too.
+        async_ctx = _drain_pending_hook_context(session)
+        if async_ctx:
+            text = f"{text}\n\n{async_ctx}"
+        state = session.get("_hook_state") or {}
+        queued = state.pop("pending_context", None) or []
+        if queued:
+            text = f"{text}\n\n" + "\n".join(queued)
         return text
 
     def _check_cancelled() -> None:
@@ -3843,6 +4188,28 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             _emit(session, "session_usage", **t,
                   fmt=(f"{DIM}{MAG}[session tokens] prompt {t['prompt']:,}{cached_part}  |  "
                        f"completion {t['completion']:,}{RESET}\n"))
+            # ── Stop hooks ─────────────────────────────────────────────
+            # decision:block / exit 2 refuses to stop: the reason becomes a
+            # new user message and the loop continues.  stop_hook_active
+            # guards against infinite continuation (a second block while
+            # already true is ignored), exactly Claude/Codex's guard.
+            state = session.setdefault("_hook_state", {})
+            if not state.get("stop_hook_active"):
+                stop = _fire_hooks(
+                    session, "Stop",
+                    stop_hook_active=False,
+                    last_assistant_message=text)
+                if stop.block and stop.reason:
+                    state["stop_hook_active"] = True
+                    _append_message({
+                        "role": "user", "content": stop.reason,
+                        "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                    continue
+            else:
+                # Guarded continuation: report the active flag but ignore a
+                # second block, exactly Claude/Codex's loop guard.
+                _fire_hooks(session, "Stop", stop_hook_active=True,
+                            last_assistant_message=text)
             # Build the result before turn-end compaction so final_reply
             # survives even when the policy summarizes the whole history away.
             session_result = _session_result(session)
@@ -4104,6 +4471,16 @@ def _session_result(session: Session) -> SessionResult:
     )
 
 
+def _session_result_with_reply(session: Session, reply: str) -> SessionResult:
+    """SessionResult carrying an explicit final reply (hook-blocked prompt)."""
+    return SessionResult(
+        session_id  = session["session_id"],
+        final_reply = reply,
+        usage       = dict(session["usage_totals"]),
+        messages    = session["messages"],
+    )
+
+
 def _endpoint_is_openrouter(endpoint: str | None) -> bool:
     """True if *endpoint* points at openrouter.ai."""
     try:
@@ -4246,6 +4623,8 @@ def run_task(
     session_dir: str | Path | None = None,
     durable_sink: DurableSink | None = None,
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
+    hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
+    hooks_enabled: bool | None = None,
 ) -> SessionResult:
     """Run a single task against the agent and return a :class:`SessionResult`.
 
@@ -4298,6 +4677,8 @@ def run_task(
         durable=durable,
         session_dir=session_dir,
         durable_sink=durable_sink,
+        hooks=hooks,
+        hooks_enabled=hooks_enabled,
     )
     try:
         return run_turn(client, schema["model"], session, task)
@@ -4305,6 +4686,7 @@ def run_task(
         _save_messages_snapshot(session)
         _log(session, {"type": "session_end", "session_id": session["session_id"],
                        "reason": "run_task_complete"})
+        _fire_session_end(session, "other")
         journal = session.get("_journal")
         if journal is not None:
             journal.close()
@@ -4336,6 +4718,8 @@ def run_agent(
     session_dir: str | Path | None = None,
     durable_sink: DurableSink | None = None,
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
+    hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
+    hooks_enabled: bool | None = None,
 ) -> SessionResult:
     """Run a one-shot agent from direct tool definitions.
 
@@ -4375,6 +4759,8 @@ def run_agent(
         session_dir=session_dir,
         durable_sink=durable_sink,
         client=client,
+        hooks=hooks,
+        hooks_enabled=hooks_enabled,
     )
 
 
@@ -4403,6 +4789,8 @@ def run(
     session_dir: str | Path | None = None,
     durable_sink: DurableSink | None = None,
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
+    hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
+    hooks_enabled: bool | None = None,
 ) -> SessionResult:
     """Backward-compatible helper for :func:`run_task`.
 
@@ -4439,6 +4827,8 @@ def run(
         session_dir=session_dir,
         durable_sink=durable_sink,
         client=client,
+        hooks=hooks,
+        hooks_enabled=hooks_enabled,
     )
 
 
@@ -4565,6 +4955,14 @@ def _repl_setup(
     return client, session, model, _hist_file
 
 
+def _fire_session_end(session: Session, reason: str) -> None:
+    """Fire SessionEnd hooks (advisory, synchronous, short budget)."""
+    try:
+        _fire_hooks(session, "SessionEnd", matcher_values=[reason], reason=reason)
+    except Exception:
+        pass
+
+
 def _repl_teardown(session: Session, hist_file: Path, resume_cmd: str) -> None:
     """Common REPL teardown: save history, snapshot, log."""
     try:
@@ -4574,6 +4972,7 @@ def _repl_teardown(session: Session, hist_file: Path, resume_cmd: str) -> None:
     _save_messages_snapshot(session)
     _log(session, {"type": "session_end", "session_id": session["session_id"],
                    "reason": "repl_exit"})
+    _fire_session_end(session, "prompt_input_exit")
     journal = session.get("_journal")
     if journal is not None:
         journal.close()
@@ -4886,6 +5285,16 @@ def parse_args() -> argparse.Namespace:
                         "call and tool result inside a turn is fsync'd to disk as it "
                         "happens, so a crashed session recovers to the exact point of "
                         "failure instead of losing the whole turn.")
+    p.add_argument("--hooks", metavar="PATH", action="append", dest="hooks",
+                   default=None,
+                   help="Load Claude Code / Codex-compatible lifecycle hooks from this "
+                        "hooks.json-shaped file (repeatable). Layers merge additively "
+                        "with the spec's behaviour.hooks, <git-root>/.agentknit/hooks.json "
+                        "and ~/.agentknit/hooks.json.")
+    p.add_argument("--no-hooks", action="store_false", dest="hooks_enabled",
+                   default=None,
+                   help="Disable all lifecycle hooks for this session, whatever their "
+                        "source.")
     return p.parse_intermixed_args()
 
 
@@ -4930,6 +5339,8 @@ def main() -> None:
         strict_cache_proof       = not args.no_strict_cache_proof,
         min_cacheable_tokens     = args.min_cacheable_tokens,
         durable                  = args.durable,
+        hooks                    = args.hooks,
+        hooks_enabled            = args.hooks_enabled,
     )
 
     # Print the session header once, before any task runs.
@@ -4952,6 +5363,7 @@ def main() -> None:
             _save_messages_snapshot(session)
             _log(session, {"type": "session_end", "session_id": session["session_id"],
                            "reason": "one_shot_task"})
+            _fire_session_end(session, "other")
             print(f"\n{DIM}Resume: {resume_cmd}{RESET}")
         return
 
@@ -4964,6 +5376,7 @@ def main() -> None:
                 _save_messages_snapshot(session)
                 _log(session, {"type": "session_end", "session_id": session["session_id"],
                                "reason": "stdin_task"})
+                _fire_session_end(session, "other")
                 print(f"\n{DIM}Resume: {resume_cmd}{RESET}")
         return
 

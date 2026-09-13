@@ -421,6 +421,82 @@ Example::
         f"Diff: {data.get('diff_summary')}"
     ))
 
+## Hooks (Claude Code / Codex compatible)
+
+agentknit implements the **common core of the Claude Code and Codex CLI hook
+conventions**: same `hooks.json` config shape, same matcher semantics, same
+JSON-on-stdin input, same exit-code + JSON-on-stdout output contract. A
+`hooks.json` written for either tool works unmodified — drop it in
+`~/.agentknit/hooks.json` (user), `<git-root>/.agentknit/hooks.json`
+(project), the spec's `behaviour.hooks`, the `hooks=` kwarg of
+`init_session`/`run_task`/`run`/`run_agent`, or the CLI's `--hooks PATH`
+(repeatable; layers merge additively).
+
+```json
+{"hooks": {"PreToolUse": [{"matcher": "Bash",
+  "hooks": [{"type": "command", "command": "~/.local/bin/guard.sh",
+             "timeout": 30}]}]}}
+```
+
+Events fired: `SessionStart`, `SessionEnd`, `UserPromptSubmit`,
+`PreToolUse`, `PostToolUse`, `Stop`, `PreCompact`, `PostCompact`,
+`Interrupt`. Claude-only events (`PermissionRequest`, `SubagentStart`,
+`SubagentStop`, `Notification`) load without errors but never fire until the
+matching lifecycle point exists. Tool names are reported with their
+Claude-canonical aliases (`exec_shell`→`Bash`, `str_replace`→`Edit`,
+`read_file`→`Read`, …) and matchers are tested against both names;
+`updatedInput` accepts Claude argument names (`file_path`, `old_string`,
+…) and translates them to agentknit's.
+
+Output contract (both ecosystems): exit 0 silent = no decision; exit 0 +
+JSON on stdout = structured control (`permissionDecision` allow/deny/ask,
+`updatedInput`, `additionalContext`, `decision: "block"` + `reason`,
+`continue: false`, `systemMessage`); **exit 2 = blocking** with stderr as
+the reason; any other exit code, timeout, or invalid output = non-blocking
+error and the operation proceeds (fail open). `PreToolUse` deny/exit-2
+blocks the call (the reason becomes the tool result); `"ask"` pauses for
+user confirmation in the REPL and degrades to deny under `--non-interactive`;
+`PostToolUse` block replaces the tool result; `Stop` block continues the
+turn with the reason as a new user message (guarded by `stop_hook_active`);
+`UserPromptSubmit` block rejects the prompt. Model-visible hook text is
+capped at 10,000 chars with spill-to-disk (`additionalContextLimit`
+configurable per handler).
+
+**Strict script ≡ Python symmetry**: both front-ends go through one
+normalizer, so a hook script and the same logic as a Python function are
+proven equivalent by tests. Register Python hooks with:
+
+```python
+from agentknit import register_hook, load_hooks, HookBlock
+
+register_hook(session, "PreToolUse",
+              lambda p: {"hookSpecificOutput": {
+                  "hookEventName": "PreToolUse",
+                  "permissionDecision": "deny",
+                  "permissionDecisionReason": "read-only session"}},
+              matcher="Bash")
+
+def stop_hook(payload):
+    raise HookBlock("run the tests first")   # exit-2 equivalent
+
+register_hook(session, "Stop", stop_hook)
+```
+
+A Python hook returns `None` (silent), a `dict` (JSON outcome) or a `str`
+(plain stdout); raising `HookBlock` is exit 2; any other exception is a
+non-blocking error. Hooks are the **control plane**; the `subscribe` event
+system remains the **observation plane** (hooks run first and may
+rewrite/block; the `tool_call` event then fires with post-rewrite args).
+New events: `hook_warning` (systemMessage + errors), `hook_status`
+(`statusMessage` while a hook runs). `/hooks` in the REPL lists configured
+hooks and their sources; `--no-hooks` / `hooks_enabled: false` disables
+everything.
+
+Deliberate deviations from the upstream defaults: handler timeout defaults
+to 60 s (not Codex's 600 s), no trust/hash review flow (agentknit is a
+library — trust belongs to the embedder), and `mcp_tool`/`prompt`/`agent`
+handler types are parsed but skipped with a warning.
+
 ## Context Compaction
 
 Long sessions automatically compact when the prompt token budget is exceeded.

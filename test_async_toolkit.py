@@ -370,6 +370,51 @@ def test_t_query_exec_unknown_id() -> None:
     assert "unknown tool_exec_id" in out["error"]
 
 
+def test_sweep_orphan_exec_files(monkeypatch, tmp_path) -> None:
+    """Sweep removes stale unknown files, keeps fresh and known ones."""
+    import agentknit.async_toolkit as at
+    from pathlib import Path
+    import os
+
+    monkeypatch.setattr(at, "ASYNC_EXEC_DIR", tmp_path)
+    old = time.time() - 10 * 86400
+    stale_unknown = tmp_path / "deadbeef0000.stdout"
+    stale_unknown.write_text("old")
+    fresh_unknown = tmp_path / "cafebabe0000.stdout"
+    fresh_unknown.write_text("recent")
+    os.utime(stale_unknown, (old, old))
+    os.utime(fresh_unknown, (time.time(), time.time()))
+
+    # A registered execution: stale on disk, but its exec_id is known here.
+    known_file = tmp_path / "knownaaa0000.stdout"
+    known_file.write_text("live")
+    os.utime(known_file, (old, old))
+    with at._async_exec_lock:
+        at._async_executions["knownaaa0000"] = {
+            "proc": None, "stdout_file": str(known_file), "stderr_file": "",
+            "stdin_file": "", "start": 0.0, "started_at": "", "cwd": "",
+            "command": "", "io_before": {}, "scheduled_for": 0.0, "fast_done": False,
+        }
+
+    # Session subdir swept empty when all its files go.
+    sub = tmp_path / "sess1"
+    sub.mkdir()
+    gone_in_sub = sub / "orphanbbbb0000.stderr"
+    gone_in_sub.write_text("x")
+    os.utime(gone_in_sub, (old, old))
+
+    removed = at.sweep_orphan_exec_files()
+    assert removed == 2
+    assert not stale_unknown.exists()
+    assert not gone_in_sub.exists()
+    assert not sub.exists()                     # emptied → rmdir'd
+    assert fresh_unknown.exists()               # too young to sweep
+    assert known_file.exists()                  # exec_id known → kept
+
+    with at._async_exec_lock:
+        at._async_executions.clear()
+
+
 def test_prune_completed_executions(monkeypatch) -> None:
     """Old completed entries (and their files) are pruned, running ones kept."""
     import agentknit.async_toolkit as at

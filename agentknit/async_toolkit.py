@@ -57,6 +57,12 @@ NOHUP_TIMEOUT_MIN = 10
 # nohup_query / nohup_wait, so the model cannot wait on it anymore.
 ASYNC_RETAIN_COMPLETED = 64
 
+# Sweep of capture files left behind by earlier processes (no in-memory
+# entry to prune).  A file counts as an orphan when its mtime is older than
+# this many days and its exec_id is not registered in this process.
+# Runs once, at import, in a daemon thread.
+ASYNC_ORPHAN_MAX_AGE_DAYS = 3
+
 # Cap on wait_before_s (delayed start), same order of magnitude as the
 # nohup_wait budget cap: enough to let CI run, not enough to schedule tomorrow.
 WAIT_BEFORE_MAX_SECONDS = 3600
@@ -109,6 +115,55 @@ _last_queried_exec_id: str | None = None
 _tool_context = threading.local()
 
 
+def sweep_orphan_exec_files() -> int:
+    """Delete capture files of executions unknown to this process, if stale.
+
+    Files left in ASYNC_EXEC_DIR by earlier processes (crashed or simply
+    pre-retention) have no in-memory entry anymore; nothing else will ever
+    reference them.  A file is swept when its modification time (the last
+    output write, i.e. roughly the completion time — atime is not used, it
+    is unreliable under relatime and refreshed by scanners; ctime neither,
+    it changes on any metadata touch) is older than
+    ASYNC_ORPHAN_MAX_AGE_DAYS and its exec_id is not registered here
+    (another live agentknit process may still be using recent files — their
+    age alone must not get them deleted).
+
+    Returns the number of files removed.  The sweep also removes session
+    subdirectories it empties out.
+    """
+    cutoff = time.time() - ASYNC_ORPHAN_MAX_AGE_DAYS * 86400
+    with _async_exec_lock:
+        known = {Path(e["stdout_file"]).name.rsplit(".", 1)[0]
+                 for e in _async_executions.values()}
+    removed = 0
+    for path in ASYNC_EXEC_DIR.rglob("*"):
+        # Regular files (stdout/stderr) and FIFOs (.stdin): both are per-exec
+        # artifacts, and pre-retention orphans include plenty of FIFOs.
+        if not (path.is_file() or path.is_fifo()):
+            continue
+        stem = path.name.rsplit(".", 1)[0]
+        if stem in known:
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        if st.st_mtime >= cutoff:
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    for d in sorted((p for p in ASYNC_EXEC_DIR.rglob("*") if p.is_dir()),
+                    reverse=True):   # deepest first, so children empty parents
+        try:
+            d.rmdir()   # only succeeds when empty
+        except OSError:
+            pass
+    return removed
+
+
 def get_async_command_for_output_path(path: str) -> str | None:
     """Return the originating async shell command for a stdout/stderr file."""
     expanded = os.path.expanduser(path)
@@ -139,6 +194,11 @@ def _prune_completed_executions() -> None:
                 os.unlink(path)
             except OSError:
                 pass
+
+
+def _sweep_orphans_once() -> None:
+    """Run the orphan sweep at import, off the import path."""
+    threading.Thread(target=sweep_orphan_exec_files, daemon=True).start()
 
 
 def _async_try_inline(path: str) -> str | None:
@@ -789,3 +849,7 @@ def enable_nohup(schema: dict[str, Any], timeout_min: int = NOHUP_TIMEOUT_MIN) -
                 "nohup_wait":    {"python_function": "t_nohup_wait",   "param_map": {}},
             })
     return schema
+
+
+# Sweep capture files orphaned by earlier processes once, off the import path.
+_sweep_orphans_once()

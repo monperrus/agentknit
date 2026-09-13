@@ -2392,6 +2392,9 @@ class Session(TypedDict):
     # "missing" as a temporary status-bar warning and clear it on "ok".
     _cache_status: NotRequired[str]
     _continue_requested: NotRequired[bool]
+    # runtime tool management (/tool remove → parked, /tool activate → restore)
+    _removed_tools: NotRequired[dict[str, dict[str, Any]]]
+    _removed_dispatch: NotRequired[dict[str, dict[str, Any]]]
 
 
 def init_session(schema: "dict[str, Any]", non_interactive: bool = False,

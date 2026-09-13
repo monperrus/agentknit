@@ -7,6 +7,7 @@ Provides a registry and built-in commands:
 * ``/compact`` – summarize older history into a compact continuation summary
 * ``/model``   – list / switch models (queries the endpoint's ``/models`` endpoint)
 * ``/usage``   – show token usage for the current session
+* ``/tool``    – list / activate / remove tools at runtime
 * ``/c``       – retry an interrupted turn without adding a user message
 
 Commands are intercepted in the REPL loop before the input is sent to the model.
@@ -20,6 +21,7 @@ that agents can include in their tool list.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import json
 import urllib.request
@@ -300,6 +302,216 @@ def _handle_model(session: Session, client: Any, model: str, args: str) -> None:
     print(f"{DIM}The next turn will use the new model.{RESET}")
 
 
+def _tool_name(tool_spec: dict[str, Any]) -> str:
+    """Model-facing name of a tool spec (function or custom shape)."""
+    if tool_spec.get("type") == "custom":
+        return str(tool_spec.get("name", ""))
+    fn = tool_spec.get("function") or tool_spec
+    return str(fn.get("name", ""))
+
+
+def _tool_description(tool_spec: dict[str, Any]) -> str:
+    """One-line description of a tool spec (function or custom shape)."""
+    if tool_spec.get("type") == "custom":
+        return str(tool_spec.get("description", ""))
+    fn = tool_spec.get("function") or tool_spec
+    return str(fn.get("description", ""))
+
+
+def _library_tool_specs() -> dict[str, dict[str, Any]]:
+    """Model-facing name → parsed ``Tool spec:`` docstring, for TOOL_LIBRARY."""
+    from . import tool_library as _tool_library_module
+    from ._tool_spec import extract_tool_specs_from_module
+    specs: dict[str, dict[str, Any]] = {}
+    for fn_name, s in extract_tool_specs_from_module(_tool_library_module).items():
+        if isinstance(s.get("name"), str) and s["name"]:
+            s["_function_name"] = fn_name
+            specs[s["name"]] = s
+    return specs
+
+
+def _spec_from_docstring(doc_spec: dict[str, Any],
+                         session: Session) -> dict[str, Any] | None:
+    """Build an OpenAI function spec from a parsed ``Tool spec:`` docstring.
+
+    The dispatch entry (``python_function`` + identity ``param_map``) is
+    written into ``session["tool_dispatch"]`` as a side effect.
+    """
+    name = str(doc_spec.get("name", ""))
+    fn_name = str(doc_spec.get("_function_name", ""))
+    if not name or not fn_name:
+        return None
+
+    props: dict[str, Any] = {}
+    required: list[str] = []
+    for pname, pdef in (doc_spec.get("parameters") or {}).items():
+        prop: dict[str, Any] = {"type": pdef.get("type", "string")}
+        if pdef.get("description"):
+            prop["description"] = pdef["description"]
+        props[pname] = prop
+        required.append(pname)
+    session["tool_dispatch"][name] = {"python_function": fn_name,
+                                      "param_map": {}}
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": doc_spec.get("description", name),
+            "parameters": {"type": "object", "properties": props,
+                           "required": required},
+        },
+    }
+
+
+def _handle_tool(session: Session, client: Any, model: str, args: str) -> None:
+    """List, activate or remove the session's tools at runtime.
+
+    * ``/tool`` or ``/tool list`` — show active tools (✓), the inactive ones
+      parked by a previous ``/tool remove`` (✗), and other TOOL_LIBRARY
+      functions that could be activated.
+    * ``/tool activate <tool_name>`` — (re)add a tool to the session:
+      an inactive tool is restored verbatim; a TOOL_LIBRARY function
+      (docstring spec, or plain signature) gets a spec built on the fly;
+      a legacy alias (e.g. ``execute_shell_command``) is expanded.
+    * ``/tool remove <tool_name>`` — drop a tool from the session (parked in
+      ``session["_removed_tools"]`` so ``/tool activate`` can restore it).
+    """
+    from ._core import _LEGACY_TOOL_ALIASES, _log
+    from .tool_library import TOOL_LIBRARY
+
+    parts = args.split(None, 1)
+    sub = (parts[0].lower() if parts else "list")
+    name = parts[1].strip() if len(parts) > 1 else ""
+
+    tools: list[dict[str, Any]] = session["tools"]
+    # Inactive tools: specs (and dispatch entries) parked by a previous
+    # /tool remove, so they can be re-activated later verbatim.
+    parked_tools: dict[str, dict[str, Any]] = dict(session.get("_removed_tools") or {})
+    parked_dispatch: dict[str, dict[str, Any]] = dict(
+        session.get("_removed_dispatch") or {})
+    inactive: dict[str, dict[str, Any]] = {}
+    for parked_spec in parked_tools.values():
+        n = _tool_name(parked_spec)
+        if n:
+            inactive[n] = parked_spec
+
+    def _active_names() -> list[str]:
+        return [_tool_name(t) for t in tools]
+
+    if sub in ("", "list", "ls"):
+        active = _active_names()
+        print(f"{BOLD}Active tools ({len(active)}):{RESET}")
+        for t in tools:
+            desc = _tool_description(t).split("\n")[0]
+            suffix = f"  {DIM}{desc[:70]}{RESET}" if desc else ""
+            print(f"  {GREEN}✓{RESET} {_tool_name(t)}{suffix}")
+        if inactive:
+            print(f"{BOLD}Inactive (removed, re-activatable):{RESET}")
+            for n in sorted(inactive):
+                print(f"  {RED}✗{RESET} {n}   {DIM}/tool activate {n}{RESET}")
+        # TOOL_LIBRARY functions not yet advertised: candidates for activate.
+        from .tool_library import _ASK_USER_FNS
+        lib = _library_tool_specs()
+        by_fn = {str(s.get("_function_name")): s for s in lib.values()}
+        known = set(active) | set(inactive)
+        candidates: list[str] = []
+        for fn_name, fn in TOOL_LIBRARY.items():
+            if session.get("non_interactive") and fn_name in _ASK_USER_FNS:
+                continue
+            model_name = str((by_fn.get(fn_name) or {}).get("name")
+                             or (fn_name[2:] if fn_name.startswith("t_") else fn_name))
+            if model_name not in known and model_name not in candidates:
+                candidates.append(model_name)
+        if candidates:
+            print(f"{BOLD}Available in TOOL_LIBRARY (not active):{RESET}")
+            for n in sorted(candidates):
+                print(f"  {DIM}-{RESET} {n}   {DIM}/tool activate {n}{RESET}")
+        print(f"\n{DIM}Usage: /tool list | /tool activate <name> | /tool remove <name>{RESET}")
+        return
+
+    if not name:
+        print(f"{RED}Usage: /tool {sub} <tool_name>{RESET}")
+        return
+
+    if sub == "activate":
+        # Legacy aliases (e.g. execute_shell_command) resolve to their
+        # canonical name; the alias itself keeps working through the
+        # dispatch-only entry installed at session start.
+        name = _LEGACY_TOOL_ALIASES.get(name, name)
+        if name in _active_names():
+            pass  # already active — idempotent no-op
+        else:
+            spec: dict[str, Any] | None = None
+            # 1. A parked spec from a previous /tool remove — restore both
+            #    the schema and the parked dispatch entry verbatim.
+            if name in inactive:
+                spec = inactive[name]
+                for dispatch_name, entry in parked_dispatch.items():
+                    if dispatch_name == name or _LEGACY_TOOL_ALIASES.get(dispatch_name) == name:
+                        session["tool_dispatch"][dispatch_name] = entry
+            # 2. A TOOL_LIBRARY function advertised by its docstring spec.
+            if spec is None:
+                doc_spec = _library_tool_specs().get(name)
+                if doc_spec is not None:
+                    spec = _spec_from_docstring(doc_spec, session)
+            # 3. Any other TOOL_LIBRARY function — schema inferred from its
+            #    signature via Tool/build_tool_spec.
+            if spec is None and name in TOOL_LIBRARY:
+                from .tool import Tool as _T, build_tool_spec as _bts
+                fn = TOOL_LIBRARY[name]
+                model_name = name[2:] if name.startswith("t_") else name
+                doc = (inspect.getdoc(fn) or model_name).split("\n\nTool spec:")[0]
+                desc = next((ln.strip() for ln in doc.splitlines() if ln.strip()),
+                             model_name)
+                schema_list, disp = _bts([_T(model_name, desc, fn)])
+                session["tool_dispatch"].update(disp)
+                spec = schema_list[0]
+            if spec is None:
+                known_names: set[str] = set(TOOL_LIBRARY) | set(_library_tool_specs())
+                known_names |= set(_active_names()) | set(inactive)
+                known_list = sorted(known_names)
+                print(f"{RED}Unknown tool '{name}'. Known: "
+                      f"{', '.join(known_list) or '(none)'}{RESET}")
+                return
+            tools.append(spec)
+        # Drop the parked copies of the same name (it is active again now).
+        session["_removed_tools"] = {
+            k: v for k, v in parked_tools.items() if _tool_name(v) != name
+        }
+        session["_removed_dispatch"] = {
+            k: v for k, v in parked_dispatch.items()
+            if k != name and _LEGACY_TOOL_ALIASES.get(k) != name
+        }
+        _log(session, {"type": "tool_activated", "tool": name})
+        print(f"{GREEN}Tool activated: {name}{RESET}")
+        print(f"{DIM}The next turn will offer it to the model.{RESET}")
+        return
+
+    if sub == "remove":
+        active_names = _active_names()
+        if name not in active_names:
+            print(f"{RED}Tool '{name}' is not active. Active: "
+                  f"{', '.join(active_names) or '(none)'}{RESET}")
+            return
+        removed_spec = tools.pop(active_names.index(name))
+        session.setdefault("_removed_tools", {})[name] = removed_spec
+        # Also retire the dispatch entry (and any alias pointing at it), so
+        # the model cannot call a tool it can no longer see; parked entries
+        # are restored verbatim on the next activate.
+        _aliases = [a for a, c in _LEGACY_TOOL_ALIASES.items() if c == name]
+        for dispatch_name in [name, *_aliases]:
+            parked_entry = session["tool_dispatch"].pop(dispatch_name, None)
+            if parked_entry is not None:
+                session.setdefault("_removed_dispatch", {})[dispatch_name] = parked_entry
+        _log(session, {"type": "tool_removed", "tool": name})
+        print(f"{GREEN}Tool removed: {name}{RESET}")
+        print(f"{DIM}Re-activate later with /tool activate {name}.{RESET}")
+        return
+
+    print(f"{RED}Unknown /tool sub-command '{sub}'. "
+          f"Usage: /tool list | /tool activate <name> | /tool remove <name>{RESET}")
+
+
 def _handle_usage(session: Session, client: Any, model: str, args: str) -> None:
     """Display token usage for the current session."""
     t = session.get("usage_totals", {})
@@ -372,6 +584,12 @@ REGISTRY.register(SlashCommand(
     handler=_handle_usage,
 ))
 REGISTRY.register(SlashCommand(
+    name="tool",
+    description="List / activate / remove tools at runtime: "
+                "/tool list | /tool activate <name> | /tool remove <name>.",
+    handler=_handle_tool,
+))
+REGISTRY.register(SlashCommand(
     name="hooks",
     description="List configured lifecycle hooks and their sources.",
     handler=_handle_hooks,
@@ -394,6 +612,7 @@ _HANDLERS: dict[str, Callable[..., object]] = {
     "model":   _handle_model,
     "usage":   _handle_usage,
     "hooks":   _handle_hooks,
+    "tool":    _handle_tool,
     "help":    _handle_help,
 }
 
@@ -401,8 +620,10 @@ _HANDLERS: dict[str, Callable[..., object]] = {
 def t_slash_command(command: str, args: str = "") -> tuple[str, dict[str, object]]:
     """Run a slash command and return its output as a tool result.
 
-    command must be one of: clear, compact, model, usage, hooks, help.
+    command must be one of: clear, compact, model, usage, hooks, tool, help.
     For 'model', pass a model-id in args to switch; omit to list.
+    For 'tool', args is one of: 'list', 'activate <tool_name>',
+    'remove <tool_name>'.
 
     Populate :data:`slash_tool_ctx` with the live session, client, and model
     name before registering this tool in an agent.
@@ -428,20 +649,22 @@ from .tool import Tool as _Tool  # noqa: E402
 
 SLASH_COMMAND_TOOL = _Tool(
     "slash_command",
-    "Run a slash command. command: one of clear, compact, model, usage, hooks, help. "
-    "For 'model', pass a model-id in args to switch; omit args to list.",
+    "Run a slash command. command: one of clear, compact, model, usage, hooks, tool, help. "
+    "For 'model', pass a model-id in args to switch; omit args to list. "
+    "For 'tool', args is one of: 'list', 'activate <tool_name>', 'remove <tool_name>'.",
     t_slash_command,
     parameters={
         "type": "object",
         "properties": {
             "command": {
                 "type": "string",
-                "enum": ["clear", "compact", "model", "usage", "hooks", "help"],
+                "enum": ["clear", "compact", "model", "usage", "hooks", "tool", "help"],
                 "description": "Slash command to run.",
             },
             "args": {
                 "type": "string",
-                "description": "Optional argument (e.g. model-id for 'model').",
+                "description": ("Optional argument (e.g. model-id for 'model', "
+                                "'activate read_file' for 'tool')."),
             },
         },
         "required": ["command"],

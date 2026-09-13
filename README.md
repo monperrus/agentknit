@@ -233,6 +233,24 @@ The framework ships with a built-in set of tools (`read_file`, `write_file`,
 still accepted as an alias. `str_replace` replaces the first occurrence of
 `old_str` by default; pass `replace_all: true` to replace every occurrence.
 
+### Runtime tool management (`/tool`)
+
+In the REPL the toolset is not fixed at startup — `/tool` lists and mutates it:
+
+```
+/tool                    # or /tool list — active ✓, inactive ✗, available
+/tool activate <name>    # add a tool back (removed, library function or alias)
+/tool remove <name>      # drop a tool for the rest of the session
+```
+
+`/tool remove` also retires the tool's dispatch entry, so the model can no
+longer call a tool it cannot see; the spec is parked and restored verbatim by
+`/tool activate`. `activate` also brings in any `TOOL_LIBRARY` function (e.g.
+`/tool activate t_glob` — schema inferred from the signature when no
+`Tool spec:` docstring exists) and resolves legacy aliases
+(`execute_shell_command` → `exec_shell`). Interactive tools such as
+`t_ask_user` are hidden in `--non-interactive` sessions.
+
 ### Background shell tools (`nohup` / `nohup_query` / `nohup_wait`)
 
 `agentknit.async_toolkit` provides bounded background execution on top of the

@@ -36,7 +36,9 @@ else:
 
 # ── execution state ───────────────────────────────────────────────────────────
 
-# Persistent directory for stdout/stderr capture files (never deleted).
+# Directory for stdout/stderr capture files.  Files of completed executions
+# are kept so the model can read them afterwards, but pruned per the
+# ASYNC_RETAIN_COMPLETED retention below — see _prune_completed_executions.
 ASYNC_EXEC_DIR = Path.home() / ".cache" / "async_agent_execs"
 ASYNC_EXEC_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -47,6 +49,13 @@ ASYNC_INLINE_MAX_BYTES = 4096
 
 # Default execution bound (minutes) applied by t_nohup via timeout(1).
 NOHUP_TIMEOUT_MIN = 10
+
+# Retention for completed executions: keep the _async_executions entry and
+# the capture files of the newest ASYNC_RETAIN_COMPLETED ones, delete the
+# older ones (dict + FIFO + output files).  Entries still running are never
+# collected.  Once an entry is deleted its tool_exec_id becomes unknown to
+# nohup_query / nohup_wait, so the model cannot wait on it anymore.
+ASYNC_RETAIN_COMPLETED = 64
 
 # Cap on wait_before_s (delayed start), same order of magnitude as the
 # nohup_wait budget cap: enough to let CI run, not enough to schedule tomorrow.
@@ -71,7 +80,11 @@ class _AsyncExecEntry(TypedDict):
 _async_executions: dict[str, _AsyncExecEntry] = {}
 _async_exec_lock = threading.Lock()
 
-# Completed processes push here so the REPL can trigger a new LLM turn.
+# Completed processes push here.  t_nohup_wait drains this queue while it
+# sleeps, so completions — of the awaited execution and of any others
+# finishing meanwhile — are reported inline in its result.  Nothing else
+# consumes it: the REPL does not wake the model when an execution finishes,
+# the model has to call nohup_query / nohup_wait itself.
 # Each entry: {"tool_exec_id", "returncode", "stdout_file", "stderr_file", "duration"}
 class _AsyncCompletion(TypedDict):
     tool_exec_id: str
@@ -104,6 +117,28 @@ def get_async_command_for_output_path(path: str) -> str | None:
             if expanded in {entry["stdout_file"], entry["stderr_file"]}:
                 return entry["command"]
     return None
+
+
+def _prune_completed_executions() -> None:
+    """Drop old completed executions (entries + files), keep the newest ones.
+
+    Called with _async_exec_lock held, after a completion has been queued.
+    Entries whose process has exited are kept while they are among the
+    ASYNC_RETAIN_COMPLETED most recent, older ones are deleted together with
+    their capture files.
+    """
+    completed = sorted(
+        (e for e in _async_executions.values() if e["proc"] is not None and e["proc"].poll() is not None),
+        key=lambda e: e["start"],
+    )
+    for entry in completed[:-ASYNC_RETAIN_COMPLETED]:
+        exec_id = next(i for i, e in _async_executions.items() if e is entry)
+        del _async_executions[exec_id]
+        for path in (entry["stdin_file"], entry["stdout_file"], entry["stderr_file"]):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def _async_try_inline(path: str) -> str | None:
@@ -330,6 +365,8 @@ def t_execute_async(command: str, wait_before_s: float = 0) -> tuple[str, dict[s
                     fh.close()
                 except OSError:
                     pass
+            with _async_exec_lock:
+                _prune_completed_executions()
             async_completion_queue.put({
                 "tool_exec_id": exec_id,
                 "returncode":   proc.returncode,

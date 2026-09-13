@@ -369,3 +369,55 @@ def test_t_query_exec_unknown_id() -> None:
     out = json.loads(t_query_exec("nope")[0])
     assert "unknown tool_exec_id" in out["error"]
 
+
+def test_prune_completed_executions(monkeypatch) -> None:
+    """Old completed entries (and their files) are pruned, running ones kept."""
+    import agentknit.async_toolkit as at
+    from pathlib import Path
+
+    with at._async_exec_lock:
+        at._async_executions.clear()
+    monkeypatch.setattr(at, "ASYNC_RETAIN_COMPLETED", 3)
+
+    ids = []
+    stdout_files = {}
+    for _ in range(5):
+        r, _ = t_nohup("true")
+        d = json.loads(r)
+        ids.append(d["tool_exec_id"])
+        stdout_files[d["tool_exec_id"]] = d["stdout_localfile"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            q = json.loads(t_query_exec(d["tool_exec_id"])[0])
+            if q.get("completed"):
+                break
+            time.sleep(0.02)
+
+    # One more completion triggers the prune inside _close_on_exit.
+    r, _ = t_nohup("sleep 0.6")
+    drain_id = json.loads(r)["tool_exec_id"]
+    stdout_files[drain_id] = json.loads(r)["stdout_localfile"]
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        q = json.loads(t_query_exec(drain_id)[0])
+        if q.get("completed"):
+            break
+        time.sleep(0.02)
+
+    with at._async_exec_lock:
+        remaining = set(at._async_executions)
+    # 6 completions with retain=3: the 3 oldest are gone, the 3 newest stay.
+    assert not ({"ids[0]", "ids[1]"} & remaining)
+    assert ids[0] not in remaining and ids[1] not in remaining and ids[2] not in remaining
+    assert set(ids[3:]) <= remaining
+    assert drain_id in remaining
+    # Files of pruned executions are gone, files of retained ones are not.
+    for i in (0, 1, 2):
+        assert not Path(stdout_files[ids[i]]).exists()
+    for i in (3, 4):
+        assert Path(stdout_files[ids[i]]).exists()
+    assert Path(stdout_files[drain_id]).exists()
+
+    with at._async_exec_lock:
+        at._async_executions.clear()
+

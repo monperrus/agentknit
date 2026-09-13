@@ -2947,8 +2947,14 @@ def compact_session(
     client: openai.OpenAI | SubprocessOpenAI,
     model: str,
     session: Session,
+    prompt_tokens: int | None = None,
 ) -> bool:
     """Replace the oldest portion of the conversation with a continuation-oriented summary.
+
+    *prompt_tokens* is the server-reported prompt size that triggered the
+    compaction (when known — threshold/every-turn policies); it is shown in
+    the ``compaction`` event as ``triggered at N tokens (P% to max size)``
+    and omitted when unknown (manual ``/compact``, overflow retry).
 
     Keeps the system prompt and the most recent *compaction_keep_last_turns*
     non-system messages in raw form.  The kept boundary is snapped back to a
@@ -2971,6 +2977,12 @@ def compact_session(
     """
     messages = session["messages"]
     keep = session.get("compaction_keep_last_turns", DEFAULT_COMPACTION_KEEP_LAST_TURNS)
+    # Server-reported prompt size at the trigger moment, for the user-facing
+    # message.  Passed by the caller when known; falls back to the session
+    # watermark (0 = never triggered, so unknown) so manual /compact and
+    # overflow-retry paths simply omit the number.
+    prompt_tokens = (prompt_tokens if prompt_tokens is not None
+                     else session.get("compaction_last_prompt_tokens", 0) or None)
     # Adaptively shrink the kept suffix when the provider rejects the summary
     # request as too large: with a mis-sized trigger the history can be so big
     # that even keep_last_turns=2 overflows the window.  The loop below drops

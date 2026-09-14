@@ -3879,6 +3879,19 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
     structured = session["structured"]
     journal    = session.get("_journal")
 
+    # A turn that died between the model's tool_calls and their results
+    # (Ctrl-C, crash, a tool thread killed) leaves an assistant message whose
+    # calls were never answered.  Every provider rejects that transcript
+    # ("No tool output found for function call …"), so the live session would
+    # be poisoned for good — each later turn failing the same way.  Repair it
+    # here, in-process, exactly as resume does when loading from disk.
+    repaired = _repair_tool_call_pairing(messages)
+    if repaired != messages:
+        _log(session, {"type": "repair_tool_call_pairing",
+                       "delta": len(repaired) - len(messages),
+                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+        messages[:] = repaired
+
     # Per-turn hook state: fresh prompt_id, reset the Stop-continuation guard.
     hook_state = session.setdefault("_hook_state", {})
     hook_state["turn_id"] = uuid.uuid4().hex

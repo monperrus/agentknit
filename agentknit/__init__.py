@@ -119,6 +119,8 @@ from .tool_library import (
     enable_rtk_rewrite,
     get_tool_output_stream,
     set_tool_output_stream,
+    CANONICAL_TOOLS,
+    SUPERSEDED_TOOLS,
 )
 
 from .async_toolkit import (
@@ -191,6 +193,8 @@ __all__ = [
     "enable_rtk_rewrite",
     # where live tool output goes
     "get_tool_output_stream", "set_tool_output_stream",
+    # which tool implementation to use
+    "CANONICAL_TOOLS", "SUPERSEDED_TOOLS",
     # nohup tools (async_toolkit)
     "NOHUP_TIMEOUT_MIN", "WAIT_FOR_MAX_SECONDS", "WAIT_FOR_UNIT_SECONDS",
     "enable_nohup", "nohup_tool_specs", "t_nohup", "t_nohup_wait",

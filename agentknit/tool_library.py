@@ -719,6 +719,39 @@ TOOL_LIBRARY: "dict[str, ToolFn]" = {
     "t_nohup_wait":           t_nohup_wait,
 }
 
+
+# ── which implementation to use ───────────────────────────────────────────────
+# The library has grown several implementations of the same capability: some
+# were written by hand, others appended by the probe's code-generation path
+# (the "--- generated:" blocks below).  From the outside they are
+# indistinguishable, so a host publishing these tools had no way to tell which
+# one to pick.  These two maps say it.
+
+#: Tool name (as the model sees it) → the function that implements it.
+#: These are the implementations to build a tool set from; each carries a
+#: ``Tool spec:`` block describing its parameters.  The interactive
+#: (``t_ask_user*``) and background-shell (``t_nohup*``, ``t_execute_async``)
+#: tools are opt-in and described elsewhere — see :func:`nohup_tool_specs` —
+#: so they appear in neither map.
+CANONICAL_TOOLS: "dict[str, str]" = {
+    "read_file": "t_read",
+    "write_file": "t_write",
+    "str_replace": "t_update",
+    "exec_shell": "t_run",
+    "list_dir": "t_list_dir",
+    "glob": "t_glob",
+    "search_files": "t_search",
+}
+
+#: Older function → the canonical function that replaced it.  Kept working for
+#: specs and sessions that name them, but not worth exposing to new callers.
+SUPERSEDED_TOOLS: "dict[str, str]" = {
+    "t_update_file": "t_update",
+    "t_list_directory": "t_list_dir",
+    "t_search_files": "t_glob",
+    "t_find_files": "t_glob",
+}
+
 def enable_rtk_rewrite() -> None:
     """Patch TOOL_LIBRARY so shell commands are rewritten through rtk before execution.
 
@@ -773,6 +806,7 @@ def _register_generated(fn_name: str, source: str) -> bool:
 
 # --- generated: t_update_file ---
 def t_update_file(new_str: str = '', file_path: str = '', old_str: str = '') -> tuple[str, dict[str, object]]:
+    """Superseded by :func:`t_update` (see :data:`SUPERSEDED_TOOLS`)."""
     result_dict: dict[str, object] = {'result': 'success'}
     if not file_path:
         return _tool_failure("ERROR: File path is required.")
@@ -791,6 +825,7 @@ TOOL_LIBRARY['t_update_file'] = t_update_file
 
 # --- generated: t_list_directory ---
 def t_list_directory(path: str = '') -> tuple[str, dict[str, object]]:
+    """Superseded by :func:`t_list_dir` (see :data:`SUPERSEDED_TOOLS`)."""
     try:
         p = Path(os.path.expanduser(path))
         if not p.exists() or not p.is_dir():
@@ -809,6 +844,10 @@ TOOL_LIBRARY['t_list_directory'] = t_list_directory
 
 # --- generated: t_search_files ---
 def t_search_files(command: str = '') -> tuple[str, dict[str, object]]:
+    """Path lookup despite the name; superseded by :func:`t_glob`.
+
+    :func:`t_search` is the one that greps file *contents*.
+    """
     try:
         if not command:
             return _tool_failure("ERROR: command is required")
@@ -848,6 +887,7 @@ TOOL_LIBRARY['t_search_files'] = t_search_files
 
 # --- generated: t_find_files ---
 def t_find_files(pattern: str = '', recursive: str = '') -> tuple[str, dict[str, object]]:
+    """Superseded by :func:`t_glob` (see :data:`SUPERSEDED_TOOLS`)."""
     try:
         rec = str(recursive).strip().lower() in ('true', '1', 'yes', 'on')
         if not pattern:

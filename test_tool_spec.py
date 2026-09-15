@@ -10,6 +10,7 @@ import pytest
 from agentknit._tool_spec import (
     parse_tool_spec_from_docstring,
     extract_tool_specs_from_module,
+    tool_spec_to_schema,
 )
 from agentknit import tool_library
 from agentknit._core import _DEFAULT_TOOL_SCHEMA, _DEFAULT_TOOL_DISPATCH
@@ -94,29 +95,7 @@ def _build_schema_from_docstring(fn_name: str, tool_name: str) -> dict:
     spec = parse_tool_spec_from_docstring(doc)
     assert spec is not None, f"No Tool spec block in {fn_name} docstring"
 
-    properties = {}
-    required = []
-    for pname, pinfo in spec["parameters"].items():
-        properties[pname] = {
-            "type": pinfo["type"],
-        }
-        if "description" in pinfo:
-            properties[pname]["description"] = pinfo["description"]
-        # All params in the spec are required (no optional marker in YAML spec)
-        required.append(pname)
-
-    return {
-        "type": "function",
-        "function": {
-            "name": spec["name"],
-            "description": spec["description"],
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-            },
-        },
-    }
+    return tool_spec_to_schema(spec)
 
 
 # Mapping: python function name → (tool name in schema, dispatch key)
@@ -219,3 +198,86 @@ def test_all_default_tools_have_docstring_specs():
         assert fn_name in specs, (
             f"No docstring spec found for {fn_name} (tool {tool_name})"
         )
+
+
+# ── required parameters ───────────────────────────────────────────────────────
+
+def test_required_parameters_are_parsed():
+    spec = parse_tool_spec_from_docstring(inspect.getdoc(tool_library.t_read))
+    assert spec["required"] == ["path"]        # offset and limit are optional
+
+
+def test_required_is_empty_when_nothing_is_marked():
+    spec = parse_tool_spec_from_docstring(
+        "Tool spec:\n"
+        "    name: noop\n"
+        "    description: Does nothing.\n"
+        "    parameters:\n"
+        "        x:\n"
+        "            type: string\n"
+        "            description: Anything.\n"
+    )
+    assert spec["required"] == []
+
+
+def test_every_mandatory_signature_parameter_is_marked_required():
+    specs = extract_tool_specs_from_module(tool_library)
+
+    for fn_name, spec in specs.items():
+        fn = getattr(tool_library, fn_name)
+        mandatory = [
+            p.name for p in inspect.signature(fn).parameters.values()
+            if p.default is inspect.Parameter.empty
+        ]
+        # param_map renames some of them (old_str → old), so compare counts.
+        assert len(spec["required"]) >= len(mandatory), (
+            f"{fn_name}: signature needs {mandatory}, spec marks {spec['required']}"
+        )
+
+
+# ── tool_spec_to_schema ───────────────────────────────────────────────────────
+
+def test_docstring_specs_reproduce_the_shipped_schema():
+    """A host can build the shipped schema from the docstrings alone.
+
+    Wording may differ — the shipped str_replace entry carries a longer
+    description — but the contract (parameters, types, required) must not.
+    """
+    specs = extract_tool_specs_from_module(tool_library)
+    by_name = {spec["name"]: tool_spec_to_schema(spec) for spec in specs.values()}
+
+    for entry in _DEFAULT_TOOL_SCHEMA:
+        shipped = entry["function"]["parameters"]
+        built = by_name[entry["function"]["name"]]["function"]["parameters"]
+
+        assert built["type"] == shipped["type"]
+        assert set(built["properties"]) == set(shipped["properties"])
+        assert built["required"] == shipped["required"]
+        for pname, pinfo in shipped["properties"].items():
+            assert built["properties"][pname]["type"] == pinfo["type"]
+            assert built["properties"][pname]["description"]
+
+
+def test_read_file_is_reproduced_byte_for_byte():
+    spec = parse_tool_spec_from_docstring(inspect.getdoc(tool_library.t_read))
+    shipped = next(e for e in _DEFAULT_TOOL_SCHEMA if e["function"]["name"] == "read_file")
+
+    assert tool_spec_to_schema(spec) == shipped
+
+
+def test_schema_conversion_keeps_the_required_marker_out_of_properties():
+    spec = parse_tool_spec_from_docstring(inspect.getdoc(tool_library.t_glob))
+    params = tool_spec_to_schema(spec)["function"]["parameters"]
+
+    assert params["required"] == ["pattern"]
+    assert params["properties"]["pattern"] == {
+        "type": "string",
+        "description": "Glob pattern, e.g. 'src/**/*.py'.",
+    }
+
+
+def test_the_extra_library_tools_are_documented_too():
+    """glob, list_dir and search_files carry specs, not just the default four."""
+    names = {spec["name"] for spec in extract_tool_specs_from_module(tool_library).values()}
+
+    assert {"glob", "list_dir", "search_files"} <= names

@@ -130,6 +130,7 @@ def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tu
             path:
                 type: string
                 description: Path to the file.
+                required: true
             offset:
                 type: integer
                 description: Line number to start reading from (1-indexed).
@@ -222,9 +223,11 @@ def t_write(path: str, content: str) -> tuple[str, dict[str, object]]:
             path:
                 type: string
                 description: Path to the file.
+                required: true
             content:
                 type: string
                 description: Content to write.
+                required: true
     """
     path = _coerce_str(path, "path")
     content = _coerce_str(content, "content")
@@ -300,12 +303,15 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "",
             path:
                 type: string
                 description: Path to the file.
+                required: true
             old_str:
                 type: string
                 description: Text to replace.
+                required: true
             new_str:
                 type: string
                 description: Replacement text.
+                required: true
             replace_all:
                 type: boolean
                 description: Replace every occurrence instead of only the first.
@@ -376,6 +382,7 @@ def t_run(command: str) -> tuple[str, dict[str, object]]:
             command:
                 type: string
                 description: Shell command to execute.
+                required: true
     """
     global _active_proc
     command = _coerce_str(command, "command")
@@ -551,6 +558,17 @@ def t_ask_user_question(question: str = '', options: str = '') -> tuple[str, dic
 
 
 def t_list_dir(path: str) -> tuple[str, dict[str, object]]:
+    """List a directory, one entry per line, prefixed by d (dir) or f (file).
+
+    Tool spec:
+        name: list_dir
+        description: List the entries of a directory, one per line, prefixed by d (directory) or f (file).
+        parameters:
+            path:
+                type: string
+                description: Directory to list.
+                required: true
+    """
     path = _coerce_str(path, "path")
     try:
         entries = sorted(Path(os.path.expanduser(path)).iterdir(), key=lambda p: (p.is_file(), p.name))
@@ -561,6 +579,20 @@ def t_list_dir(path: str) -> tuple[str, dict[str, object]]:
         return _tool_error("list_dir", e)
 
 def t_search(path: str = ".", pattern: str = "") -> tuple[str, dict[str, object]]:
+    """Grep *path* for *pattern*, returning the matching lines as JSON.
+
+    Tool spec:
+        name: search_files
+        description: Search file contents for a regular expression and return the matching lines as JSON.
+        parameters:
+            pattern:
+                type: string
+                description: Regular expression to search for.
+                required: true
+            path:
+                type: string
+                description: File or directory to search in (default '.').
+    """
     global _active_proc
     path = _coerce_str(path, "path")
     pattern = _coerce_str(pattern, "pattern")
@@ -641,6 +673,17 @@ def t_search(path: str = ".", pattern: str = "") -> tuple[str, dict[str, object]
         _active_proc = None
 
 def t_glob(pattern: str) -> tuple[str, dict[str, object]]:
+    """Return the paths matching a glob pattern, one per line.
+
+    Tool spec:
+        name: glob
+        description: Return the paths matching a glob pattern, one per line.
+        parameters:
+            pattern:
+                type: string
+                description: Glob pattern, e.g. 'src/**/*.py'.
+                required: true
+    """
     import glob as _glob
     pattern = _coerce_str(pattern, "pattern")
     try:

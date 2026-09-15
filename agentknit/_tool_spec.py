@@ -13,8 +13,9 @@ def parse_tool_spec_from_docstring(doc: str) -> dict[str, Any] | None:
     indented YAML-like key-value pairs.
 
     Returns a dict with keys ``name``, ``description``, ``parameters``
-    (a dict of parameter name → ``{"type": str, "description": str}``),
-    or ``None`` if no ``Tool spec:`` block is found.
+    (a dict of parameter name → ``{"type": str, "description": str}``) and
+    ``required`` (the parameter names marked ``required: true``, in declaration
+    order), or ``None`` if no ``Tool spec:`` block is found.
     """
     if not doc:
         return None
@@ -36,6 +37,7 @@ def parse_tool_spec_from_docstring(doc: str) -> dict[str, Any] | None:
         "name": "",
         "description": "",
         "parameters": {},
+        "required": [],
     }
 
     # Determine base indent from first non-empty line
@@ -106,6 +108,10 @@ def parse_tool_spec_from_docstring(doc: str) -> dict[str, Any] | None:
                         result["parameters"][current_param]["type"] = value
                     elif key == "description":
                         result["parameters"][current_param]["description"] = value
+                    elif key == "required":
+                        if value.strip().lower() in ("true", "yes", "1"):
+                            if current_param not in result["required"]:
+                                result["required"].append(current_param)
         else:
             # Top-level keys
             top_match = re.match(r"^(\w+):\s*(.*)", content)
@@ -134,3 +140,44 @@ def extract_tool_specs_from_module(module: object) -> dict[str, dict[str, Any]]:
         if spec is not None:
             specs[name] = spec
     return specs
+
+
+def tool_spec_to_schema(spec: dict[str, Any]) -> dict[str, Any]:
+    """Convert a parsed ``Tool spec:`` block into one OpenAI schema entry.
+
+    The result is what an endpoint's ``"tools"`` list expects, and what
+    :func:`~agentknit.tool.build_tool_spec` produces for a :class:`~agentknit.Tool`::
+
+        >>> spec = parse_tool_spec_from_docstring('''
+        ...     Tool spec:
+        ...         name: glob
+        ...         description: Match paths.
+        ...         parameters:
+        ...             pattern:
+        ...                 type: string
+        ...                 description: Glob pattern.
+        ...                 required: true
+        ... ''')
+        >>> tool_spec_to_schema(spec)["function"]["parameters"]["required"]
+        ['pattern']
+
+    Together with :func:`extract_tool_specs_from_module`, this turns a module of
+    documented tool functions into a schema a host can publish, with no second
+    copy of the parameter descriptions to keep in sync.
+    """
+    properties = {
+        name: {k: v for k, v in param.items() if k != "required"}
+        for name, param in spec.get("parameters", {}).items()
+    }
+    return {
+        "type": "function",
+        "function": {
+            "name": spec.get("name", ""),
+            "description": spec.get("description", ""),
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": list(spec.get("required", [])),
+            },
+        },
+    }

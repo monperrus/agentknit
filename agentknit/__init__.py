@@ -106,6 +106,7 @@ from .sandbox import (
 from ._tool_spec import (
     parse_tool_spec_from_docstring,
     extract_tool_specs_from_module,
+    tool_spec_to_schema,
 )
 
 from .tool_library import (
@@ -142,6 +143,7 @@ from .slash_commands import (
 __all__ = [
     "parse_tool_spec_from_docstring",
     "extract_tool_specs_from_module",
+    "tool_spec_to_schema",
     "AgentProbeError", "AgentSpecDisabledError", "AgentSpecInvalidError",
     "PricingLimitExceededError", "AuthenticationError", "CacheProofError",
     "ContextWindowExceededError", "RateLimitError",

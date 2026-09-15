@@ -515,7 +515,10 @@ def t_search(path: str = ".", pattern: str = "") -> tuple[str, dict[str, object]
     proc: subprocess.Popen[str] | None = None
     try:
         proc = subprocess.Popen(
-            ["grep", "-r", "-n", "--", pattern, path],
+            # -H: without it grep omits the filename when *path* is a single
+            # file, and the "file:line:text" parser below then discards every
+            # match — searching one file silently returned no results.
+            ["grep", "-r", "-H", "-n", "--", pattern, path],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

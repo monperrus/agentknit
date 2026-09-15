@@ -308,10 +308,12 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "",
                 type: string
                 description: Text to replace.
                 required: true
+                maps_to: old
             new_str:
                 type: string
                 description: Replacement text.
                 required: true
+                maps_to: new
             replace_all:
                 type: boolean
                 description: Replace every occurrence instead of only the first.

@@ -13,9 +13,10 @@ def parse_tool_spec_from_docstring(doc: str) -> dict[str, Any] | None:
     indented YAML-like key-value pairs.
 
     Returns a dict with keys ``name``, ``description``, ``parameters``
-    (a dict of parameter name → ``{"type": str, "description": str}``) and
+    (a dict of parameter name → ``{"type": str, "description": str}``),
     ``required`` (the parameter names marked ``required: true``, in declaration
-    order), or ``None`` if no ``Tool spec:`` block is found.
+    order) and ``param_map`` (model-facing name → Python keyword, from any
+    ``maps_to:`` markers), or ``None`` if no ``Tool spec:`` block is found.
     """
     if not doc:
         return None
@@ -38,6 +39,7 @@ def parse_tool_spec_from_docstring(doc: str) -> dict[str, Any] | None:
         "description": "",
         "parameters": {},
         "required": [],
+        "param_map": {},
     }
 
     # Determine base indent from first non-empty line
@@ -112,6 +114,10 @@ def parse_tool_spec_from_docstring(doc: str) -> dict[str, Any] | None:
                         if value.strip().lower() in ("true", "yes", "1"):
                             if current_param not in result["required"]:
                                 result["required"].append(current_param)
+                    elif key == "maps_to":
+                        # The model-facing name differs from the Python kwarg.
+                        if value and value != current_param:
+                            result["param_map"][current_param] = value
         else:
             # Top-level keys
             top_match = re.match(r"^(\w+):\s*(.*)", content)
@@ -166,7 +172,7 @@ def tool_spec_to_schema(spec: dict[str, Any]) -> dict[str, Any]:
     copy of the parameter descriptions to keep in sync.
     """
     properties = {
-        name: {k: v for k, v in param.items() if k != "required"}
+        name: {k: v for k, v in param.items() if k not in ("required", "maps_to")}
         for name, param in spec.get("parameters", {}).items()
     }
     return {

@@ -12,7 +12,7 @@ from agentknit._tool_spec import (
     extract_tool_specs_from_module,
     tool_spec_to_schema,
 )
-from agentknit import tool_library
+from agentknit import dispatch, tool_library
 from agentknit._core import _DEFAULT_TOOL_SCHEMA, _DEFAULT_TOOL_DISPATCH
 
 
@@ -274,6 +274,33 @@ def test_schema_conversion_keeps_the_required_marker_out_of_properties():
         "type": "string",
         "description": "Glob pattern, e.g. 'src/**/*.py'.",
     }
+
+
+def test_param_map_is_parsed_from_maps_to():
+    spec = parse_tool_spec_from_docstring(inspect.getdoc(tool_library.t_update))
+
+    assert spec["param_map"] == {"old_str": "old", "new_str": "new"}
+
+
+def test_specs_alone_yield_a_working_dispatch_table(tmp_path):
+    """A host can build schema *and* dispatch from the docstrings only."""
+    specs = extract_tool_specs_from_module(tool_library)
+    tool_dispatch = {
+        spec["name"]: {"python_function": fn_name, "param_map": spec["param_map"]}
+        for fn_name, spec in specs.items()
+    }
+    for name, shipped in _DEFAULT_TOOL_DISPATCH.items():
+        assert tool_dispatch[name]["param_map"] == shipped["param_map"]
+
+    target = tmp_path / "f.txt"
+    target.write_text("hello")
+    dispatch(
+        "str_replace",
+        {"path": str(target), "old_str": "hello", "new_str": "bye"},
+        tool_dispatch,
+    )
+
+    assert target.read_text() == "bye"
 
 
 def test_the_extra_library_tools_are_documented_too():

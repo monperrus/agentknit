@@ -91,6 +91,7 @@ from .hooks import (
 from .tool import (
     Tool,
     build_tool_spec,
+    default_tool_spec,
     register_tools_in_library,
 )
 
@@ -172,6 +173,7 @@ __all__ = [
     "RawHookResult", "load_hooks", "register_hook",
     "Tool",
     "build_tool_spec",
+    "default_tool_spec",
     "register_tools_in_library",
     "ToolExecutor", "ToolSessionContext", "LocalToolExecutor",
     "SandboxPolicy", "BubblewrapToolExecutor",

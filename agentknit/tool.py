@@ -22,6 +22,7 @@ Typical usage::
 
 from __future__ import annotations
 
+import copy
 import inspect
 import typing
 from dataclasses import dataclass
@@ -243,6 +244,42 @@ def build_tool_spec(
         }
 
     return schema, dispatch
+
+
+def default_tool_spec() -> tuple[list[dict[str, object]], dict[str, dict[str, object]]]:
+    """Return agentknit's built-in tools as a ``(schema, dispatch)`` pair.
+
+    Same shape as :func:`build_tool_spec`, for the four tools agentknit ships
+    with: ``read_file``, ``write_file``, ``str_replace`` and ``exec_shell``.
+    Their callables are already registered in
+    :data:`~agentknit.tool_library.TOOL_LIBRARY`, so the pair works as is::
+
+        from agentknit import default_tool_spec, dispatch
+
+        schema, tool_dispatch = default_tool_spec()
+        text, meta = dispatch("read_file", {"path": "README.md"}, tool_dispatch)
+
+    This is what a host embedding only the tool runtime needs — an MCP or ACP
+    server re-publishing agentknit's tools under another protocol, say.  Both
+    halves are deep copies, so extending them with tools of your own cannot
+    disturb anything else in the process.
+
+    >>> schema, tool_dispatch = default_tool_spec()
+    >>> sorted(tool_dispatch)
+    ['exec_shell', 'read_file', 'str_replace', 'write_file']
+    >>> schema[0]["function"]["name"]
+    'read_file'
+    """
+    # Imported here, not at module scope: _core imports this module, so the
+    # dependency can only run in this direction at call time.
+    from ._core import _DEFAULT_TOOL_DISPATCH, _DEFAULT_TOOL_SCHEMA
+
+    schema = copy.deepcopy(_DEFAULT_TOOL_SCHEMA)
+    dispatch = copy.deepcopy(dict(_DEFAULT_TOOL_DISPATCH))
+    return (
+        typing.cast("list[dict[str, object]]", schema),
+        typing.cast("dict[str, dict[str, object]]", dispatch),
+    )
 
 
 def register_tools_in_library(tools: list[Tool]) -> None:

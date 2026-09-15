@@ -233,6 +233,67 @@ The framework ships with a built-in set of tools (`read_file`, `write_file`,
 still accepted as an alias. `str_replace` replaces the first occurrence of
 `old_str` by default; pass `replace_all: true` to replace every occurrence.
 
+`tool_library` also carries `list_dir`, `glob` and `search_files`, plus a few
+older functions kept for compatibility. `CANONICAL_TOOLS` maps each tool name
+to the implementation to use, and `SUPERSEDED_TOOLS` maps the rest to their
+replacement:
+
+```python
+from agentknit import CANONICAL_TOOLS, SUPERSEDED_TOOLS
+
+CANONICAL_TOOLS["search_files"]     # 't_search'
+SUPERSEDED_TOOLS["t_find_files"]    # 't_glob'
+```
+
+### Using the tool runtime from another host
+
+The sections above have agentknit drive the model. The opposite arrangement
+works too: something else runs the conversation — Claude Code over MCP, an
+editor over ACP, your own loop — and agentknit supplies only the tools.
+
+Two public functions cover it. `default_tool_spec()` returns the built-in
+tools as a `(schema, dispatch)` pair, and `dispatch()` runs one call:
+
+```python
+from agentknit import default_tool_spec, dispatch
+
+schema, tool_dispatch = default_tool_spec()   # publish schema to your host
+
+text, meta = dispatch("read_file", {"path": "README.md"}, tool_dispatch)
+if not meta.get("ok", True):
+    ...                                       # meta["error"] has the message
+```
+
+`text` is written for the model and starts with `ERROR: ` on failure; code
+should test `meta.get("ok", True)` rather than that prefix. To publish more
+than the default four, read their descriptions straight from the docstrings
+instead of keeping a second copy:
+
+```python
+from agentknit import extract_tool_specs_from_module, tool_spec_to_schema, tool_library
+
+specs = extract_tool_specs_from_module(tool_library)
+schema = [tool_spec_to_schema(spec) for spec in specs.values()]
+tool_dispatch = {
+    spec["name"]: {"python_function": fn_name, "param_map": spec["param_map"]}
+    for fn_name, spec in specs.items()
+}
+```
+
+One thing to set up front: `exec_shell` and `search_files` echo their
+subprocess output live, to stdout by default. If your host speaks a protocol
+on stdout, move that stream before the first tool call:
+
+```python
+import sys
+from agentknit import set_tool_output_stream
+
+set_tool_output_stream(sys.stderr)
+```
+
+A worked example is [agentknit-over-mcp](https://github.com/monperrus/agentknit-over-mcp),
+which publishes this runtime as an MCP server.
+
 ### Runtime tool management (`/tool`)
 
 In the REPL the toolset is not fixed at startup — `/tool` lists and mutates it:

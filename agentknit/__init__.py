@@ -115,6 +115,8 @@ from .tool_library import (
     ASYNC_INLINE_MAX_BYTES,
     async_completion_queue,
     enable_rtk_rewrite,
+    get_tool_output_stream,
+    set_tool_output_stream,
 )
 
 from .async_toolkit import (
@@ -183,6 +185,8 @@ __all__ = [
     "t_execute_async", "t_query_exec", "async_completion_queue",
     "ASYNC_EXEC_DIR", "ASYNC_FAST_THRESHOLD_S", "ASYNC_INLINE_MAX_BYTES",
     "enable_rtk_rewrite",
+    # where live tool output goes
+    "get_tool_output_stream", "set_tool_output_stream",
     # nohup tools (async_toolkit)
     "NOHUP_TIMEOUT_MIN", "WAIT_FOR_MAX_SECONDS", "WAIT_FOR_UNIT_SECONDS",
     "enable_nohup", "nohup_tool_specs", "t_nohup", "t_nohup_wait",

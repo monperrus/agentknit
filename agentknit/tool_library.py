@@ -16,7 +16,7 @@ import sys
 import threading
 import traceback
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import IO, TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -81,6 +81,43 @@ _RL_RESET = "\x01\033[0m\x02"
 # Tracks the subprocess currently executing inside a tool, so the SIGINT
 # handler in _core.py can SIGKILL it immediately on Ctrl-C.
 _active_proc: "subprocess.Popen[str] | None" = None
+
+
+# ── streamed tool output ──────────────────────────────────────────────────────
+# Long-running tools echo their subprocess output live so a human watching the
+# terminal sees progress.  A host that speaks a protocol on stdout — MCP, ACP,
+# LSP — must send that stream elsewhere, or the echoed bytes land in the middle
+# of a frame and corrupt the session.  set_tool_output_stream() moves it.
+
+_tool_output_stream: "IO[str] | None" = None
+
+
+def set_tool_output_stream(stream: "IO[str] | None") -> None:
+    """Send live tool output to *stream* instead of stdout.
+
+    Pass ``None`` to restore the default.  The default is resolved at write
+    time, so a caller that reassigns ``sys.stdout`` is still honoured.
+
+    >>> import sys
+    >>> set_tool_output_stream(sys.stderr)   # stdout carries a protocol
+    """
+    global _tool_output_stream
+    _tool_output_stream = stream
+
+
+def get_tool_output_stream() -> "IO[str]":
+    """Return the stream live tool output is currently written to."""
+    return _tool_output_stream if _tool_output_stream is not None else sys.stdout
+
+
+def _emit(text: str) -> None:
+    """Write streamed tool output, never failing the tool if the sink is gone."""
+    try:
+        stream = get_tool_output_stream()
+        stream.write(text)
+        stream.flush()
+    except Exception:
+        pass
 
 
 def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tuple[str, dict[str, object]]:
@@ -347,7 +384,7 @@ def t_run(command: str) -> tuple[str, dict[str, object]]:
         def _drain(stream: Iterable[str], sink: list[str]) -> None:
             for line in stream:
                 sink.append(line)
-                print(line, end="", flush=True)
+                _emit(line)
 
         t_out = threading.Thread(target=_drain, args=(proc.stdout, stdout_lines), daemon=True)
         t_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_lines), daemon=True)
@@ -532,7 +569,7 @@ def t_search(path: str = ".", pattern: str = "") -> tuple[str, dict[str, object]
         def _drain(stream: Iterable[str], sink: list[str]) -> None:
             for line in stream:
                 sink.append(line)
-                print(line, end="", flush=True)
+                _emit(line)
 
         t_out = threading.Thread(target=_drain, args=(proc.stdout, stdout_lines), daemon=True)
         t_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_lines), daemon=True)

@@ -184,6 +184,21 @@ def _coerce_str(value: object, name: str) -> str:
     return str(value)
 
 
+def _tool_failure(message: str) -> tuple[str, dict[str, object]]:
+    """Uniform failure envelope: the message for the model, ``ok: False`` for code.
+
+    The text a tool returns is written for the model, so failures are just an
+    ``ERROR: …`` sentence.  A caller that has to *act* on the outcome — a
+    protocol host mapping it to MCP's ``isError``, a hook, a dashboard — should
+    read ``meta`` instead of pattern-matching English::
+
+        text, meta = dispatch(name, args, tool_dispatch)
+        if not meta.get("ok", True):
+            ...
+    """
+    return message, {"result": message, "ok": False, "error": message}
+
+
 def _tool_error(tool: str, exc: Exception) -> tuple[str, dict[str, object]]:
     """Uniform internal-error envelope: exception type + message + innermost
     frames, so the model (and the human) can locate tool bugs from the
@@ -194,7 +209,7 @@ def _tool_error(tool: str, exc: Exception) -> tuple[str, dict[str, object]]:
         f"{os.path.basename(f.filename)}:{f.lineno} in {f.name}" for f in tb[-3:]
     )
     r = f"ERROR: {tool} internal error: {type(exc).__name__}: {exc} ({inner})"
-    return r, {"result": r}
+    return _tool_failure(r)
 
 
 def t_write(path: str, content: str) -> tuple[str, dict[str, object]]:
@@ -246,8 +261,7 @@ def _apply_patch_format(patch: str) -> tuple[str, dict[str, object]]:
             path = line.split(":", 1)[1].strip()
             break
     if not path:
-        r = "ERROR: apply_patch: could not find '*** Update File:' in patch"
-        return r, {"result": r}
+        return _tool_failure("ERROR: apply_patch: could not find '*** Update File:' in patch")
 
     # Collect hunk lines after the @@ marker
     in_hunk = False
@@ -309,10 +323,11 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "",
         p = Path(os.path.expanduser(path))
         text = p.read_text()
         if old not in text:
-            r = (f"ERROR: old string not found in {path} "
-                 f"({len(old)} chars, starts with {repr(old[:80])}). "
-                 f"Re-read the file and copy the exact bytes.")
-            return r, {"result": r}
+            return _tool_failure(
+                f"ERROR: old string not found in {path} "
+                f"({len(old)} chars, starts with {repr(old[:80])}). "
+                f"Re-read the file and copy the exact bytes."
+            )
         n = text.count(old)                      # total matches before the edit
         done = n if replace_all else min(1, n)
         p.write_text(text.replace(old, new) if replace_all else text.replace(old, new, 1))
@@ -494,7 +509,7 @@ def _play_ask_sound() -> None:
 def t_ask_user_question(question: str = '', options: str = '') -> tuple[str, dict[str, object]]:
     """Prompt the user with an optional numbered list of choices."""
     if not question:
-        return 'ERROR: No question provided', {'result': 'error'}
+        return _tool_failure('ERROR: No question provided')
 
     parsed_options: list[object] = []
     if options:
@@ -521,7 +536,7 @@ def t_ask_user_question(question: str = '', options: str = '') -> tuple[str, dic
     try:
         answer = input(f"{_RL_BOLD}Your answer:{_RL_RESET} ").strip()
     except (EOFError, KeyboardInterrupt):
-        return 'ERROR: No user input available', {'result': 'error'}
+        return _tool_failure('ERROR: No user input available')
     finally:
         if collector is not None:
             collector.resume()
@@ -618,10 +633,10 @@ def t_search(path: str = ".", pattern: str = "") -> tuple[str, dict[str, object]
             except Exception:
                 proc.kill()
         result = json.dumps({"error": "search timed out after 30 s"}, separators=(",", ":"))
-        return result, {"result": result, "error": "search timed out after 30 s"}
+        return result, {"result": result, "ok": False, "error": "search timed out after 30 s"}
     except Exception as e:
         result = json.dumps({"error": str(e)}, separators=(",", ":"))
-        return result, {"result": result, "error": str(e)}
+        return result, {"result": result, "ok": False, "error": str(e)}
     finally:
         _active_proc = None
 
@@ -717,7 +732,7 @@ def _register_generated(fn_name: str, source: str) -> bool:
 def t_update_file(new_str: str = '', file_path: str = '', old_str: str = '') -> tuple[str, dict[str, object]]:
     result_dict: dict[str, object] = {'result': 'success'}
     if not file_path:
-        return ("ERROR: File path is required.", {'result': 'error'})
+        return _tool_failure("ERROR: File path is required.")
     try:
         with Path(os.path.expanduser(file_path)).open('r') as f:
             content = f.read()
@@ -726,7 +741,7 @@ def t_update_file(new_str: str = '', file_path: str = '', old_str: str = '') -> 
             f.write(new_content)
         return ("File updated successfully.", result_dict)
     except Exception as e:
-        return (f"ERROR: {str(e)}", {'result': 'error'})
+        return _tool_failure(f"ERROR: {str(e)}")
 
 TOOL_LIBRARY['t_update_file'] = t_update_file
 
@@ -736,7 +751,7 @@ def t_list_directory(path: str = '') -> tuple[str, dict[str, object]]:
     try:
         p = Path(os.path.expanduser(path))
         if not p.exists() or not p.is_dir():
-            return ("ERROR: Path does not exist or is not a directory", {'result': 'error'})
+            return _tool_failure("ERROR: Path does not exist or is not a directory")
         items = [str(item.name) for item in p.iterdir()]
         result_dict: dict[str, object] = {
             'result': 'success',
@@ -744,7 +759,7 @@ def t_list_directory(path: str = '') -> tuple[str, dict[str, object]]:
         }
         return ("Directory listing successful", result_dict)
     except Exception as e:
-        return (f"ERROR: {str(e)}", {'result': 'error'})
+        return _tool_failure(f"ERROR: {str(e)}")
 
 TOOL_LIBRARY['t_list_directory'] = t_list_directory
 
@@ -753,7 +768,7 @@ TOOL_LIBRARY['t_list_directory'] = t_list_directory
 def t_search_files(command: str = '') -> tuple[str, dict[str, object]]:
     try:
         if not command:
-            return "ERROR: command is required", {"result": "ERROR: command is required"}
+            return _tool_failure("ERROR: command is required")
         
         glob_chars = {'*', '?', '['}
         has_glob = any(c in command for c in glob_chars)

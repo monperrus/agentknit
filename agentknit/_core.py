@@ -893,6 +893,12 @@ def dispatch(tool_name: str, args: dict[str, Any], tool_dispatch: dict[str, Any]
 
     param_map translates model argument names → Python kwarg names.
     Any model arg not in param_map is passed through unchanged.
+
+    Returns ``(text, meta)``.  *text* is written for the model and starts with
+    ``ERROR: `` when the call failed; code should test ``meta.get("ok", True)``
+    instead of pattern-matching that prefix, and read ``meta["error"]`` for the
+    message.  A missing ``"ok"`` key means success — tools only set it when
+    something went wrong.
     """
     entry = tool_dispatch.get(tool_name)
     if not entry:
@@ -903,7 +909,7 @@ def dispatch(tool_name: str, args: dict[str, Any], tool_dispatch: dict[str, Any]
     if fn is None:
         pf = entry.get("python_function", "")
         r = f"ERROR: python_function '{pf}' not found in TOOL_LIBRARY"
-        return r, {"result": r}
+        return r, {"result": r, "ok": False, "error": r}
 
     param_map = entry.get("param_map") or {}
     # Translate model param names → Python kwarg names.
@@ -927,7 +933,7 @@ def dispatch(tool_name: str, args: dict[str, Any], tool_dispatch: dict[str, Any]
              f"Expected signature: {fn_name}{sig}. "
              f"You supplied: {sorted(args.keys())}. "
              f"Correct the argument names/values and call the tool again.")
-        return r, {"result": r}
+        return r, {"result": r, "ok": False, "error": r}
     except Exception as e:
         # Internal tool failure — include the exception type (not just
         # str(e)) plus the innermost frames so bugs like "'bool' object has
@@ -937,7 +943,7 @@ def dispatch(tool_name: str, args: dict[str, Any], tool_dispatch: dict[str, Any]
                           for f in tb[-3:])
         r = (f"ERROR: tool {tool_name!r} raised {type(e).__name__}: {e} "
              f"({fn_name}(**{kwargs!r}); {inner})")
-        return r, {"result": r}
+        return r, {"result": r, "ok": False, "error": r}
 
     # All library functions return (str, dict); handle plain str just in case.
     if isinstance(result, tuple):

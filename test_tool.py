@@ -8,6 +8,20 @@ from agentknit.tool_library import TOOL_LIBRARY
 from agentknit._core import FatalToolDispatchError
 
 
+@pytest.fixture(autouse=True)
+def _restore_tool_library():
+    """Undo the registrations done here.
+
+    Several tests below register the sample tools under the names of the real
+    ones, t_read included.  Left in place, every later test in the session — in
+    this file or any other — would dispatch read_file to the stub.
+    """
+    saved = dict(TOOL_LIBRARY)
+    yield
+    TOOL_LIBRARY.clear()
+    TOOL_LIBRARY.update(saved)
+
+
 # ── sample tool implementations ───────────────────────────────────────────────
 
 def t_read(path: str) -> tuple[str, dict]:

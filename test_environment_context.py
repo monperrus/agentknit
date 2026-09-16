@@ -65,8 +65,28 @@ def test_git_status_in_git_repo(tmp_path: Path) -> None:
         block = environment_context("test-model")
 
     assert "Git: on branch " in block
-    assert "last commit: initial commit" in block
+    assert "recent commits:" in block
+    assert "initial commit" in block
     assert "b.txt" in block
+
+
+def test_recent_commits_lists_up_to_five(tmp_path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=tmp_path,
+                   capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "tester@example.com"],
+                   cwd=tmp_path, capture_output=True, check=True)
+    for i in range(7):
+        (tmp_path / "f.txt").write_text(f"v{i}")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True, check=True)
+        subprocess.run(["git", "commit", "-m", f"commit {i}"], cwd=tmp_path,
+                       capture_output=True, check=True)
+
+    with _cwd(tmp_path):
+        block = environment_context("test-model")
+
+    assert "commit 6" in block and "commit 2" in block
+    assert "commit 1" not in block and "commit 0" not in block
 
 
 class _cwd:

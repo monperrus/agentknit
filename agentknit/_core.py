@@ -1255,15 +1255,16 @@ def _git_status_block() -> "str | None":
             ["git", "status", "--porcelain"],
             capture_output=True, text=True, timeout=5,
         ).stdout.splitlines()
-        last_commit = subprocess.run(
-            ["git", "log", "-1", "--pretty=format:%s"],
+        recent_commits = subprocess.run(
+            ["git", "log", "-5", "--pretty=format:%h %s"],
             capture_output=True, text=True, timeout=5,
-        ).stdout.strip()
+        ).stdout.splitlines()
     except (OSError, subprocess.TimeoutExpired):
         return None
     lines = [f"Git: on branch {branch or '(unknown)'}"]
-    if last_commit:
-        lines.append(f"  last commit: {last_commit}")
+    if recent_commits:
+        lines.append("  recent commits:")
+        lines.extend(f"    {line}" for line in recent_commits if line.strip())
     if changed:
         lines.append(f"  changed files ({len(changed)}):")
         lines.extend(f"    {line}" for line in changed[:20])

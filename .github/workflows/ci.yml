@@ -39,6 +39,19 @@ jobs:
           pip install "mypy~=2.1.0" types-requests
           python -m mypy agentknit/
 
+      - name: Seed user-level config (leak detector)
+        run: |
+          # CI runs with a bare home, so a test that accidentally reads the
+          # user's real ~/.agentknit or ~/.claude config passes here and fails
+          # on a developer machine.  Plant config in $HOME so that any such
+          # leak fails the build instead.  conftest.py isolates $HOME, so a
+          # correct suite never sees these files.
+          mkdir -p "$HOME/.agentknit" "$HOME/.claude"
+          cat > "$HOME/.agentknit/hooks.json" <<'JSON'
+          {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo ci-home-leak"}]}]}}
+          JSON
+          echo 'ci-home-leak: this file must never reach a test.' > "$HOME/.claude/CLAUDE.md"
+
       - name: Run tests with pytest
         run: |
           python -m pytest --cov=agentknit --cov-report=term-missing -v

@@ -80,5 +80,5 @@ def test_request_is_committed_before_submit(tmp_path: Path) -> None:
     result = run_task(_schema(), "hello", client=client,
                       session_dir=tmp_path / "request-session", durable_sink=sink)
     assert result.final_reply == "ok"
-    assert submitted[0]["last_content"] == "hello"
+    assert submitted[0]["last_content"].startswith("hello")
     assert (tmp_path / "request-session" / "messages.json").exists()

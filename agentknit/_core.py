@@ -249,6 +249,28 @@ _TOKEN_AWARENESS_REMINDER = (    "<context_window_reminder>\n"
     "</context_window_reminder>"
 )
 
+# Time awareness (model-facing): inject *measured* wall-clock timings into
+# the model's own context, so it works from a lived distribution of how long
+# things take in this repo on this machine instead of a trained-on prior
+# about how long they take for humans.  Two injections, both derived from
+# real clock readings — never estimated:
+#   1. a timing line opening every turn (session elapsed · last tool ·
+#      wall since the model's previous message);
+#   2. an ISO-8601 start/end/duration stamp on every tool result.
+# Framing mirrors token awareness: time is information, not pressure — no
+# deadline is implied, so elapsed time is never a reason to rush or stop.
+_TIME_AWARENESS_SYSTEM = (
+    "Wall-clock timing is injected into this session: each of your turns opens "
+    "with a <session_time> line (session elapsed · duration of the last tool "
+    "call · wall time since your previous message), and every tool result "
+    "carries a <tool_time> stamp with its ISO-8601 start, end and duration. "
+    "These numbers are measured on this machine, not estimated — use them to "
+    "learn how long operations actually take here instead of assuming. Time "
+    "passing is information, not pressure: nothing expires, no deadline is "
+    "implied, and a long elapsed time is never a reason to rush, take "
+    "shortcuts or stop early."
+)
+
 _COMPACTION_PROMPT = (
     "Summarize the conversation above into a dense, structured summary "
     "optimized for continuing a coding task. Preserve all state needed to "
@@ -1611,6 +1633,93 @@ def _token_awareness_injection(session: Session, usage: object) -> str | None:
     return warning
 
 
+def fmt_duration(seconds: float) -> str:
+    """Format a measured duration the way a human (or a model) reads it.
+
+    Sub-second readings keep millisecond precision (tool calls are often
+    that fast); longer ones degrade gracefully to ``9.4s`` / ``42s`` /
+    ``14m22s`` / ``2h05m``.
+    """
+    seconds = max(0.0, seconds)
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 10:
+        return f"{seconds:.1f}s"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        m, s = divmod(int(seconds), 60)
+        return f"{m}m{s:02d}s"
+    h, rem = divmod(int(seconds), 3600)
+    return f"{h}h{rem // 60:02d}m"
+
+
+def _epoch_from_iso(ts: str | None) -> float | None:
+    """Epoch seconds for an ISO timestamp written by this module, or None."""
+    if not ts:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(ts).timestamp()
+    except ValueError:
+        return None
+
+
+def _iso_stamp(epoch: float) -> str:
+    """Local ISO-8601 timestamp (millisecond precision, with UTC offset)."""
+    return (datetime.datetime.fromtimestamp(epoch)
+            .astimezone().isoformat(timespec="milliseconds"))
+
+
+def _time_awareness_preamble(session: Session) -> str | None:
+    """Model-facing timing line to open a turn with, or None when disabled.
+
+    Three measured numbers, every turn, no reasoning required: how long the
+    session has been running, how long the last tool call took, and how much
+    wall time passed since the model's previous message (i.e. how long the
+    human was away).  Never estimated, never padded.
+    """
+    if not session.get("time_awareness_enabled"):
+        return None
+    now = time.time()
+    started = session.get("time_awareness_started_at") or now
+    elapsed = now - started
+    last_tool_ms = session.get("time_awareness_last_tool_ms")
+    last_reply_at = session.get("time_awareness_last_reply_at")
+    since_reply = None if not last_reply_at else now - last_reply_at
+    line = ("session elapsed: " + fmt_duration(elapsed)
+            + " · last tool: "
+            + (fmt_duration(last_tool_ms / 1000) if last_tool_ms is not None
+               else "n/a")
+            + " · wall since your previous message: "
+            + (fmt_duration(since_reply) if since_reply is not None else "n/a"))
+    _emit(session, "session_time",
+          elapsed_seconds=round(elapsed, 3),
+          last_tool_ms=last_tool_ms,
+          since_previous_message_seconds=(None if since_reply is None
+                                          else round(since_reply, 3)),
+          fmt=None)
+    return f"<session_time>{line}</session_time>"
+
+
+def _tool_timing_footer(session: Session) -> str | None:
+    """ISO-8601 stamp for the tool call that just ran, consumed once.
+
+    The span is recorded by :func:`_handle_tool_call` around the dispatch
+    itself, so it measures the tool, not the turn plumbing around it.
+    """
+    span = cast("dict[str, Any]", session).pop(
+        "_time_awareness_pending_tool_span", None)
+    if span is None:
+        return None
+    if not (session.get("time_awareness_enabled")
+            and session.get("time_awareness_tool_timestamps", True)):
+        return None
+    started, ended = span
+    return (f'<tool_time start="{_iso_stamp(started)}" '
+            f'end="{_iso_stamp(ended)}" '
+            f'duration="{fmt_duration(ended - started)}" />')
+
+
 def _log(session: Session, record: "dict[str, Any]") -> None:
     record["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
     record["cwd"] = os.getcwd()
@@ -1714,6 +1823,18 @@ def _save_messages_snapshot(session: Session) -> None:
                 "budget_tokens": session.get("token_awareness_budget_tokens"),
                 "reminder_tokens": session.get("token_awareness_reminder_tokens"),
                 "update_every": session.get("token_awareness_update_every"),
+            },
+            # Time-awareness knobs plus the session clock's anchor, so a
+            # resumed session keeps reporting elapsed time from the real
+            # start rather than restarting at zero.
+            "time_awareness": {
+                "enabled": bool(session.get("time_awareness_enabled")),
+                "tool_timestamps": bool(
+                    session.get("time_awareness_tool_timestamps", True)),
+                "started_at": (
+                    _iso_stamp(started_at)
+                    if (started_at := session.get("time_awareness_started_at"))
+                    else None),
             },
         },
         "messages": annotated,
@@ -2373,6 +2494,16 @@ class Session(TypedDict):
     token_awareness_reminder_tokens: NotRequired[int]   # checkpoint-protocol threshold
     token_awareness_update_every: NotRequired[int]      # inject every Nth LLM call
     token_awareness_last_remaining: NotRequired[int | None]  # edge-trigger state; None = no observation yet
+    # time awareness (model-facing wall-clock timings)
+    # NotRequired: sessions snapshotted before time awareness existed lack
+    # these keys; the restore path backfills defaults (enabled, session start
+    # taken from session_start_ts).  New sessions always set them.
+    time_awareness_enabled: NotRequired[bool]            # master switch (default on)
+    time_awareness_tool_timestamps: NotRequired[bool]    # stamp tool results (default on)
+    time_awareness_started_at: NotRequired[float]        # epoch seconds; denominator of "session elapsed"
+    time_awareness_last_reply_at: NotRequired[float | None]  # epoch of the last final answer
+    time_awareness_last_tool_ms: NotRequired[int | None]     # duration of the last tool call
+    _time_awareness_pending_tool_span: NotRequired["tuple[float, float] | None"]
     # durability
     # NotRequired: sessions saved before the durable-recovery feature lack
     # this key; the restore path defaults it to True.
@@ -2426,6 +2557,8 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                  token_awareness_budget_tokens: int | None = None,
                  token_awareness_reminder_tokens: int | None = None,
                  token_awareness_update_every: int | None = None,
+                 time_awareness_enabled: bool | None = None,
+                 time_awareness_tool_timestamps: bool | None = None,
                  durable: bool | None = None,
                  session_dir: str | Path | None = None,
                  durable_sink: DurableSink | None = None,
@@ -2592,6 +2725,17 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                             DEFAULT_TOKEN_AWARENESS_REMINDER_TOKENS)
         restored.setdefault("token_awareness_update_every", 1)
         restored.setdefault("token_awareness_last_remaining", None)
+        # Old snapshots predate time awareness: backfill defaults.  The
+        # session clock keeps running across the resume — "session elapsed"
+        # is anchored on the original start, which is the truth the model
+        # should see (a session resumed a day later really is a day old).
+        restored.setdefault("time_awareness_enabled", True)
+        restored.setdefault("time_awareness_tool_timestamps", True)
+        restored.setdefault(
+            "time_awareness_started_at",
+            _epoch_from_iso(restored.get("session_start_ts")) or time.time())
+        restored.setdefault("time_awareness_last_reply_at", None)
+        restored.setdefault("time_awareness_last_tool_ms", None)
         # Replace event handler if a new one was provided.
         if on_event is not None:
             restored["on_event"] = on_event
@@ -2625,6 +2769,10 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             restored["token_awareness_reminder_tokens"] = token_awareness_reminder_tokens
         if token_awareness_update_every is not None:
             restored["token_awareness_update_every"] = token_awareness_update_every
+        if time_awareness_enabled is not None:
+            restored["time_awareness_enabled"] = time_awareness_enabled
+        if time_awareness_tool_timestamps is not None:
+            restored["time_awareness_tool_timestamps"] = time_awareness_tool_timestamps
         if durable is not None:
             restored["durable"] = durable
         # Hooks: restored sessions keep their configured hooks unless the
@@ -2700,6 +2848,18 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     ))
     if ta_enabled:
         sys_msg += "\n\n" + _TOKEN_AWARENESS_SYSTEM.format(budget=ta_budget)
+
+    # Time awareness: explicit kwarg → schema → default (on).
+    time_enabled = (
+        time_awareness_enabled if time_awareness_enabled is not None
+        else schema.get("time_awareness_enabled", True)
+    )
+    time_stamps = (
+        time_awareness_tool_timestamps if time_awareness_tool_timestamps is not None
+        else schema.get("time_awareness_tool_timestamps", True)
+    )
+    if time_enabled:
+        sys_msg += "\n\n" + _TIME_AWARENESS_SYSTEM
 
     session_id = resumed_from if resumed_from else uuid.uuid4().hex[:12]
     streaming = bool(
@@ -2804,6 +2964,12 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         "token_awareness_reminder_tokens": int(ta_reminder),
         "token_awareness_update_every": ta_update_every,
         "token_awareness_last_remaining": None,
+        "time_awareness_enabled": bool(time_enabled),
+        "time_awareness_tool_timestamps": bool(time_stamps),
+        "time_awareness_started_at": (_epoch_from_iso(session_start_ts)
+                                      or time.time()),
+        "time_awareness_last_reply_at": None,
+        "time_awareness_last_tool_ms": None,
         # Durable recovery: append-only WAL of every in-turn state change.
         "durable": (
             True if session_dir is not None else
@@ -3588,6 +3754,10 @@ def _handle_tool_call(
     _tool_module._tool_context.tool_dispatch = tool_dispatch
     _tool_module._tool_context.tool_ttl_seconds = session.get("tool_ttl_seconds")
 
+    # Time awareness: measure the dispatch itself — the number the model
+    # sees is a real clock reading of this tool on this machine.
+    tool_started_at = time.time()
+
     if is_ask and non_interactive:
         result = "ERROR: user interaction is disabled (--non-interactive)"
         log_data: dict[str, Any] = {"result": result}
@@ -3677,6 +3847,12 @@ def _handle_tool_call(
                            "ts": datetime.datetime.now().isoformat(timespec="seconds")})
             raise
 
+    tool_ended_at = time.time()
+    tool_duration_ms = int(round((tool_ended_at - tool_started_at) * 1000))
+    session["time_awareness_last_tool_ms"] = tool_duration_ms
+    cast("dict[str, Any]", session)["_time_awareness_pending_tool_span"] = (
+        tool_started_at, tool_ended_at)
+
     fmt = fmt_result(result, streamed=streamed)
     if name == "read_file":
         path = args.get("path")
@@ -3715,10 +3891,16 @@ def _handle_tool_call(
           name=name, result=result, streamed=streamed,
           files=log_data.get("files"),
           diff_summary=log_data.get("diff_summary"),
+          started_at=_iso_stamp(tool_started_at),
+          ended_at=_iso_stamp(tool_ended_at),
+          duration_ms=tool_duration_ms,
           fmt=fmt)
     _log(session, {"type": "tool_result", "name": name,
                    "python_function": pf_name,
                    "result": result, **log_data,
+                   "started_at": _iso_stamp(tool_started_at),
+                   "ended_at": _iso_stamp(tool_ended_at),
+                   "duration_ms": tool_duration_ms,
                    "ts": datetime.datetime.now().isoformat(timespec="seconds")})
     return result
 
@@ -3929,6 +4111,16 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
         messages.append(msg)
 
     now_ts = datetime.datetime.now().isoformat(timespec="seconds")
+    # Time awareness: the submitted prompt carries the turn's timing line.
+    # Suffixed onto the user message rather than sent as its own message —
+    # same reasoning as the token countdown: no extra messages, valid role
+    # alternation, and the cached prefix stays untouched.  The log keeps the
+    # human's text verbatim.
+    submitted = task
+    if task is not None:
+        preamble = _time_awareness_preamble(session)
+        if preamble:
+            submitted = f"{task}\n\n{preamble}" if task else preamble
     if task is None:
         # The prior user message was already journaled before the failed
         # request.  Send that exact transcript again rather than turning a
@@ -3938,7 +4130,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
         # Merge consecutive user messages to keep the API-valid
         # user/assistant alternation.
         old = messages[-1]["content"]
-        messages[-1]["content"] = f"{old}\n\n{task}" if old else task
+        messages[-1]["content"] = f"{old}\n\n{submitted}" if old else submitted
         messages[-1]["ts"] = now_ts
         if journal is not None:
             # A merge replaces prior history; replay it as a replacement,
@@ -3946,7 +4138,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             _write_journal_record(session, {"type": "reset_messages", "reason": "user_merge",
                                             "messages": list(messages)})
     else:
-        _append_message({"role": "user", "content": task, "ts": now_ts})
+        _append_message({"role": "user", "content": submitted, "ts": now_ts})
     if task is not None:
         _log(session, {"type": "user", "content": task, "ts": now_ts})
 
@@ -3963,6 +4155,12 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
 
     def _with_pending_ta(text: str) -> str:
         nonlocal pending_ta
+        # Time awareness: stamp the tool result with the measured span of
+        # the call that produced it (nothing to stamp when no tool ran, e.g.
+        # the malformed-arguments path).
+        timing = _tool_timing_footer(session)
+        if timing:
+            text = f"{text}\n\n{timing}"
         if pending_ta:
             text = f"{text}\n\n{pending_ta}"
             pending_ta = None
@@ -4204,6 +4402,10 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             _log(session, {"type": "assistant", "content": text,
                        "ts": datetime.datetime.now().isoformat(timespec="seconds")})
             already_streamed = session.get("_content_was_streamed", False)
+            # Time awareness: anchor "wall since your previous message" on
+            # the moment this reply left, so the next turn measures how long
+            # the human actually took.
+            session["time_awareness_last_reply_at"] = time.time()
             _emit(session, "final_answer", text=text.strip(),
                   fmt="" if already_streamed else f"\n{GREEN}{BOLD}» {RESET}{text.strip()}\n")
             t = session["usage_totals"]

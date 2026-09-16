@@ -104,7 +104,8 @@ def test_run_repl_uses_injected_client(monkeypatch) -> None:
     with contextlib.redirect_stdout(buf):
         run_repl(_schema(), client=client)
     assert len(client.requests) == 1
-    assert client.requests[0]["messages"][-1]["content"] == "hi"
+    # The prompt carries the time-awareness line; the typed text opens it.
+    assert client.requests[0]["messages"][-1]["content"].startswith("hi")
 
 
 def test_repl_continue_retries_without_adding_user_message(monkeypatch) -> None:
@@ -118,5 +119,6 @@ def test_repl_continue_retries_without_adding_user_message(monkeypatch) -> None:
         run_repl(_schema(), client=client)
 
     assert len(client.requests) == 2
-    assert [m["content"] for m in client.requests[1]["messages"]
-            if m["role"] == "user"] == ["work"]
+    users = [m["content"] for m in client.requests[1]["messages"]
+             if m["role"] == "user"]
+    assert len(users) == 1 and users[0].startswith("work")

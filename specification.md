@@ -50,6 +50,22 @@ Model-facing token awareness (see [Token Awareness in Coding Agents](https://www
 | `token_awareness_update_every` | integer | no | Inject the countdown every Nth LLM call (default `1`). |
 
 All four are also accepted as keyword arguments to `init_session` / `run_task` / `run`.  A `token_budget` event (`used`, `budget`, `remaining`, `below_reminder_threshold`) is emitted alongside `usage`, and usage log records gain `token_budget_remaining`.
+
+### Time awareness
+
+Model-facing time awareness: *measured* wall-clock readings injected into the model's own context, so it works from a lived distribution of how long things take in this repo on this machine instead of a trained-on prior about how long they take for humans.  Two injections, both from real clock readings — never estimated:
+
+1. Every turn opens with a timing line suffixed onto the submitted prompt: `<session_time>session elapsed: 14m22s · last tool: 340ms · wall since your previous message: 1m31s</session_time>`.  Readings that don't exist yet (first turn) say `n/a` rather than inventing a number.  "Your previous message" is the model's own last reply, so the third number is how long the human took to answer.
+2. Every tool result is stamped with the measured span of the call that produced it: `<tool_time start="2026-09-16T14:22:31.120+02:00" end="2026-09-16T14:22:31.460+02:00" duration="340ms" />`.  This covers every tool, `exec_shell` included — no per-tool wrapping needed.  A call that never ran (malformed arguments, hook denial) gets no stamp.
+
+The system prompt gains a paragraph explaining both markers, framed like the token countdown: time is information, not pressure — nothing expires, and a long elapsed time is never a reason to rush or stop early.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `time_awareness_enabled` | boolean | no | Master switch (default `true`).  When `false` neither injection happens and the system prompt says nothing about timing. |
+| `time_awareness_tool_timestamps` | boolean | no | Stamp tool results with `<tool_time …>` (default `true`).  Turning it off keeps the per-turn timing line. |
+
+Both are also accepted as keyword arguments to `init_session`.  The `tool_result` event and its log record gain `started_at`, `ended_at` and `duration_ms`, so a journal replays the session's real timing distribution.  "Session elapsed" is anchored on `session_start_ts` and survives a resume: a session resumed a day later reports itself as a day old, because it is.
 | `provider` | string | no | OpenRouter provider hint pinned for the session. |
 | `provider_api_support` | object | no | Capability map written by llmprobe; `provider_api_support.streaming.supported` enables streaming. |
 

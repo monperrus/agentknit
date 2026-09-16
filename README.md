@@ -9,6 +9,7 @@ Features:
 * Rich event system (`tool_call`, `content_delta`, `usage`, …) for logging/TUI/dashboards
 * Automatic context compaction keeps long sessions inside the token budget
 * Model-facing [token awareness](https://www.monperrus.net/martin/token-awareness): a true countdown in the model's context, with a checkpoint reminder before compaction
+* Model-facing time awareness: every turn opens with `session elapsed · last tool · wall since your previous message`, and every tool result is stamped with its ISO-8601 start/end/duration
 * Bubblewrap-sandboxed tool execution for untrusted replay workloads
 * `rtk` integration cuts shell tool output tokens by 60–90%
 

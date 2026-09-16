@@ -24,6 +24,7 @@ import contextlib
 import inspect
 import io
 import json
+import shlex
 import urllib.request
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
@@ -267,9 +268,13 @@ def _handle_model(session: Session, client: Any, model: str, args: str) -> None:
             print(f"{RED}Cannot determine endpoint URL to query /models.{RESET}")
             return
 
-        # Don't query /models for subprocess backends.
-        if _parse_run_uri(endpoint):
-            print(f"{YEL}/models is not available for subprocess backends.{RESET}")
+        # A subprocess backend has no /models endpoint — show the command
+        # the backend runs instead, which is what identifies the "model".
+        binary_path = _parse_run_uri(endpoint)
+        if binary_path:
+            binary_path = getattr(client, "_binary_path", None) or binary_path
+            print(f"{BOLD}Subprocess backend:{RESET} {shlex.quote(binary_path)}")
+            print(f"{DIM}The request payload is piped to its stdin as JSON.{RESET}")
             return
 
         try:

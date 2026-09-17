@@ -5171,6 +5171,8 @@ def _repl_setup(
     session_dir: str | Path | None = None,
     durable_sink: DurableSink | None = None,
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
+    hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
+    hooks_enabled: bool | None = None,
 ) -> tuple[Any, ...]:
     """Common REPL setup: validate, create client, init session, return (client, session, model, hist_file)."""
     if session_id is not None and session_dir is None:
@@ -5196,6 +5198,8 @@ def _repl_setup(
         durable=durable,
         session_dir=session_dir,
         durable_sink=durable_sink,
+        hooks=hooks,
+        hooks_enabled=hooks_enabled,
     )
     model = schema["model"]
 
@@ -5430,6 +5434,8 @@ def run_repl(
     session_dir: str | Path | None = None,
     durable_sink: DurableSink | None = None,
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
+    hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
+    hooks_enabled: bool | None = None,
 ) -> None:
     """Start an interactive REPL session against the agent (sync, no background thread).
 
@@ -5463,6 +5469,8 @@ def run_repl(
         session_dir=session_dir,
         durable_sink=durable_sink,
         client=client,
+        hooks=hooks,
+        hooks_enabled=hooks_enabled,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
 
@@ -5514,6 +5522,8 @@ def run_async_repl(
     session_dir: str | Path | None = None,
     durable_sink: DurableSink | None = None,
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
+    hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
+    hooks_enabled: bool | None = None,
 ) -> None:
     """Start an interactive REPL session with a background input queue.
 
@@ -5546,6 +5556,8 @@ def run_async_repl(
         session_dir=session_dir,
         durable_sink=durable_sink,
         client=client,
+        hooks=hooks,
+        hooks_enabled=hooks_enabled,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
 

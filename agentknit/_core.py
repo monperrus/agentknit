@@ -1107,6 +1107,22 @@ def _enforce_cache_proof(session: Session, usage: object) -> None:
     if not session.get("strict_cache_proof", True):
         return
 
+    # Some backends report no input accounting at all -- Cursor's protocol, for
+    # instance, never sends a prompt token count. Cache proof is then not
+    # "failing", it is unmeasurable, and the honest response is to say so once
+    # rather than make the caller disable the check wholesale (which would also
+    # hide a genuine regression on every other provider).
+    if not session.get("reports_prompt_tokens", True):
+        if not session.get("_cache_unmeasurable_warned"):
+            session["_cache_unmeasurable_warned"] = True
+            session["_cache_status"] = "unmeasurable"
+            notice = (
+                f"{DIM}This backend reports no prompt-token accounting, so prefix "
+                f"caching cannot be verified; strict cache proof is inactive.{RESET}"
+            )
+            _emit(session, "cache_unmeasurable", fmt=notice)
+        return
+
     has_cache_proof = getattr(usage, "has_cache_proof", False)
     cached_tokens = getattr(usage, "cached_tokens", 0) or 0
     prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
@@ -2441,6 +2457,7 @@ _REQUIRED_SESSION_KEYS = frozenset({
     "messages", "tools", "structured", "tool_dispatch", "session_id",
     "cache_key", "model", "endpoint", "non_interactive", "usage_totals",
     "provider", "max_output_tokens", "strict_cache_proof", "llm_call_count",
+    "reports_prompt_tokens",
     "on_event", "streaming", "options", "session_start_ts",
     "compaction_enabled", "compaction_trigger_tokens", "compaction_target_tokens",
     "compaction_keep_last_turns", "compaction_policy", "compaction_min_chars",
@@ -2492,6 +2509,7 @@ class Session(TypedDict):
     provider: dict[str, Any] | None            # OpenRouter routing hints
     max_output_tokens: int | None
     strict_cache_proof: bool
+    reports_prompt_tokens: bool
     min_cacheable_tokens: int
     streaming: bool
     options: list[str]               # extra request options passed verbatim
@@ -2550,6 +2568,7 @@ class Session(TypedDict):
     _hook_state: NotRequired[dict[str, Any]]
     _cwd: NotRequired[Path]
     _cache_cold_warned: NotRequired[bool]
+    _cache_unmeasurable_warned: NotRequired[bool]
     # "ok" once a cache read/write has been observed, "missing" when a
     # post-first-call response exposed no cache proof.  A UI can surface
     # "missing" as a temporary status-bar warning and clear it on "ok".
@@ -2955,6 +2974,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         "provider":        schema.get("provider"),
         "max_output_tokens": max_output_tokens or schema.get("max_output_tokens"),
         "strict_cache_proof": strict_cache_proof,
+        "reports_prompt_tokens": schema.get("reports_prompt_tokens", True),
         "llm_call_count":  0,
         "_cache_status":   "ok",
         "on_event":        on_event or _default_event_handler,

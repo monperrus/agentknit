@@ -5597,7 +5597,7 @@ def run_async_repl(
 
 # ── entry point ───────────────────────────────────────────────────────────────
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Probe + agent loop for any OpenRouter model.")
     p.add_argument("model", help="Model ID, e.g. qwen/qwen3-vl-32b-instruct")
     p.add_argument("task", nargs="*", help="Task to run (omit for REPL or stdin)")
@@ -5653,13 +5653,19 @@ def parse_args() -> argparse.Namespace:
                    default=None,
                    help="Disable all lifecycle hooks for this session, whatever their "
                         "source.")
-    return p.parse_intermixed_args()
+    return p.parse_intermixed_args(argv)
 
 
-def main() -> None:
+def main(argv: "list[str] | None" = None) -> None:
+    """Run the CLI. `argv` defaults to ``sys.argv[1:]``.
+
+    Passing it explicitly lets a launcher compose a command line as data
+    instead of mutating ``sys.argv``, which is order-sensitive and leaks into
+    anything else reading it in the same process.
+    """
     if sys.stdout.isatty():
         enable_osc8_hyperlinks()
-    args   = parse_args()
+    args   = parse_args(argv)
     try:
         schema = load_specification(args.model, args.endpoint, spec_path=args.spec_path)
         if args.session:

@@ -351,6 +351,17 @@ To run a command later — e.g. re-check CI in 5 minutes — pass
 `tool_exec_id`, the command starts after the delay, the `timeout(1)` budget
 applies only once it runs, and `nohup_wait` reports it as usual.
 
+A long `nohup_wait` never freezes the conversation. In the REPL, typing a line
+while the agent is waiting cuts the wait short: the call comes back with
+`completed: false` and `interrupted_by: "user_input"`, the model ends its turn,
+and your message runs as the next turn while the command keeps running in the
+background. When that command finishes, the model is pinged — the completion is
+delivered as a `[background]` notice, either prepended to your next message or,
+if you are idle at the prompt, as a turn of its own. Programmatic embedders get
+the same two halves via `async_toolkit.wait_interrupt_hook` (a predicate that
+cuts waits short) and `async_toolkit.drain_completions()` /
+`completion_notice()` (what to feed the model afterwards).
+
 Two consecutive `nohup_query` calls for the same still-running
 `tool_exec_id` get a response pointing at
 `nohup_wait(tool_exec_id, howmuch, unit)`, which returns as soon as the

@@ -121,6 +121,7 @@ if TYPE_CHECKING:
 from . import openai_compat as openai
 from .openai_compat import SubprocessOpenAI
 
+from . import async_toolkit as _async_module
 from . import tool_library as _tool_module
 from .tool_library import TOOL_LIBRARY, _ASK_USER_FNS
 from .tool import Tool, build_tool_spec, register_tools_in_library
@@ -312,6 +313,9 @@ MAG = "\033[35m"
 RL_BOLD  = "\x01\033[1m\x02"
 RL_RESET = "\x01\033[0m\x02"
 PASTE_IDLE_TIMEOUT_S = 0.25
+# How often the idle prompt looks for a background event (a finished nohup
+# execution) while waiting for the first keystroke.
+REPL_WAKE_POLL_S = 0.25
 
 # ── OSC 8 terminal hyperlinks ─────────────────────────────────────────────────
 
@@ -1499,12 +1503,33 @@ def attribution_block(model: str) -> str:
     )
 
 
-def read_repl_input(prompt: str) -> str:
-    """Read one REPL task, coalescing multiline clipboard paste into one turn."""
+class BackgroundWake(Exception):
+    """Raised by :func:`read_repl_input` when its *wake* predicate fires.
+
+    The REPL catches it and runs a turn on the background event instead of on
+    user input — this is how a finished ``nohup`` execution pings the model
+    while the user sits idle at the prompt.
+    """
+
+
+def read_repl_input(prompt: str, *, wake: "Callable[[], bool] | None" = None) -> str:
+    """Read one REPL task, coalescing multiline clipboard paste into one turn.
+
+    With *wake*, the wait for the first keystroke is polled: as soon as the
+    predicate returns True the prompt is erased and :class:`BackgroundWake` is
+    raised.  A half-typed line is never stolen — the poll only runs while
+    stdin has nothing to read.
+    """
     # Do not use input() here. With readline enabled, input() can read ahead
     # into readline's private buffer. select() cannot see those buffered paste
     # lines, so a multiline paste was split into separate REPL turns.
     print(prompt.replace("\x01", "").replace("\x02", ""), end="", flush=True)
+    if wake is not None:
+        while not select.select([sys.stdin], [], [], REPL_WAKE_POLL_S)[0]:
+            if wake():
+                sys.stdout.write("\r\033[K")   # erase the prompt we just drew
+                sys.stdout.flush()
+                raise BackgroundWake
     first_line = sys.stdin.readline()
     if first_line == "":
         raise EOFError
@@ -3979,6 +4004,14 @@ class _InputCollector:
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
 
+    def has_pending(self) -> bool:
+        """True when a line typed during the turn is waiting to be run.
+
+        Long-blocking tools (``nohup_wait``) poll this to cut their wait short
+        so the user's message is not stuck behind them.
+        """
+        return not self._q.empty()
+
     def drain(self) -> list[str]:
         items: list[str] = []
         while True:
@@ -5214,6 +5247,49 @@ def _repl_teardown(session: Session, hist_file: Path, resume_cmd: str) -> None:
     print(f"\n{DIM}Resume: {resume_cmd}{RESET}")
 
 
+def _stdin_has_input() -> bool:
+    """True when an unread keystroke sits on an interactive stdin.
+
+    Used as the ``nohup_wait`` interrupt predicate in the sync REPL, which has
+    no background reader thread.  Non-tty stdin is excluded: a pipe at EOF is
+    always "readable", which would cut every wait short.
+    """
+    if not sys.stdin.isatty():
+        return False
+    try:
+        return bool(select.select([sys.stdin], [], [], 0)[0])
+    except Exception:
+        return False
+
+
+def _background_completions_pending() -> bool:
+    """True when a background execution finished and nobody has reported it."""
+    return not _async_module.async_completion_queue.empty()
+
+
+def _background_notice() -> str | None:
+    """Drain finished background executions into a model-facing notice."""
+    completions = _async_module.drain_completions()
+    if not completions:
+        return None
+    return _async_module.completion_notice(completions)
+
+
+def _repl_ping_turn(
+    client: openai.OpenAI | SubprocessOpenAI,
+    session: Session,
+    model: str,
+    *,
+    use_async_input: bool,
+) -> None:
+    """Wake the model with the pending background-completion notice, if any."""
+    notice = _background_notice()
+    if notice is None:
+        return
+    print(f"{DIM}{notice}{RESET}")
+    _repl_loop_body(notice, client, session, model, use_async_input=use_async_input)
+
+
 def _repl_loop_body(
     t: str,
     client: openai.OpenAI | SubprocessOpenAI,
@@ -5246,6 +5322,12 @@ def _repl_loop_body(
             _save_messages_snapshot(session)
         return
 
+    # A background execution that finished while the user was typing is
+    # reported to the model together with what the user just said.
+    notice = _background_notice()
+    if notice is not None:
+        t = f"{notice}\n\n{t}"
+
     if use_async_input:
         _async_repl_turn(t, client, session, current_model)
     else:
@@ -5259,6 +5341,9 @@ def _sync_repl_turn(
     model: str,
 ) -> None:
     """Run a single turn synchronously — no background reader thread."""
+    # Typing a line cuts a blocking nohup_wait short so the turn ends and the
+    # line is read by the next prompt instead of queueing behind the wait.
+    _async_module.wait_interrupt_hook = _stdin_has_input
     try:
         run_turn(client, model, session, t)
     except KeyboardInterrupt:
@@ -5266,6 +5351,8 @@ def _sync_repl_turn(
     except Exception as exc:
         _emit_and_log_error(session, exc, str(exc), f"\n{RED}Error: {exc}{RESET}",
                             client=client)
+    finally:
+        _async_module.wait_interrupt_hook = None
     _save_messages_snapshot(session)
 
 
@@ -5278,6 +5365,9 @@ def _async_repl_turn(
     """Run a turn with a background ``_InputCollector`` queuing keystrokes."""
     _collector = _InputCollector()
     _tool_module._input_collector = _collector
+    # A queued keystroke cuts a blocking nohup_wait short: the turn ends, the
+    # queued line runs next, and the execution keeps going in the background.
+    _async_module.wait_interrupt_hook = _collector.has_pending
     _pending: list[str | None] = [t]
     try:
         while _pending:
@@ -5316,6 +5406,7 @@ def _async_repl_turn(
                     _save_messages_snapshot(session)
     finally:
         _tool_module._input_collector = None
+        _async_module.wait_interrupt_hook = None
 
 
 def run_repl(
@@ -5380,7 +5471,13 @@ def run_repl(
     try:
         while True:
             try:
-                t = read_repl_input(f"{RL_BOLD}>{RL_RESET} ")
+                t = read_repl_input(f"{RL_BOLD}>{RL_RESET} ",
+                                    wake=_background_completions_pending)
+            except BackgroundWake:
+                # A nohup execution finished while the user was idle: ping the
+                # model with it instead of waiting for the next keystroke.
+                _repl_ping_turn(client, session, model, use_async_input=False)
+                continue
             except EOFError:
                 print()
                 break
@@ -5457,7 +5554,13 @@ def run_async_repl(
     try:
         while True:
             try:
-                t = read_repl_input(f"{RL_BOLD}>{RL_RESET} ")
+                t = read_repl_input(f"{RL_BOLD}>{RL_RESET} ",
+                                    wake=_background_completions_pending)
+            except BackgroundWake:
+                # A nohup execution finished while the user was idle: ping the
+                # model with it instead of waiting for the next keystroke.
+                _repl_ping_turn(client, session, model, use_async_input=True)
+                continue
             except EOFError:
                 print()
                 break

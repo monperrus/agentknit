@@ -26,8 +26,10 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
 if TYPE_CHECKING:
     from typing import BinaryIO, TypedDict
 else:
@@ -88,9 +90,9 @@ _async_exec_lock = threading.Lock()
 
 # Completed processes push here.  t_nohup_wait drains this queue while it
 # sleeps, so completions — of the awaited execution and of any others
-# finishing meanwhile — are reported inline in its result.  Nothing else
-# consumes it: the REPL does not wake the model when an execution finishes,
-# the model has to call nohup_query / nohup_wait itself.
+# finishing meanwhile — are reported inline in its result.  The REPL drains
+# what is left over (see drain_completions / completion_notice): an execution
+# that finishes while nobody waits on it pings the model at the next turn.
 # Each entry: {"tool_exec_id", "returncode", "stdout_file", "stderr_file", "duration"}
 class _AsyncCompletion(TypedDict):
     tool_exec_id: str
@@ -102,6 +104,49 @@ class _AsyncCompletion(TypedDict):
 
 
 async_completion_queue: "_queue.Queue[_AsyncCompletion]" = _queue.Queue()
+
+# Set by the REPL to a predicate that answers "is the user waiting to be
+# heard?" (a line typed while the agent is busy).  t_nohup_wait polls it and
+# returns early when it becomes true, so a long wait never holds the
+# conversation hostage: the turn ends, the typed message runs, and the
+# execution keeps running in the background — its completion reaches the model
+# later through async_completion_queue.  None means "never interrupt".
+wait_interrupt_hook: "Callable[[], bool] | None" = None
+
+
+def drain_completions() -> list[_AsyncCompletion]:
+    """Pop every completion queued so far (non-blocking).
+
+    Completions consumed by a concurrent ``nohup_wait`` are reported by that
+    call instead; whoever drains one owns reporting it.
+    """
+    out: list[_AsyncCompletion] = []
+    while True:
+        try:
+            out.append(async_completion_queue.get_nowait())
+        except _queue.Empty:
+            return out
+
+
+def completion_notice(completions: "list[_AsyncCompletion]") -> str:
+    """One-paragraph, model-facing report of finished background executions."""
+    lines = [
+        "[background] {n} nohup execution{s} finished while you were not waiting "
+        "on {it}:".format(n=len(completions), s="" if len(completions) == 1 else "s",
+                          it="it" if len(completions) == 1 else "them")
+    ]
+    for c in completions:
+        entry = _async_executions.get(c["tool_exec_id"])
+        command = entry["command"] if entry is not None else "?"
+        lines.append(
+            f"- {c['tool_exec_id']}: returncode={c['returncode']} "
+            f"duration={c['duration']:.1f}s command={command!r} "
+            f"stdout={c['stdout_file']} stderr={c['stderr_file']}"
+        )
+    lines.append("Read the output files if you need the details, then continue "
+                 "what this session was doing.")
+    return "\n".join(lines)
+
 
 # tool_exec_id returned by the last t_query_exec call. A second query for the
 # same still-running execution is answered with a nohup_wait redirect, so the
@@ -622,6 +667,13 @@ def t_nohup_wait(tool_exec_id: str, howmuch: int | None = None, unit: str = "s")
     (``completed: false``) and reports the CPU and I/O activity of the still
     running process, so the model can tell progress from a hang.
 
+    The wait is also cut short — ``completed: false`` with
+    ``interrupted_by: "user_input"`` — when :data:`wait_interrupt_hook` reports
+    that the user typed something.  The REPL sets that hook, so a long wait
+    never blocks the conversation: the model ends its turn, the user's message
+    runs, and the execution's completion is delivered later (see
+    :func:`drain_completions`).
+
     Supported units: ``s`` seconds, ``m`` minutes, ``h`` hours, ``d`` days.
     """
     # Validate the (optional) wait budget before touching the exec id.
@@ -646,13 +698,21 @@ def t_nohup_wait(tool_exec_id: str, howmuch: int | None = None, unit: str = "s")
         r = json.dumps({"error": f"unknown tool_exec_id: {tool_exec_id}"})
         return r, {"result": r}
 
-    deadline = None if seconds is None else time.monotonic() + seconds
+    wait_started = time.monotonic()
+    deadline = None if seconds is None else wait_started + seconds
     others: list[_AsyncCompletion] = []
     done = False
+    interrupted = False
     while True:
         proc = entry["proc"]
         if proc is not None and proc.poll() is not None:
             done = True
+            break
+        hook = wait_interrupt_hook
+        if hook is not None and hook():
+            # The user typed while we slept: give the conversation back to
+            # them rather than sitting on the turn for the whole budget.
+            interrupted = True
             break
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
@@ -683,13 +743,22 @@ def t_nohup_wait(tool_exec_id: str, howmuch: int | None = None, unit: str = "s")
         if entry["proc"] is None:
             result["scheduled"] = True
             result["starts_in_seconds"] = max(round(entry["scheduled_for"] - time.monotonic(), 3), 0.0)
-        result["waited_seconds"] = round(seconds if seconds is not None
-                                         else time.monotonic() - entry["start"], 3)
+        result["waited_seconds"] = round(time.monotonic() - wait_started, 3)
         result["activity"] = _activity_report(entry)
-        result["hint"] = (
-            "not completed yet; call nohup_wait again for this tool_exec_id "
-            "with a fresh howmuch budget."
-        )
+        if interrupted:
+            result["interrupted_by"] = "user_input"
+            result["hint"] = (
+                "the user typed something while you were waiting, so the wait "
+                "was cut short — the execution is still running. Stop waiting, "
+                "end your turn now and answer the user. You will be told "
+                "automatically when this execution completes; you can also call "
+                "nohup_wait again later."
+            )
+        else:
+            result["hint"] = (
+                "not completed yet; call nohup_wait again for this tool_exec_id "
+                "with a fresh howmuch budget."
+            )
     if others:
         result["also_completed"] = [
             {
@@ -786,7 +855,10 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                     "completed: false together with the CPU and I/O activity of the "
                     "still-running process, so you can tell progress from a hang; "
                     "then call nohup_wait again for the same tool_exec_id. Without "
-                    "howmuch, waits indefinitely until it completes."
+                    "howmuch, waits indefinitely until it completes. The wait is "
+                    "cut short if the user types something meanwhile "
+                    "(interrupted_by: user_input): end your turn and answer them, "
+                    "the completion will be reported to you automatically."
                 ),
                 "parameters": {
                     "type": "object",

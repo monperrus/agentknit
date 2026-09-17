@@ -58,6 +58,18 @@ _READ_TIMEOUT_INITIAL_DELAY_SECONDS = 60
 _MAX_SERVER_ERROR_RETRIES = 5
 _SERVER_ERROR_INITIAL_DELAY_SECONDS = 5
 _RETRYABLE_STATUS_CODES = frozenset({500, 502, 503, 504, 529})
+# Kimi's Coding Plan endpoint answers an exhausted quota window with HTTP 403
+# (not 429) and no Retry-After header; the reset time lives on a side
+# endpoint, ``GET <base>/usages``, so a 403 there is resolved by asking it.
+_KIMI_HOSTS = ("api.kimi.com", "api.moonshot.cn", "api.moonshot.ai")
+# A quota 403 is waited through at most this many times per request: the
+# reset time is authoritative, so a 403 still standing after it means
+# something other than the window is refusing the call.
+_MAX_QUOTA_RETRIES = 2
+# Body wording that marks a 403 as "out of quota" rather than "not allowed".
+_QUOTA_DENIAL_RE = re.compile(
+    r"quota|rate.?limit|exceed|usage limit|too many requests|out of credit"
+    r"|insufficient", re.IGNORECASE)
 
 
 # ── rate limiter (token-bucket) ───────────────────────────────────────────────
@@ -132,6 +144,85 @@ def _z_ai_error_details(text: str) -> tuple[str | None, str | None]:
     message = error.get("message")
     return (str(code) if code is not None else None,
             str(message) if message is not None else None)
+
+
+def _kimi_quota_reset_delay(base_url: str, headers: collections.abc.Mapping[str, str]
+                            ) -> float | None:
+    """Return seconds until the exhausted Kimi quota window resets, or None.
+
+    ``GET <base>/usages`` reports one entry per rate-limit window plus the
+    subscription bucket, each with ``remaining`` and an ISO ``resetTime``.
+    Only a window that is actually exhausted justifies waiting; the soonest
+    such reset is returned. None when the endpoint is unreachable, no window
+    is exhausted (the 403 then means something else), or the reset is
+    implausibly far away.
+    """
+    url = base_url.rstrip("/").split("?", 1)[0] + "/usages"
+    try:
+        resp = requests.get(url, headers={k: v for k, v in headers.items()
+                                          if k.lower() != "content-type"},
+                            timeout=30)
+        if not resp.ok:
+            return None
+        data = resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+    buckets = [entry.get("detail") or {} for entry in (data.get("limits") or [])]
+    if isinstance(data.get("usage"), dict):
+        buckets.append(data["usage"])
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    delays = []
+    for bucket in buckets:
+        try:
+            remaining = int(str(bucket.get("remaining")))
+        except (TypeError, ValueError):
+            continue
+        if remaining > 0:
+            continue
+        reset = _parse_iso_utc(bucket.get("resetTime"))
+        if reset is None:
+            continue
+        delays.append(max(0.0, (reset - now).total_seconds()))
+    if not delays:
+        return None
+    delay = min(delays)
+    return None if delay > _MAX_AUTO_RETRY_SECONDS else delay
+
+
+def _parse_iso_utc(value: object) -> "_dt.datetime | None":
+    """Parse an ISO-8601 timestamp (``Z`` suffix included) as aware UTC."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return parsed.astimezone(_dt.timezone.utc)
+
+
+def _http_error(resp: requests.Response) -> requests.exceptions.HTTPError:
+    """An HTTPError carrying the provider's body, not just the status line.
+
+    ``resp.raise_for_status()`` produces "403 Client Error: Forbidden for
+    url: …", which says nothing about *why*. Front-ends (the TUI) show only
+    the exception, so the body — where every provider puts the reason —
+    belongs in the message.
+    """
+    body = ""
+    try:
+        body = (resp.text or "").strip()
+    except Exception:  # noqa: BLE001 — a consumed stream must not mask the error
+        pass
+    reason = getattr(resp, "reason", None) or "Error"
+    url = getattr(resp, "url", None) or ""
+    message = f"{resp.status_code} {reason} for url: {url}"
+    if body:
+        message += f" — {body[:2000]}"
+    return requests.exceptions.HTTPError(message, response=resp)
 
 
 def _retry_delay_seconds(headers: collections.abc.Mapping[str, str]) -> float | None:
@@ -282,6 +373,7 @@ class _Completions:
                     on_request_attempt: "Callable[[Any], None] | None" = None) -> requests.Response:
         read_timeout_retries = 0
         server_error_retries = 0
+        quota_retries = 0
         while True:
             self._client._rate_limiter.acquire()
             try:
@@ -304,7 +396,7 @@ class _Completions:
             if resp.status_code in _RETRYABLE_STATUS_CODES:
                 if server_error_retries >= _MAX_SERVER_ERROR_RETRIES:
                     print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
-                    resp.raise_for_status()
+                    raise _http_error(resp)
                 server_error_retries += 1
                 delay = (_retry_delay_seconds(resp.headers)
                          or _SERVER_ERROR_INITIAL_DELAY_SECONDS * (2 ** (server_error_retries - 1)))
@@ -341,15 +433,48 @@ class _Completions:
                         error_code=error_code,
                         error_message=error_message,
                     )
-                resume_at = _dt.datetime.now().astimezone() + _dt.timedelta(seconds=delay)
-                fmt = (f"  [rate-limited] waiting {delay:.1f}s "
-                       f"(resuming at {resume_at.strftime('%H:%M:%S %Z')}) …")
-                if on_rate_limit_wait is not None:
-                    on_rate_limit_wait(delay, resume_at, fmt)
-                print(fmt, flush=True)
-                time.sleep(delay)
+                self._sleep_until_reset(delay, on_rate_limit_wait)
                 continue
+            if resp.status_code == 403:
+                # A 403 is normally "not allowed", but Kimi's Coding Plan
+                # endpoint uses it for an exhausted quota window too — the
+                # same condition other providers report as 429. Ask the
+                # provider when the window resets; wait only if it says one
+                # is actually exhausted, and never blindly.
+                host = (self._client.base_url.host or "").lower()
+                delay = _retry_delay_seconds(resp.headers)
+                if delay is None and any(h in host for h in _KIMI_HOSTS):
+                    delay = _kimi_quota_reset_delay(self._client._base_url, headers)
+                if delay is not None and quota_retries < _MAX_QUOTA_RETRIES:
+                    quota_retries += 1
+                    self._sleep_until_reset(delay, on_rate_limit_wait,
+                                            label="quota exhausted (HTTP 403)")
+                    continue
+                body = (resp.text or "").strip()
+                if delay is not None or _QUOTA_DENIAL_RE.search(body):
+                    raise RateLimitError(
+                        "Quota exhausted (HTTP 403) and the window did not "
+                        "reopen in time — stopping instead of retrying "
+                        f"blindly. Provider said: {body[:2000] or '(no body)'}",
+                        status_code=403,
+                        headers=dict(resp.headers),
+                        error_message=body[:2000] or None,
+                    )
+                raise _http_error(resp)
             return resp
+
+    @staticmethod
+    def _sleep_until_reset(delay: float,
+                           on_rate_limit_wait: "Callable[..., None] | None",
+                           label: str = "rate-limited") -> None:
+        """Announce a provider-dictated wait, then sleep through it."""
+        resume_at = _dt.datetime.now().astimezone() + _dt.timedelta(seconds=delay)
+        fmt = (f"  [{label}] waiting {delay:.1f}s "
+               f"(resuming at {resume_at.strftime('%H:%M:%S %Z')}) …")
+        if on_rate_limit_wait is not None:
+            on_rate_limit_wait(delay, resume_at, fmt)
+        print(fmt, flush=True)
+        time.sleep(delay)
 
     def create(self, *, model: str, messages: list[dict[str, Any]], temperature: float = 0,
                tools: list[dict[str, Any]] | None = None, tool_choice: str | None = None,
@@ -385,7 +510,7 @@ class _Completions:
                                 on_request_attempt=on_request_attempt)
         if not resp.ok:
             print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
-        resp.raise_for_status()
+            raise _http_error(resp)
         data = resp.json()
         if on_raw_response is not None:
             on_raw_response({"kind": "payload", "payload": data})
@@ -411,7 +536,7 @@ class _Completions:
                                 on_request_attempt=on_request_attempt)
         if not resp.ok:
             print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
-            resp.raise_for_status()
+            raise _http_error(resp)
 
         with resp:
             for raw_line in resp.iter_lines():

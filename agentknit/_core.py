@@ -1061,6 +1061,22 @@ def fmt_usage(usage: object, *, compaction_trigger: int | None = None,
     return "  |  ".join(parts)
 
 
+def fmt_session_totals(totals: "dict[str, int]", *,
+                       prompt_tokens_known: bool = True) -> str:
+    """Running token totals for a whole session.
+
+    Mirrors :func:`fmt_usage`: a backend that reports no input accounting
+    renders ``prompt ?`` rather than a confident ``prompt 0``, so the summary
+    cannot contradict the per-call lines above it.
+    """
+    prompt_part = (f"prompt {totals['prompt']:,}" if prompt_tokens_known
+                   else "prompt ?")
+    cached = totals.get("cached", 0)
+    if cached and prompt_tokens_known:
+        prompt_part += f"  |  cached {cached:,}"
+    return f"{prompt_part}  |  completion {totals['completion']:,}"
+
+
 def _last_message_age_seconds(session: Session) -> float | None:
     """Seconds since the last message in the session, or None if unmeasurable.
 
@@ -4480,10 +4496,10 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             _emit(session, "final_answer", text=text.strip(),
                   fmt="" if already_streamed else f"\n{GREEN}{BOLD}» {RESET}{text.strip()}\n")
             t = session["usage_totals"]
-            cached_part = f"  |  cached {t['cached']:,}" if t["cached"] else ""
             _emit(session, "session_usage", **t,
-                  fmt=(f"{DIM}{MAG}[session tokens] prompt {t['prompt']:,}{cached_part}  |  "
-                       f"completion {t['completion']:,}{RESET}\n"))
+                  fmt=(f"{DIM}{MAG}[session tokens] "
+                       f"{fmt_session_totals(t, prompt_tokens_known=session.get('reports_prompt_tokens', True))}"
+                       f"{RESET}\n"))
             # ── Stop hooks ─────────────────────────────────────────────
             # decision:block / exit 2 refuses to stop: the reason becomes a
             # new user message and the loop continues.  stop_hook_active

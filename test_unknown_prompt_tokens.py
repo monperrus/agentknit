@@ -6,7 +6,7 @@ genuinely empty prompt, and hides that compaction can never trigger.
 
 from __future__ import annotations
 
-from agentknit._core import fmt_usage
+from agentknit._core import fmt_session_totals, fmt_usage
 
 
 class _Usage:
@@ -53,3 +53,18 @@ def test_real_accounting_is_unchanged():
     line = fmt_usage(_RealUsage(), compaction_trigger=10_000)
     assert "prompt 1,000 (400 cached, 40%)" in line
     assert "compact 10%" in line
+
+
+def test_session_totals_hide_an_unknown_prompt():
+    """The end-of-turn summary must not contradict the per-call lines."""
+    totals = {"prompt": 0, "completion": 14, "total": 14, "cached": 0, "cache_write": 0}
+    assert "prompt ?" in fmt_session_totals(totals, prompt_tokens_known=False)
+    assert "prompt 0" in fmt_session_totals(totals)
+
+
+def test_session_totals_keep_real_accounting():
+    totals = {"prompt": 900, "completion": 14, "total": 914, "cached": 300, "cache_write": 0}
+    line = fmt_session_totals(totals)
+    assert "prompt 900" in line
+    assert "cached 300" in line
+    assert "completion 14" in line

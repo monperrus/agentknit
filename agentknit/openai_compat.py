@@ -11,13 +11,16 @@ Implements only the surface used by agent_probe.py:
   -> response.usage.total_tokens
 
 SubprocessOpenAI(binary_path)  — same interface but pipes JSON to a binary's
-  stdin and reads the OpenAI-format JSON response from its stdout.
+  stdin and reads the OpenAI-format JSON response from its stdout.  The path
+  may be an argument vector, and the child's environment and timeout are
+  configurable, so a spec can parameterise its backend.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import re
 import subprocess
 import time
@@ -697,6 +700,10 @@ class _Chat:
         self.completions = _Completions(client)
 
 
+DEFAULT_SUBPROCESS_TIMEOUT = 300.0
+"""Seconds a `run://` backend may take for one completion."""
+
+
 class _BaseURL:
     """Exposes .host so agent_probe can check for openrouter.ai."""
 
@@ -764,12 +771,16 @@ class _SubprocessCompletions:
 
         if on_request_attempt is not None:
             on_request_attempt({"payload": payload})
+        child_env = None
+        if self._client._env:
+            child_env = {**os.environ, **self._client._env}
         proc = subprocess.run(
-            [self._client._binary_path],
+            self._client._command,
             input=json.dumps(payload),
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=self._client._timeout or DEFAULT_SUBPROCESS_TIMEOUT,
+            env=child_env,
         )
         if proc.stderr:
             print(f"  [subprocess stderr] {proc.stderr}", flush=True)
@@ -791,9 +802,30 @@ class _SubprocessChat:
 
 
 class SubprocessOpenAI:
-    """Client that routes completions to a local binary via stdin/stdout."""
+    """Client that routes completions to a local binary via stdin/stdout.
 
-    def __init__(self, binary_path: str) -> None:
-        self._binary_path = binary_path
+    ``binary_path`` may be a bare path or a full argument vector. A vector lets
+    a spec parameterise its backend -- ``["my-shim", "--model", "grok-4.6"]`` --
+    instead of the launcher having to smuggle the value through a process-wide
+    environment variable, which would also make two models in one process
+    impossible.
+
+    ``env`` adds variables for the child only, leaving ``os.environ`` alone.
+    """
+
+    def __init__(
+        self,
+        binary_path: "str | list[str]",
+        *,
+        env: "dict[str, str] | None" = None,
+        timeout: "float | None" = None,
+    ) -> None:
+        self._command: list[str] = (
+            [binary_path] if isinstance(binary_path, str) else list(binary_path)
+        )
+        # Kept for backward compatibility: callers and tests read _binary_path.
+        self._binary_path = self._command[0]
+        self._env = dict(env) if env else None
+        self._timeout = timeout
         self.base_url = _BaseURL("")   # empty host → no openrouter-specific headers
         self.chat = _SubprocessChat(self)

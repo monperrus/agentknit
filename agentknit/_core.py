@@ -4861,7 +4861,14 @@ def create_client(schema: "dict[str, Any]") -> "openai.OpenAI | SubprocessOpenAI
     if max_rpm is not None:
         kwargs["max_rpm"] = max_rpm
     if binary_path is not None:
-        return SubprocessOpenAI(binary_path)
+        # `command` parameterises the backend: ["shim", "--model", "grok-4.6"].
+        # Without it the bare path is used, exactly as before.
+        command = schema.get("command") or binary_path
+        return SubprocessOpenAI(
+            command,
+            env=schema.get("command_env"),
+            timeout=schema.get("command_timeout"),
+        )
     if auth == "opencode-github-copilot":
         return openai.OpenAI(api_key=_get_opencode_token(), base_url=endpoint,
                              auth_header="X-API-Key", **kwargs)

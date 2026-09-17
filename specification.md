@@ -15,6 +15,9 @@ An agent spec is a JSON file that describes how agentknit should connect to a mo
 | `status` | string | no | Informational label (e.g. `"default"`, `"experimental"`).  Not used by the runtime. |
 | `comment` | string | no | Human-readable note.  Shown as the error message when `disabled` is `true`. |
 | `disabled` | boolean | no | If `true`, the agent refuses to start and raises `AgentSpecDisabledError`. |
+| `command` | array of strings | no | Argument vector for a `run://` backend, e.g. `["my-shim", "--model", "grok-4.6"]`.  Lets a spec parameterise its subprocess instead of the launcher exporting a process-wide environment variable.  Defaults to the bare path from the `run://` URI. |
+| `command_env` | object | no | Extra environment variables for a `run://` child process only; `os.environ` is left untouched. |
+| `command_timeout` | number | no | Seconds one `run://` completion may take (default 300). |
 
 ### Tool schema
 

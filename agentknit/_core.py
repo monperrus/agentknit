@@ -1031,22 +1031,29 @@ def fmt_call(name: str, args: dict[str, Any]) -> str:
         pretty = pretty[:400] + "…"
     return f"{CYAN}{BOLD}▶ {name}({pretty}){RESET}"
 
-def fmt_usage(usage: object, *, compaction_trigger: int | None = None) -> str:
-    """One-line, human-readable token/cache breakdown for a single completion."""
+def fmt_usage(usage: object, *, compaction_trigger: int | None = None,
+              prompt_tokens_known: bool = True) -> str:
+    """One-line, human-readable token/cache breakdown for a single completion.
+
+    With ``prompt_tokens_known=False`` the input side is rendered ``prompt ?``
+    rather than ``prompt 0``: a backend that reports no input accounting is not
+    the same as one that genuinely sent no prompt, and a confident zero also
+    makes the compaction percentage read 0% forever.
+    """
     prompt      = getattr(usage, "prompt_tokens", 0) or 0
     completion  = getattr(usage, "completion_tokens", 0) or 0
     total       = getattr(usage, "total_tokens", 0) or 0
     cached      = getattr(usage, "cached_tokens", 0) or 0
     cache_write = getattr(usage, "cache_creation_tokens", 0) or 0
 
-    prompt_part = f"prompt {prompt:,}"
-    if cached:
+    prompt_part = "prompt ?" if not prompt_tokens_known else f"prompt {prompt:,}"
+    if cached and prompt_tokens_known:
         pct = (cached / prompt * 100) if prompt else 0
         prompt_part += f" ({cached:,} cached, {pct:.0f}%)"
     parts = [prompt_part]
     if cache_write:
         parts.append(f"cache-write {cache_write:,}")
-    if compaction_trigger:
+    if compaction_trigger and prompt_tokens_known:
         compact_pct = (prompt / compaction_trigger * 100) if compaction_trigger else 0
         parts.append(f"compact {compact_pct:.0f}%")
     parts.append(f"completion {completion:,}")
@@ -4328,7 +4335,8 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                       total=getattr(usage, "total_tokens", 0) or 0,
                       cached=getattr(usage, "cached_tokens", 0) or 0,
                       cache_write=getattr(usage, "cache_creation_tokens", 0) or 0,
-                      fmt=f"{DIM}{MAG}[tokens] {fmt_usage(usage, compaction_trigger=trigger)}{RESET}")
+                      fmt=f"{DIM}{MAG}[tokens] "
+                          f"{fmt_usage(usage, compaction_trigger=trigger, prompt_tokens_known=session.get('reports_prompt_tokens', True))}{RESET}")
                 _log(session, {"type": "usage",
                                "prompt_tokens":      getattr(usage, "prompt_tokens", 0) or 0,
                                "completion_tokens":  getattr(usage, "completion_tokens", 0) or 0,

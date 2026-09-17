@@ -31,6 +31,7 @@ it), so it can also be used standalone.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -55,6 +56,8 @@ __all__ = [
     "canonical_tool_name",
     "cap_model_text",
     "combine_decisions",
+    "dedupe_entries",
+    "discover_hook_dir",
     "load_hooks",
     "matcher_matches",
     "normalize",
@@ -276,6 +279,102 @@ def matcher_matches(matcher: str | None, value: str) -> bool:
         return False
 
 
+# ── directory discovery: the file's presence is the registration ──────────────
+
+#: Normalized event name -> canonical spelling, so ``pre-tool-use/`` and
+#: ``PreToolUse/`` name the same event.
+_EVENT_BY_NORMALIZED = {re.sub(r"[^a-z0-9]", "", e.lower()): e for e in _KNOWN_EVENTS}
+
+#: Never treated as hook scripts, whatever the directory says.
+_HOOK_DIR_IGNORED = frozenset({"__pycache__", "readme", "readme.md", "notes"})
+
+
+def _event_from_name(name: str) -> "str | None":
+    """Resolve a directory or file name to a hook event, or ``None``.
+
+    An exact (normalized) match wins; otherwise the **longest** event name the
+    normalized name ends with — so ``notify-stop.py`` is a ``Stop`` hook and
+    ``notify-subagent-stop.py`` is a ``SubagentStop`` hook, not a ``Stop`` one.
+    """
+    normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+    if normalized in _EVENT_BY_NORMALIZED:
+        return _EVENT_BY_NORMALIZED[normalized]
+    candidates = [key for key in _EVENT_BY_NORMALIZED if normalized.endswith(key)]
+    if not candidates:
+        return None
+    return _EVENT_BY_NORMALIZED[max(candidates, key=len)]
+
+
+def _add_script_entry(path: Path, event: str, matcher: str,
+                      entries: "list[HookEntry]", warnings: "list[str]") -> None:
+    if not os.access(path, os.X_OK):
+        warnings.append(f"{path}: hook script is not executable, skipped "
+                        f"(chmod +x to enable it)")
+        return
+    entries.append(HookEntry(
+        event=event, matcher=matcher,
+        # exec form: the path is spawned directly, never through a shell.
+        handler=HookHandler(type="command", command=str(path), args=[]),
+        source=str(path)))
+
+
+def discover_hook_dir(directory: "str | Path") -> "tuple[list[HookEntry], list[str]]":
+    """Discover hook scripts laid out in a directory — no JSON involved.
+
+    Dropping an executable file in the directory *is* the registration::
+
+        <dir>/notify-stop.py             # event inferred from the name -> Stop
+        <dir>/Stop/notify.py             # explicit event directory
+        <dir>/PreToolUse/Bash/guard.sh   # ... with a matcher
+
+    Scripts run in exec form (no shell) under the usual hook contract. A file
+    whose event cannot be inferred, or that is not executable, is reported as a
+    warning and skipped — never registered, so it can never fail with 127.
+    Hidden files, ``*.disabled`` and ``__pycache__`` are ignored silently.
+    A missing directory is not an error: there is simply nothing to discover.
+    """
+    root = Path(directory).expanduser()
+    entries: "list[HookEntry]" = []
+    warnings: "list[str]" = []
+    if not root.is_dir():
+        return entries, warnings
+
+    def walk(path: Path, event: "str | None", matcher: str) -> None:
+        for child in sorted(path.iterdir()):
+            if (child.name.startswith(".") or child.name.endswith(".disabled")
+                    or child.name.lower() in _HOOK_DIR_IGNORED):
+                continue
+            if child.is_dir():
+                if event is None:
+                    child_event = _event_from_name(child.name)
+                    if child_event is None:
+                        warnings.append(
+                            f"{child}: not a hook event name, skipped "
+                            f"(expected <event>/ such as PreToolUse/)")
+                        continue
+                    walk(child, child_event, matcher)
+                elif matcher:
+                    warnings.append(f"{child}: nested too deep, skipped "
+                                    f"(expected <event>/<matcher>/<script>)")
+                else:
+                    # One level under an event directory names the matcher.
+                    walk(child, event, child.name)
+                continue
+            if event is not None:
+                _add_script_entry(child, event, matcher, entries, warnings)
+                continue
+            file_event = _event_from_name(child.stem)
+            if file_event is None:
+                warnings.append(
+                    f"{child}: cannot infer a hook event from the name, skipped "
+                    f"(name it <event>.<ext> or put it in <event>/)")
+                continue
+            _add_script_entry(child, file_event, "", entries, warnings)
+
+    walk(root, None, "")
+    return entries, warnings
+
+
 # ── config parsing ────────────────────────────────────────────────────────────
 
 def parse_hooks_config(source: Any) -> tuple[list[HookEntry], list[str]]:
@@ -283,7 +382,8 @@ def parse_hooks_config(source: Any) -> tuple[list[HookEntry], list[str]]:
 
     *source* may be:
 
-    * a path (``str`` / ``Path``) to a ``hooks.json``-shaped JSON file
+    * a path (``str`` / ``Path``) to a ``hooks.json``-shaped JSON file, or to a
+      directory laid out for :func:`discover_hook_dir`
     * a dict with a ``"hooks"`` key (the same JSON shape, inline)
     * a list of any of the above (merged additively)
 
@@ -299,6 +399,12 @@ def parse_hooks_config(source: Any) -> tuple[list[HookEntry], list[str]]:
 def _parse_source(source: Any, entries: list[HookEntry], warnings: list[str]) -> None:
     if isinstance(source, (str, Path)):
         path = Path(source).expanduser()
+        if path.is_dir():
+            # A directory is a hooks *layout*: presence of a script registers it.
+            found, found_warnings = discover_hook_dir(path)
+            entries.extend(found)
+            warnings.extend(found_warnings)
+            return
         try:
             data = json.loads(path.read_text())
         except FileNotFoundError:
@@ -424,6 +530,42 @@ def register_hook(session: dict[str, Any], event: str, fn: PythonHookFn | None =
     session.setdefault("hooks", []).append(entry)
     session.setdefault("_hook_state", new_hook_state())
     return entry
+
+
+def _command_identity(command: "str | None") -> "str | None":
+    """A comparable identity for a command hook, or ``None`` when it is not a
+    plain path (a shell one-liner is never deduplicated)."""
+    if not command or any(c in command for c in ";|&<>$`*?(){}[]\n"):
+        return None
+    try:
+        return str(Path(command).expanduser().resolve())
+    except OSError:
+        return None
+
+
+def dedupe_entries(entries: "list[HookEntry]") -> "list[HookEntry]":
+    """Drop later entries that would run the same script twice.
+
+    Two command hooks on the same event and matcher whose commands resolve to
+    the same file are the same hook, however they were registered — typically a
+    ``hooks.json`` entry and the script the ``hooks/`` directory discovered.
+    The first occurrence (the earlier, more specific layer) wins; Python hooks
+    and shell one-liners are always kept.
+    """
+    seen: set[tuple[str, str, str]] = set()
+    kept: list[HookEntry] = []
+    for entry in entries:
+        identity = (_command_identity(entry.handler.command)
+                    if entry.handler.type == "command" else None)
+        if identity is None:
+            kept.append(entry)
+            continue
+        key = (entry.event, entry.matcher, identity)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(entry)
+    return kept
 
 
 def load_hooks(session: dict[str, Any], source: Any) -> tuple[list[HookEntry], list[str]]:

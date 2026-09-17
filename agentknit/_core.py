@@ -2643,10 +2643,13 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     consumes that record.  Exceptions stop the operation that produced it.
 
     ``hooks`` — Claude Code / Codex-compatible lifecycle hooks.  Accepts a
-    path to a ``hooks.json``-shaped file, an inline config dict, or a list
-    of either; layers merge additively with the user-level
-    (``~/.agentknit/hooks.json``) and project-level
-    (``<git-root>/.agentknit/hooks.json``) files discovered automatically.
+    path to a ``hooks.json``-shaped file, a path to a hooks directory where
+    each executable script *is* a hook (see
+    :func:`agentknit.hooks.discover_hook_dir`), an inline config dict, or a
+    list of any of those; layers merge additively with the user-level
+    (``~/.agentknit/hooks.json`` and ``~/.agentknit/hooks/``) and
+    project-level (the same two under ``<git-root>/.agentknit/``) layers,
+    which are discovered automatically.
     Python hooks can be added programmatically via
     :func:`agentknit.hooks.register_hook` (strictly equivalent to a command
     hook — both go through the same normalization).
@@ -2869,6 +2872,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     )
     session_start_ts = datetime.datetime.now().isoformat(timespec="seconds")
     # ── hooks: discover config layers, merge additively ───────────────────
+    from .hooks import dedupe_entries as _dedupe_hook_entries
     from .hooks import parse_hooks_config as _parse_hooks_config
     behaviour_hooks = behaviour.get("hooks")
     hook_sources: list[Any] = []
@@ -2878,8 +2882,12 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         hook_sources.append(hooks)
     if behaviour_hooks:
         hook_sources.append(behaviour_hooks)
+    # Each layer is a hooks.json plus a hooks/ directory, where dropping an
+    # executable script *is* the registration — no JSON needed.
     hook_sources.append(_git_root() / ".agentknit" / "hooks.json")
+    hook_sources.append(_git_root() / ".agentknit" / "hooks")
     hook_sources.append(Path.home() / ".agentknit" / "hooks.json")
+    hook_sources.append(Path.home() / ".agentknit" / "hooks")
     session_hooks: list[HookEntry] = []
     for source in hook_sources:
         entries, warnings = _parse_hooks_config(source)
@@ -2889,6 +2897,8 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             # is a real config problem worth surfacing at startup.
             if "not found" not in w:
                 print(f"{YEL}⚠ hooks: {w}{RESET}", file=sys.stderr)
+    # A hooks.json entry and a discovered script can name the same file; run it once.
+    session_hooks = _dedupe_hook_entries(session_hooks)
     session = cast(Session, {
         "messages":        [{"role": "system", "content": sys_msg,
                              "ts": session_start_ts}],
@@ -5513,9 +5523,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hooks", metavar="PATH", action="append", dest="hooks",
                    default=None,
                    help="Load Claude Code / Codex-compatible lifecycle hooks from this "
-                        "hooks.json-shaped file (repeatable). Layers merge additively "
-                        "with the spec's behaviour.hooks, <git-root>/.agentknit/hooks.json "
-                        "and ~/.agentknit/hooks.json.")
+                        "hooks.json-shaped file, or from a hooks directory where each "
+                        "executable script is a hook (repeatable). Layers merge "
+                        "additively with the spec's behaviour.hooks and the project "
+                        "and user .agentknit/hooks.json + hooks/ layers.")
     p.add_argument("--no-hooks", action="store_false", dest="hooks_enabled",
                    default=None,
                    help="Disable all lifecycle hooks for this session, whatever their "

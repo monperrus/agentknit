@@ -518,6 +518,40 @@ JSON-on-stdin input, same exit-code + JSON-on-stdout output contract. A
              "timeout": 30}]}]}}
 ```
 
+### Hooks directory — presence is the registration
+
+No JSON is required at all. A `hooks/` directory next to `hooks.json` in either
+layer (`~/.agentknit/hooks/`, `<git-root>/.agentknit/hooks/`) is scanned, and an
+executable script found there *is* a registered hook — there is nothing else to
+keep in sync:
+
+```
+~/.agentknit/hooks/notify-stop.py           # event inferred from the name → Stop
+~/.agentknit/hooks/Stop/notify.py           # explicit event directory
+~/.agentknit/hooks/PreToolUse/Bash/guard.sh # … with a matcher
+```
+
+The event comes from an exact (case- and separator-insensitive) name match, else
+the longest event name the file name ends with — `notify-subagent-stop.py` is a
+`SubagentStop` hook, not a `Stop` one. Scripts run in exec form (no shell), so a
+path with spaces is fine. Hidden files, `*.disabled` and `__pycache__` are
+ignored; a file whose event cannot be inferred, or that is not executable, is
+reported as a startup warning and **not** registered, so it can never fail at
+dispatch time with exit 127. Directory and `hooks.json` layers merge additively,
+and a script named by both is registered once: two command hooks on the same
+event and matcher whose commands resolve to the same file are one hook (shell
+one-liners and Python hooks are never deduplicated).
+
+Any path passed as a hooks source — `--hooks PATH`, the `hooks=` kwarg — is
+scanned this way when it is a directory, or parsed as JSON when it is a file.
+The scan is available on its own too:
+
+```python
+from agentknit import discover_hook_dir
+
+entries, warnings = discover_hook_dir("~/.agentknit/hooks")
+```
+
 Events fired: `SessionStart`, `SessionEnd`, `UserPromptSubmit`,
 `PreToolUse`, `PostToolUse`, `Stop`, `PreCompact`, `PostCompact`,
 `Interrupt`. Claude-only events (`PermissionRequest`, `SubagentStart`,

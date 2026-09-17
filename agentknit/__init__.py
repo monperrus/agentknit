@@ -84,6 +84,8 @@ from .hooks import (
     HookEntry,
     HookHandler,
     RawHookResult,
+    dedupe_entries,
+    discover_hook_dir,
     load_hooks,
     register_hook,
 )
@@ -174,7 +176,7 @@ __all__ = [
     "new_call_id", "replay_journal",
     # hooks (Claude Code / Codex-compatible)
     "HookBlock", "HookDecision", "HookEntry", "HookHandler",
-    "RawHookResult", "load_hooks", "register_hook",
+    "RawHookResult", "load_hooks", "register_hook", "discover_hook_dir", "dedupe_entries",
     "Tool",
     "build_tool_spec",
     "default_tool_spec",

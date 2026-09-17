@@ -10,7 +10,7 @@ An agent spec is a JSON file that describes how agentknit should connect to a mo
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `model` | string | yes | Model identifier sent to the API (e.g. `"qwen/qwen3-8b"`).  For subprocess endpoints this is the path to the binary. |
+| `model` | string | yes | Model identifier sent to the API (e.g. `"qwen/qwen3-8b"`).  For a subprocess backend this may be the path to the binary, but prefer putting the `run://` URI in `endpoint` and keeping a real model name here — see below. |
 | `endpoint` | string | no | Base URL of the OpenAI-compatible API (default: OpenRouter).  Use a `run://` URI (e.g. `"run:///path/to/binary"`) to invoke a local subprocess instead of an HTTP endpoint. |
 | `status` | string | no | Informational label (e.g. `"default"`, `"experimental"`).  Not used by the runtime. |
 | `comment` | string | no | Human-readable note.  Shown as the error message when `disabled` is `true`. |
@@ -18,6 +18,30 @@ An agent spec is a JSON file that describes how agentknit should connect to a mo
 | `command` | array of strings | no | Argument vector for a `run://` backend, e.g. `["my-shim", "--model", "grok-4.6"]`.  Lets a spec parameterise its subprocess instead of the launcher exporting a process-wide environment variable.  Defaults to the bare path from the `run://` URI. |
 | `command_env` | object | no | Extra environment variables for a `run://` child process only; `os.environ` is left untouched. |
 | `command_timeout` | number | no | Seconds one `run://` completion may take (default 300). |
+
+A `run://` backend accepts the URI in **either** `model` or `endpoint`, and the
+choice decides the session's identity:
+
+```jsonc
+// path becomes the identity: status line and logs read
+// "_home_user_bin_my-shim.py", and the real model appears nowhere
+{"model": "run:///home/user/bin/my-shim.py"}
+
+// preferred: the model names itself, the endpoint carries the transport
+{"model": "composer-2.5", "endpoint": "run:///home/user/bin/my-shim.py"}
+```
+
+The second form keeps `Model: composer-2.5` in the header and files logs and
+session snapshots under `composer-2.5/`. Combine it with `command` to pass the
+model on to the subprocess:
+
+```jsonc
+{
+  "model": "composer-2.5",
+  "endpoint": "run:///home/user/bin/my-shim.py",
+  "command": ["/home/user/bin/my-shim.py", "--model", "composer-2.5"]
+}
+```
 
 ### Tool schema
 

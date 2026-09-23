@@ -407,6 +407,25 @@ signal.signal(signal.SIGINT, _sigint_handler)
 EventCallback: TypeAlias = Callable[[str, "dict[str, Any]"], None]
 
 
+@dataclasses.dataclass
+class StepReduction:
+    """What a :data:`StepReducer` keeps of a step, optionally ending the turn.
+
+    ``messages`` replace the step in the history.  A non-``None``
+    ``final_reply`` ends the turn with that text as the final answer, exactly
+    as if the model had replied it (Stop hooks and turn-end compaction run).
+    """
+    messages: "list[dict[str, Any]]"
+    final_reply: "str | None" = None
+
+
+# step_reducer(session, step, *, client, model) — called after each tool step
+# (the assistant tool-call message plus its results) is appended.  Return the
+# messages to keep in its place (a list or a StepReduction), or None to keep
+# the step unchanged.
+StepReducer: TypeAlias = Callable[..., "list[dict[str, Any]] | StepReduction | None"]
+
+
 def _default_event_handler(event_type: str, data: dict[str, Any]) -> None:
     """Print the pre-formatted ANSI string from *data["fmt"]* to stdout/stderr.
 
@@ -2551,6 +2570,8 @@ class Session(TypedDict):
     # the restore path backfills defaults (empty list, enabled).
     hooks: NotRequired[list[HookEntry]]
     hooks_enabled: NotRequired[bool]
+    # per-step context policy (see init_session); runtime-only, not snapshotted
+    step_reducer: NotRequired["StepReducer | None"]
     # token awareness (model-facing countdown)
     # NotRequired: sessions snapshotted before token awareness existed lack
     # these keys; the restore path backfills defaults (enabled, counting
@@ -2631,6 +2652,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                  durable_sink: DurableSink | None = None,
                  hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
                  hooks_enabled: bool | None = None,
+                 step_reducer: "StepReducer | None" = None,
                  ) -> "Session":
     """Build a stateful session dict (:class:`Session`).
 
@@ -2723,6 +2745,16 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
 
     ``hooks_enabled`` — master switch (default ``True``).  ``False``
     disables all hooks for the session.
+
+    ``step_reducer`` — called as ``step_reducer(session, step, client=,
+    model=)`` after every tool step, where *step* is the assistant tool-call
+    message followed by its results.  It returns the messages that replace
+    the step in the history (a list, or a :class:`StepReduction` that can
+    also end the turn with a final reply), or ``None`` to keep the step as
+    is.  The replacement must leave the history API-valid for the next
+    request (e.g. end on a ``user`` or ``tool`` message).  Use it for
+    per-step context policies, such as replacing raw tool output by a
+    bounded digest obtained with :func:`side_query`.  Default ``None``.
     """
     # A resumed session must run (and re-save its snapshot) on the endpoint
     # it was created on — bind here so every caller is covered, including
@@ -2854,6 +2886,8 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         if hooks is not None:
             _load_hooks(cast("dict[str, Any]", restored), hooks)
         restored.setdefault("hooks_enabled", True)
+        if step_reducer is not None:
+            restored["step_reducer"] = step_reducer
         # Reopen (or start) the session journal on restore.
         restored["_journal"] = (
             SessionJournal(_journal_path(restored.get("model") or "unknown",
@@ -3067,6 +3101,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             hooks_enabled if hooks_enabled is not None
             else schema.get("hooks_enabled", True)
         ),
+        "step_reducer": step_reducer,
         "_hook_state": {"turn_id": None, "stop_hook_active": False,
                         "pending_context": [], "async_results": []},
         "_cwd": Path.cwd(),
@@ -3983,6 +4018,20 @@ def _handle_tool_call(
     return result
 
 
+def execute_tool_call(session: Session, name: str, args: dict[str, Any], *,
+                      call_id: str | None = None) -> str:
+    """Run one tool call through the session's full tool runtime.
+
+    Unlike :func:`dispatch`, which only calls the tool function, this is the
+    path :func:`run_turn` uses: PreToolUse/PostToolUse hooks, the durable
+    journal, ``tool_call``/``tool_result`` events, the session's
+    ``tool_executor`` (sandbox) and time awareness.  Returns the model-facing
+    result text (``"ERROR: ..."`` on failure).  For hosts that run their own
+    agent loop on an agentknit :class:`Session`.
+    """
+    return _handle_tool_call(name, args, session, call_id=call_id)
+
+
 class CancelToken:
     """Cooperative cancellation handle for :func:`run_turn`.
 
@@ -4159,7 +4208,8 @@ SIDE_QUERY_PENDING_TOOL = "[still running: this tool call has not returned yet]"
 
 
 def _side_query_messages(messages: list[dict[str, Any]], question: str,
-                         structured: bool) -> list[dict[str, Any]]:
+                         structured: bool,
+                         preamble: str | None = SIDE_QUERY_PREAMBLE) -> list[dict[str, Any]]:
     """API-valid copy of *messages* mid-turn, ending with *question*.
 
     Tool calls of the trailing assistant message that have no result yet are
@@ -4177,7 +4227,7 @@ def _side_query_messages(messages: list[dict[str, Any]], question: str,
             msgs.append({"role": "tool", "tool_call_id": cid,
                          "content": SIDE_QUERY_PENDING_TOOL})
     msgs = _repair_tool_call_pairing(msgs)
-    content = f"{SIDE_QUERY_PREAMBLE}\n\n{question}"
+    content = f"{preamble}\n\n{question}" if preamble else question
     if msgs and msgs[-1].get("role") == "user" and not structured:
         # Keep the user/assistant alternation (inline tool results are user
         # messages in non-structured mode).
@@ -4188,7 +4238,9 @@ def _side_query_messages(messages: list[dict[str, Any]], question: str,
 
 
 def side_query(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Session,
-               question: str) -> str:
+               question: str, *, max_tokens: int | None = None,
+               preamble: str | None = SIDE_QUERY_PREAMBLE,
+               count_usage: bool = False) -> str:
     """Answer *question* from the session's context without touching the session.
 
     Safe to call from another thread while :func:`run_turn` is running (e.g.
@@ -4196,23 +4248,61 @@ def side_query(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Se
     calls are answered with :data:`SIDE_QUERY_PENDING_TOOL`, and one LLM call
     runs with tools declared but ``tool_choice="none"`` — same prefix as the
     turn's requests, so the prompt cache still hits.  Nothing is appended to
-    the messages, the journal or the usage totals; the exchange is only
-    recorded in the session log.  Returns the answer text; API errors raise.
+    the messages or the journal; the exchange is only recorded in the session
+    log.  Returns the answer text; API errors raise.
+
+    ``max_tokens`` caps this answer (default: the session's
+    ``max_output_tokens``).  ``preamble`` is prepended to *question*; pass
+    ``None`` to send the question alone (e.g. from a ``step_reducer``, where
+    the "side question" framing does not apply).  ``count_usage=True`` adds
+    the call to ``session["usage_totals"]`` and emits a ``usage`` event with
+    ``purpose="side_query"``; by default the call is not accounted.
     """
     structured = session["structured"]
-    msgs = _side_query_messages(list(session["messages"]), question, structured)
+    msgs = _side_query_messages(list(session["messages"]), question, structured,
+                                preamble)
     kwargs: dict[str, Any] = dict(model=model, messages=msgs, temperature=0,
                                   user=session["cache_key"])
     if structured:
         kwargs["tools"] = session["tools"]
         kwargs["tool_choice"] = "none"
-    if session.get("max_output_tokens"):
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    elif session.get("max_output_tokens"):
         kwargs["max_tokens"] = session["max_output_tokens"]
+    extra: dict[str, Any] = {}
     if "exclude-prompt_cache_key" not in session.get("options", []):
-        kwargs["extra_body"] = {"prompt_cache_key": session["cache_key"]}
+        extra["prompt_cache_key"] = session["cache_key"]
+    if "openrouter.ai" in (getattr(getattr(client, "base_url", None), "host", None) or ""):
+        # Same routing as _complete: an unpinned provider would miss the cache.
+        extra["usage"] = {"include": True}
+        if session.get("provider"):
+            extra["provider"] = session["provider"]
+    if extra:
+        kwargs["extra_body"] = extra
     resp = client.chat.completions.create(**kwargs)
     answer = (getattr(resp.choices[0].message, "content", None) or "").strip()
-    _log(session, {"type": "side_query", "question": question, "answer": answer})
+    usage = getattr(resp, "usage", None)
+    record: dict[str, Any] = {"type": "side_query", "question": question, "answer": answer}
+    if usage is not None:
+        record["usage"] = {k: getattr(usage, k, 0) or 0 for k in
+                           ("prompt_tokens", "completion_tokens", "total_tokens",
+                            "cached_tokens", "cache_creation_tokens")}
+    _log(session, record)
+    if count_usage and usage is not None:
+        u = record["usage"]
+        totals = session["usage_totals"]
+        totals["prompt"] += u["prompt_tokens"]
+        totals["completion"] += u["completion_tokens"]
+        totals["total"] += u["total_tokens"]
+        totals["cached"] += u["cached_tokens"]
+        totals["cache_write"] += u["cache_creation_tokens"]
+        _emit(session, "usage", purpose="side_query",
+              prompt=u["prompt_tokens"], completion=u["completion_tokens"],
+              total=u["total_tokens"], cached=u["cached_tokens"],
+              cache_write=u["cache_creation_tokens"],
+              fmt=f"{DIM}{MAG}[tokens · side query] "
+                  f"{fmt_usage(usage, prompt_tokens_known=session.get('reports_prompt_tokens', True))}{RESET}")
     return answer
 
 
@@ -4331,6 +4421,43 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
         if queued:
             text = f"{text}\n\n" + "\n".join(queued)
         return text
+
+    def _reduce_step(step_start: int) -> str | None:
+        """Run the session's step reducer on ``messages[step_start:]``.
+
+        The step (assistant tool-call message + its results) is replaced in
+        place by what the reducer returns.  Returns the final reply when the
+        reducer ends the turn, else ``None``.
+        """
+        reducer = session.get("step_reducer")
+        if reducer is None:
+            return None
+        live = messages  # the list _append_message writes to
+        step = [dict(m) for m in live[step_start:]]
+        out = reducer(session, step, client=client, model=model)
+        if out is None:
+            return None
+        if isinstance(out, StepReduction):
+            kept, final = list(out.messages), out.final_reply
+        else:
+            kept, final = list(out), None
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        kept = [m if "ts" in m else {**m, "ts": ts} for m in kept]
+        live[step_start:] = kept
+        if journal is not None:
+            _write_journal_record(session, {"type": "reset_messages",
+                                            "reason": "step_reducer",
+                                            "messages": list(live)})
+        raw_chars = sum(len(json.dumps(m, default=str)) for m in step)
+        kept_chars = sum(len(json.dumps(m, default=str)) for m in kept)
+        _log(session, {"type": "step_reduced", "raw_messages": len(step),
+                       "kept_messages": len(kept), "raw_chars": raw_chars,
+                       "kept_chars": kept_chars, "final": final is not None, "ts": ts})
+        _emit(session, "step_reduced", raw_messages=len(step), kept_messages=len(kept),
+              raw_chars=raw_chars, kept_chars=kept_chars, final_reply=final,
+              fmt=f"{DIM}{MAG}[step reduced] {len(step)} msgs/{raw_chars:,} chars → "
+                  f"{len(kept)} msgs/{kept_chars:,} chars{RESET}")
+        return final
 
     def _check_cancelled() -> None:
         if cancel is None or not cancel.cancelled:
@@ -4480,8 +4607,12 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                         continue
                 return _session_result(session)
 
+            # Set when a step reducer ends the turn with a final reply.
+            forced_final: str | None = None
+
             # ── structured tool_calls ────────────────────────────────────────────
             if structured and msg.tool_calls:
+                step_start = len(messages)
                 now_ts = datetime.datetime.now().isoformat(timespec="seconds")
                 _append_message({
                     "role": "assistant",
@@ -4534,12 +4665,15 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                     _append_message({"role": "tool", "tool_call_id": tc.id,
                                      "content": _with_pending_ta(result),
                                      "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-                continue
+                forced_final = _reduce_step(step_start)
+                if forced_final is None:
+                    continue
 
-            text = msg.content or ""
+            text = (msg.content or "") if forced_final is None else forced_final
 
             # ── inline JSON tool calls ───────────────────────────────────────────
-            if not structured:
+            if not structured and forced_final is None:
+                step_start = len(messages)
                 now_ts = datetime.datetime.now().isoformat(timespec="seconds")
                 _append_message({"role": "assistant", "content": text, "ts": now_ts})
                 calls = extract_inline_calls(text)
@@ -4551,11 +4685,15 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                     _append_message({"role": "user",
                                      "content": "Tool results:\n" + "\n\n".join(results),
                                      "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-                    continue
+                    forced_final = _reduce_step(step_start)
+                    if forced_final is None:
+                        continue
+                    text = forced_final
 
             # ── final answer ─────────────────────────────────────────────────────
-            # In structured mode the assistant message wasn't appended above.
-            if structured:
+            # In structured mode the assistant message wasn't appended above;
+            # a reducer-forced reply was never appended in either mode.
+            if structured or forced_final is not None:
                 _append_message({"role": "assistant", "content": text,
                                  "ts": datetime.datetime.now().isoformat(timespec="seconds")})
             _log(session, {"type": "assistant", "content": text,
@@ -5016,6 +5154,7 @@ def run_task(
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
     hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
     hooks_enabled: bool | None = None,
+    step_reducer: "StepReducer | None" = None,
 ) -> SessionResult:
     """Run a single task against the agent and return a :class:`SessionResult`.
 
@@ -5070,6 +5209,7 @@ def run_task(
         durable_sink=durable_sink,
         hooks=hooks,
         hooks_enabled=hooks_enabled,
+        step_reducer=step_reducer,
     )
     try:
         return run_turn(client, schema["model"], session, task)
@@ -5111,6 +5251,7 @@ def run_agent(
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
     hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
     hooks_enabled: bool | None = None,
+    step_reducer: "StepReducer | None" = None,
 ) -> SessionResult:
     """Run a one-shot agent from direct tool definitions.
 
@@ -5152,6 +5293,7 @@ def run_agent(
         client=client,
         hooks=hooks,
         hooks_enabled=hooks_enabled,
+        step_reducer=step_reducer,
     )
 
 
@@ -5182,6 +5324,7 @@ def run(
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
     hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
     hooks_enabled: bool | None = None,
+    step_reducer: "StepReducer | None" = None,
 ) -> SessionResult:
     """Backward-compatible helper for :func:`run_task`.
 
@@ -5220,6 +5363,7 @@ def run(
         client=client,
         hooks=hooks,
         hooks_enabled=hooks_enabled,
+        step_reducer=step_reducer,
     )
 
 
@@ -5296,6 +5440,7 @@ def _repl_setup(
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
     hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
     hooks_enabled: bool | None = None,
+    step_reducer: "StepReducer | None" = None,
 ) -> tuple[Any, ...]:
     """Common REPL setup: validate, create client, init session, return (client, session, model, hist_file)."""
     if session_id is not None and session_dir is None:
@@ -5323,6 +5468,7 @@ def _repl_setup(
         durable_sink=durable_sink,
         hooks=hooks,
         hooks_enabled=hooks_enabled,
+        step_reducer=step_reducer,
     )
     model = schema["model"]
 
@@ -5559,6 +5705,7 @@ def run_repl(
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
     hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
     hooks_enabled: bool | None = None,
+    step_reducer: "StepReducer | None" = None,
 ) -> None:
     """Start an interactive REPL session against the agent (sync, no background thread).
 
@@ -5594,6 +5741,7 @@ def run_repl(
         client=client,
         hooks=hooks,
         hooks_enabled=hooks_enabled,
+        step_reducer=step_reducer,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
 
@@ -5647,6 +5795,7 @@ def run_async_repl(
     client: "openai.OpenAI | SubprocessOpenAI | None" = None,
     hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
     hooks_enabled: bool | None = None,
+    step_reducer: "StepReducer | None" = None,
 ) -> None:
     """Start an interactive REPL session with a background input queue.
 
@@ -5681,6 +5830,7 @@ def run_async_repl(
         client=client,
         hooks=hooks,
         hooks_enabled=hooks_enabled,
+        step_reducer=step_reducer,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
 

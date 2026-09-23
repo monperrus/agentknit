@@ -488,6 +488,7 @@ generic `on_event` handler.
 | `session_resumed` | Session history was loaded from disk | `session_id`, `messages_loaded`, `fmt` |
 | `provider_pinned` | OpenRouter provider was locked for the session | `provider`, `fmt` |
 | `compaction` | Context was compacted into a summary | `summary`, `compacted_turns`, `fmt` |
+| `step_reduced` | A `step_reducer` replaced a tool step in the history | `raw_messages`, `kept_messages`, `raw_chars`, `kept_chars`, `final_reply`, `fmt` |
 | `cache_cold` | Resumed turn missed the (expired) prefix cache | `age`, `fmt` |
 | `journal_recovered` | A resumed session was rebuilt from the durable journal | `entries_replayed`, `messages_loaded`, `pending`, `mid_turn`, `fmt` |
 | `rate_limit_wait` | Before sleeping through a retryable HTTP 429 | `delay`, `resume_at`, `fmt` |
@@ -661,6 +662,51 @@ Or in the agent spec JSON:
 The summary message is tagged with `"compacted_summary": true` so consumers
 can distinguish compacted state from raw conversation turns. Compaction events
 are emitted as `"compaction"` events and logged to the session trace.
+
+### Per-step context policy (`step_reducer`)
+
+Compaction acts on the whole history once it is large. A `step_reducer` acts
+on every tool step as soon as it completes: it receives the step (the
+assistant's tool-call message followed by its results) and returns what stays
+in the history in its place. Returning `None` keeps the step unchanged.
+
+Paired with `side_query`, the model can summarize its own step into a bounded
+digest. The digest request starts with the same prefix as the step's own
+request, so the prompt cache serves it, and the context then grows by at most
+`B` tokens per step:
+
+```python
+from agentknit import StepReduction, run_task, side_query
+
+B = 200
+
+def digest_step(session, step, *, client, model):
+    digest = side_query(client, model, session,
+                        f"Summarize this step in at most {B} tokens; "
+                        "end with 'DONE: <answer>' if the task is finished.",
+                        max_tokens=B, preamble=None, count_usage=True)
+    kept = [{"role": "assistant", "content": f"[step digest] {digest}"},
+            {"role": "user", "content": "Step recorded. Do the next action."}]
+    final = digest.split("DONE:", 1)[1].strip() if "DONE:" in digest else None
+    return StepReduction(kept, final_reply=final)   # final_reply ends the turn
+
+result = run_task(schema, "Fix the failing test", step_reducer=digest_step)
+```
+
+The replacement must leave the history valid for the next request (end on a
+`user` or `tool` message). Reductions are journaled as `reset_messages`
+records, so durable recovery replays the reduced history. Each reduction
+emits a `step_reduced` event.
+
+`side_query` options used here: `max_tokens` caps that single answer,
+`preamble=None` drops the "side question" framing, and `count_usage=True`
+adds the call to `usage_totals` and emits a `usage` event with
+`purpose="side_query"`.
+
+A host running its own loop on a `Session` can call
+`execute_tool_call(session, name, args)`. Unlike `dispatch()`, it runs the
+full tool runtime: hooks, journal, events, `tool_executor` sandbox and time
+awareness.
 
 ## Durable Recovery
 

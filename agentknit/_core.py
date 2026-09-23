@@ -4146,6 +4146,76 @@ def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Sess
         _sigint_handler.session = None  # type: ignore[attr-defined]
 
 
+SIDE_QUERY_PREAMBLE = (
+    "[Side question from the user while your turn is still running. Answer "
+    "it briefly from the conversation so far; you cannot call tools here. "
+    "Your running work continues untouched afterwards, and this exchange "
+    "is not kept in your context.]"
+)
+
+# Result stand-in for a tool call still executing when a side query snapshots
+# the transcript (providers reject an unanswered tool call).
+SIDE_QUERY_PENDING_TOOL = "[still running: this tool call has not returned yet]"
+
+
+def _side_query_messages(messages: list[dict[str, Any]], question: str,
+                         structured: bool) -> list[dict[str, Any]]:
+    """API-valid copy of *messages* mid-turn, ending with *question*.
+
+    Tool calls of the trailing assistant message that have no result yet are
+    in flight: they get :data:`SIDE_QUERY_PENDING_TOOL`, not the "result lost"
+    placeholder of :func:`_repair_tool_call_pairing` (which handles any other
+    unanswered id).
+    """
+    msgs = [dict(m) for m in messages]
+    answered = {str(m.get("tool_call_id")) for m in msgs if m.get("role") == "tool"}
+    last_assistant = next((m for m in reversed(msgs) if m.get("role") == "assistant"),
+                          None)
+    for tc in (last_assistant or {}).get("tool_calls") or []:
+        cid = str(tc.get("id") or "")
+        if cid and cid not in answered:
+            msgs.append({"role": "tool", "tool_call_id": cid,
+                         "content": SIDE_QUERY_PENDING_TOOL})
+    msgs = _repair_tool_call_pairing(msgs)
+    content = f"{SIDE_QUERY_PREAMBLE}\n\n{question}"
+    if msgs and msgs[-1].get("role") == "user" and not structured:
+        # Keep the user/assistant alternation (inline tool results are user
+        # messages in non-structured mode).
+        msgs[-1] = {**msgs[-1], "content": f"{msgs[-1]['content']}\n\n{content}"}
+    else:
+        msgs.append({"role": "user", "content": content})
+    return msgs
+
+
+def side_query(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Session,
+               question: str) -> str:
+    """Answer *question* from the session's context without touching the session.
+
+    Safe to call from another thread while :func:`run_turn` is running (e.g.
+    blocked in a long tool call): the transcript is snapshotted, in-flight tool
+    calls are answered with :data:`SIDE_QUERY_PENDING_TOOL`, and one LLM call
+    runs with tools declared but ``tool_choice="none"`` — same prefix as the
+    turn's requests, so the prompt cache still hits.  Nothing is appended to
+    the messages, the journal or the usage totals; the exchange is only
+    recorded in the session log.  Returns the answer text; API errors raise.
+    """
+    structured = session["structured"]
+    msgs = _side_query_messages(list(session["messages"]), question, structured)
+    kwargs: dict[str, Any] = dict(model=model, messages=msgs, temperature=0,
+                                  user=session["cache_key"])
+    if structured:
+        kwargs["tools"] = session["tools"]
+        kwargs["tool_choice"] = "none"
+    if session.get("max_output_tokens"):
+        kwargs["max_tokens"] = session["max_output_tokens"]
+    if "exclude-prompt_cache_key" not in session.get("options", []):
+        kwargs["extra_body"] = {"prompt_cache_key": session["cache_key"]}
+    resp = client.chat.completions.create(**kwargs)
+    answer = (getattr(resp.choices[0].message, "content", None) or "").strip()
+    _log(session, {"type": "side_query", "question": question, "answer": answer})
+    return answer
+
+
 def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Session, task: str | None,
               cancel: CancelToken | None = None,
               timeout_expired: threading.Event | None = None) -> SessionResult:

@@ -4456,6 +4456,8 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                     )
                     _emit(session, "cache_proof_missing", fmt=notice)
             _apply_compaction_policy(client, model, session, usage, phase="mid_turn")
+            # Compaction installs a new list: keep appending (and sending) to it.
+            messages = session["messages"]
 
             if total_tokens > max_tokens:
                 totals = session["usage_totals"]

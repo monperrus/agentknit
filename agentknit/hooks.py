@@ -981,10 +981,13 @@ def run_hooks(entries: "list[HookEntry]", event: str, payload: dict[str, Any], *
         if entry.handler.async_:
             continue
         if notify is not None:
+            # Like Claude Code, a hook is only announced on the console when it
+            # declares a statusMessage; the event itself always fires.
+            status = entry.handler.status_message
             notify("hook_status", {
-                "text": entry.handler.status_message or entry.label(),
+                "text": status or entry.label(),
                 "source": entry.source,
-                "fmt": f"[hook] {entry.handler.status_message or entry.label()}",
+                "fmt": f"[hook] {status}" if status else None,
             })
 
     sync_entries = [e for e in matching if not e.handler.async_]

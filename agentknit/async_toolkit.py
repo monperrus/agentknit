@@ -623,20 +623,32 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict[str, object]]:
 
 # ── nohup / nohup_query / nohup_wait ───────────────────────────────────────────────────────
 
-def t_nohup(command: str, timeout: int = NOHUP_TIMEOUT_MIN,
+def t_nohup(command: str, timeout: float = NOHUP_TIMEOUT_MIN, timeout_unit: str = "m",
             wait_before_s: float = 0) -> tuple[str, dict[str, object]]:
     """Bound the command with timeout(1) then hand off to t_execute_async.
 
-    A ``wait_before_s`` delay elapses *before* the command starts and is not
+    *timeout* is expressed in *timeout_unit* (``s``/``m``/``h``/``d``, same
+    units as :func:`t_nohup_wait`); the default bound is
+    ``NOHUP_TIMEOUT_MIN`` minutes for backward compatibility.  A
+    ``wait_before_s`` delay elapses *before* the command starts and is not
     counted against the bound, which begins when the command runs.
     """
+    factor = WAIT_FOR_UNIT_SECONDS.get(timeout_unit)
+    if factor is None:
+        expected = "/".join(sorted(WAIT_FOR_UNIT_SECONDS))
+        r = json.dumps({"error": f"unknown timeout_unit {timeout_unit!r}, expected one of {expected}"})
+        return r, {"result": r}
+    seconds = float(timeout) * factor
+    if seconds <= 0:
+        r = json.dumps({"error": "timeout must be a positive number"})
+        return r, {"result": r}
     if wait_before_s < 0:
         r = json.dumps({"error": "wait_before_s must be >= 0"})
         return r, {"result": r}
     if wait_before_s > WAIT_BEFORE_MAX_SECONDS:
         r = json.dumps({"error": f"wait_before_s exceeds the {WAIT_BEFORE_MAX_SECONDS}s cap"})
         return r, {"result": r}
-    return t_execute_async(f"timeout {int(timeout) * 60} {command}",
+    return t_execute_async(f"timeout {seconds:g} {command}",
                            wait_before_s=wait_before_s)
 
 
@@ -787,7 +799,8 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                     "tool_exec_id, the process id (pid), and local file paths for "
                     "stdin (FIFO), stdout, and stderr. Write to stdin_localfile "
                     "to send input to the running process. Execution is bounded: "
-                    f"the command is killed after `timeout` minutes (default {timeout_min}). "
+                    "the command is killed after `timeout` × `timeout_unit` "
+                    f"(default {timeout_min}m). "
                     f"If the command finishes within {int(ASYNC_FAST_THRESHOLD_S * 1000)} ms "
                     f"and both outputs are under {ASYNC_INLINE_MAX_BYTES} bytes, "
                     "stdout/stderr are inlined immediately. To run a command in N "
@@ -800,11 +813,21 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run."},
                         "timeout": {
-                            "type": "integer",
+                            "type": "number",
                             "description": (
-                                "Maximum minutes the command may run before being "
-                                f"killed (default {timeout_min}). Counts from the "
-                                "moment the command starts, not from wait_before_s."
+                                "Maximum time the command may run before being "
+                                "killed, expressed in timeout_unit (default "
+                                f"{timeout_min}). Counts from the moment the "
+                                "command starts, not from wait_before_s."
+                            ),
+                        },
+                        "timeout_unit": {
+                            "type": "string",
+                            "enum": sorted(WAIT_FOR_UNIT_SECONDS),
+                            "description": (
+                                "Time unit for timeout: s=seconds, m=minutes, "
+                                "h=hours, d=days. Mandatory whenever timeout is "
+                                "passed, so the bound is never ambiguous."
                             ),
                         },
                         "wait_before_s": {

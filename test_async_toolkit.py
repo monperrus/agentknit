@@ -52,7 +52,7 @@ def test_t_nohup_runs_and_reports_output() -> None:
 
 
 def test_t_nohup_bounds_with_timeout(monkeypatch) -> None:
-    """t_nohup prefixes the command with timeout(1), minutes → seconds."""
+    """t_nohup prefixes the command with timeout(1), timeout × unit → seconds."""
     seen: list[str] = []
 
     def _fake_execute(command: str, wait_before_s: float = 0):
@@ -61,13 +61,25 @@ def test_t_nohup_bounds_with_timeout(monkeypatch) -> None:
 
     monkeypatch.setattr("agentknit.async_toolkit.t_execute_async", _fake_execute)
     t_nohup("sleep 30")
-    t_nohup("sleep 30", timeout=3)
+    t_nohup("sleep 30", timeout=3, timeout_unit="m")
+    t_nohup("sleep 30", timeout=90, timeout_unit="s")
     t_nohup("sleep 30", wait_before_s=300)
     assert seen == [
         ("timeout 600 sleep 30", 0),
         ("timeout 180 sleep 30", 0),
+        ("timeout 90 sleep 30", 0),
         ("timeout 600 sleep 30", 300),   # bound applies to the command, not the delay
     ]
+
+
+def test_t_nohup_rejects_bad_timeout_unit(monkeypatch) -> None:
+    """An unknown timeout_unit (or non-positive timeout) is rejected upfront."""
+    def _fake_execute(command: str, wait_before_s: float = 0):
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr("agentknit.async_toolkit.t_execute_async", _fake_execute)
+    assert "unknown timeout_unit" in json.loads(t_nohup("true", timeout=5, timeout_unit="w")[0])["error"]
+    assert "positive" in json.loads(t_nohup("true", timeout=0)[0])["error"]
 
 
 def test_t_nohup_rejects_bad_wait_before(monkeypatch) -> None:
@@ -120,6 +132,7 @@ def test_nohup_tool_specs_shape() -> None:
     assert specs[0]["function"]["parameters"]["required"] == ["command"]
     assert specs[1]["function"]["parameters"]["required"] == ["tool_exec_id"]
     assert specs[2]["function"]["parameters"]["required"] == ["tool_exec_id"]
+    assert specs[0]["function"]["parameters"]["properties"]["timeout_unit"]["enum"] == ["d", "h", "m", "s"]
     assert specs[2]["function"]["parameters"]["properties"]["unit"]["enum"] == ["d", "h", "m", "s"]
     assert "howmuch" in specs[2]["function"]["parameters"]["properties"]
     assert "activity" in specs[2]["function"]["description"]

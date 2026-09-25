@@ -272,6 +272,43 @@ _TIME_AWARENESS_SYSTEM = (
     "shortcuts or stop early."
 )
 
+# Change awareness (model-facing): when the repository moves between turns —
+# files changed outside the session's own tool calls, or the git state
+# (branch, commits, working tree) changing — the next turn opens with a
+# <ground_moved> note saying what moved.  Provenance is reported honestly:
+# a file is listed only when its bytes changed outside this session's tool
+# calls, but the actual writer (user, formatter, background process) cannot
+# be determined from a stat — the note says so instead of inventing one.
+_CHANGE_AWARENESS_SYSTEM = (
+    "Change awareness is injected into this session: when the repository "
+    "state moves between your turns — files changed outside your tool "
+    "calls, or the git state (branch, commits, working tree) changing — "
+    "your next turn opens with a <ground_moved> note listing what moved. "
+    "Provenance is honest: a file is listed only when it changed outside "
+    "this session's tool calls, but the actual writer (the user, a "
+    "formatter, a background process) cannot be determined — never assume "
+    "which. When a file you rely on is listed, re-read it before editing; "
+    "your mental model of it may be stale."
+)
+
+# The six situational-awareness types (Martin Monperrus, "Situational
+# Awareness for Coding Agents"), in article order.  Each has a config flag
+# (schema key + init_session kwarg + --no-<type>-awareness CLI flag) and a
+# line in the startup checklist event.
+AWARENESS_TYPES: "tuple[str, ...]" = (
+    "user", "system", "git", "time", "token", "change",
+)
+
+# One emoji per sense, leading its checklist line — the concept at a glance.
+AWARENESS_EMOJI: "dict[str, str]" = {
+    "user": "👤",
+    "system": "💻",
+    "git": "🌿",
+    "time": "🕐",
+    "token": "🪙",
+    "change": "🔄",
+}
+
 _COMPACTION_PROMPT = (
     "Summarize the conversation above into a dense, structured summary "
     "optimized for continuing a coding task. Preserve all state needed to "
@@ -316,6 +353,12 @@ PASTE_IDLE_TIMEOUT_S = 0.25
 # How often the idle prompt looks for a background event (a finished nohup
 # execution) while waiting for the first keystroke.
 REPL_WAKE_POLL_S = 0.25
+# Banner hint for multi-line input. Enter always submits: terminal
+# Shift/Ctrl/Alt+Enter deliver the same \n as plain Enter (the modifier never
+# reaches stdin), so a newline comes from paste or from an explicit
+# trailing-backslash continuation — the same convention as POSIX shells.
+NEWLINE_HINT = ("Enter submits. Newline: paste multiline text (one turn), or "
+                "end a line with '\\' to continue on the next line.")
 
 # ── OSC 8 terminal hyperlinks ─────────────────────────────────────────────────
 
@@ -1371,6 +1414,118 @@ def _scratchpad_dir(cwd: Path) -> Path:
     return Path(tempfile.gettempdir()) / f"agentknit-scratchpad-{cwd.name}-{digest}"
 
 
+# ── change awareness ──────────────────────────────────────────────────────────
+
+def _git_state_digest() -> "str | None":
+    """One-line digest of the git state: branch, HEAD, dirty file list.
+
+    The point is not to be readable — the full block is already in the
+    system prompt — but to be *cheap to compare* between turns: identical
+    digests mean the git ground has not moved.  ``None`` outside a repo.
+    """
+    import subprocess
+    try:
+        inside = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if inside.returncode != 0:
+            return None
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return f"branch={branch or '?'} head={head or '?'}\n{status}"
+
+
+def _stat_file(path: str) -> "tuple[int, int] | None":
+    """(mtime_ns, size) of *path*, or None when it cannot be stat'd."""
+    try:
+        st = os.stat(os.path.expanduser(path))
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _watched_file_changes(session: Session) -> "list[str]":
+    """Files among the session's watched set whose bytes moved on disk.
+
+    Compares each file's (mtime_ns, size) against the reading recorded the
+    last time this session observed it — after a tool call that read or
+    wrote it.  A change means the file moved *outside* this session's tool
+    calls: the tool path records the post-tool state immediately after the
+    write, so the session's own edits do not show up here.
+    """
+    watch: "dict[str, tuple[int, int] | None]" = session.get(
+        "_awareness_file_watch") or {}
+    changed: list[str] = []
+    for path, known in watch.items():
+        now = _stat_file(path)
+        if now is not None and known is not None and now != known:
+            changed.append(path)
+        # A vanished file is not a change the model can act on; a newly
+        # appearing one was never known.  Both leave the watch as is.
+        if now is not None:
+            watch[path] = now
+    return changed
+
+
+def _watch_files(session: Session, paths: "list[str] | None") -> None:
+    """Start/refresh watching *paths* (file args of a tool call that ran)."""
+    if not paths:
+        return
+    watch = session.setdefault("_awareness_file_watch", {})
+    for path in paths:
+        if isinstance(path, str) and path:
+            stat = _stat_file(path)
+            if stat is not None:
+                watch[path] = stat
+
+
+def _ground_moved_preamble(session: Session) -> "str | None":
+    """Turn-opening note when the repository ground moved, else None.
+
+    Two detectors, both compared against the state at the last observation:
+    the git digest (branch, HEAD, working tree) and the (mtime, size) of
+    files this session has read or written through its tools.  The note
+    lists what moved and states provenance honestly: files listed changed
+    outside this session's tool calls, but *who* wrote them cannot be
+    determined from a stat.
+    """
+    if not session.get("change_awareness_enabled"):
+        return None
+    notes: list[str] = []
+    git_digest = _git_state_digest()
+    if git_digest is not None and git_digest != session.get("_awareness_git_digest"):
+        if session.get("_awareness_git_digest") is not None:
+            notes.append("git state changed (branch, commits and/or working tree)")
+        session["_awareness_git_digest"] = git_digest
+    changed_files = _watched_file_changes(session)
+    if changed_files:
+        notes.append("files changed outside this session's tool calls "
+                     "(the writer cannot be determined from a stat — it may "
+                     "be the user, a formatter or a background process): "
+                     + ", ".join(sorted(changed_files)))
+    if not notes:
+        return None
+    note = ("<ground_moved>" + "; ".join(notes)
+            + ". Re-read what you rely on before editing; your mental model "
+              "may be stale.</ground_moved>")
+    _emit(session, "ground_moved", git_changed=notes[0].startswith("git state"),
+          files=changed_files or None, fmt=None)
+    return note
+
+
 # ── hooks integration ─────────────────────────────────────────────────────────
 
 def _hooks_enabled(session: Session) -> bool:
@@ -1485,65 +1640,76 @@ def _total_ram_gib(meminfo: "Path | None" = None) -> "float | None":
     return None
 
 
-def environment_context(model: str, version: "str | None" = None) -> str:
+def environment_context(model: str, version: "str | None" = None,
+                        enabled: "dict[str, bool] | None" = None) -> str:
     """Build the environment-awareness block appended to the system prompt.
 
     Covers (per issue #31): user identity, git status, working directory,
     OS/architecture, CPU/RAM, current date & timezone, scratchpad dir,
     model identity.
+
+    *enabled* is the session's awareness flag map; the ``user``, ``system``
+    and ``git`` types gate the corresponding lines.  ``None`` means all on
+    (backward-compatible signature for direct callers).
     """
     import getpass
     import platform
 
+    on = enabled or {}
+
     lines = ["## Environment"]
 
     # User identity: unix name + git identity when configured.
-    try:
-        unix_name = getpass.getuser()
-    except Exception:
-        unix_name = None
-    git_name = _git_config_value("user.name")
-    git_email = _git_config_value("user.email")
-    identity = ""
-    if unix_name:
-        identity += f"unix user: {unix_name}"
-    if git_name or git_email:
-        git_id = " ".join(x for x in (git_name, f"<{git_email}>" if git_email else "") if x)
-        identity += ("; " if identity else "") + f"git identity: {git_id}"
-    if identity:
-        lines.append(f"User: {identity}")
+    if on.get("user", True):
+        try:
+            unix_name = getpass.getuser()
+        except Exception:
+            unix_name = None
+        git_name = _git_config_value("user.name")
+        git_email = _git_config_value("user.email")
+        identity = ""
+        if unix_name:
+            identity += f"unix user: {unix_name}"
+        if git_name or git_email:
+            git_id = " ".join(x for x in (git_name, f"<{git_email}>" if git_email else "") if x)
+            identity += ("; " if identity else "") + f"git identity: {git_id}"
+        if identity:
+            lines.append(f"User: {identity}")
 
-    git_block = _git_status_block()
-    if git_block:
-        lines.append(git_block)
+    if on.get("git", True):
+        git_block = _git_status_block()
+        if git_block:
+            lines.append(git_block)
 
-    lines.append(f"Working directory: {Path.cwd()}")
-    lines.append(f"OS: {platform.system()} {platform.release()} ({platform.machine()})")
-    cpus = _cpu_count()
-    if cpus:
-        lines.append(f"CPU cores: {cpus}")
-    ram = _total_ram_gib()
-    if ram:
-        lines.append(f"RAM: {ram:.1f} GiB")
+    if on.get("system", True):
+        lines.append(f"Working directory: {Path.cwd()}")
+        lines.append(f"OS: {platform.system()} {platform.release()} ({platform.machine()})")
+        cpus = _cpu_count()
+        if cpus:
+            lines.append(f"CPU cores: {cpus}")
+        ram = _total_ram_gib()
+        if ram:
+            lines.append(f"RAM: {ram:.1f} GiB")
 
-    now = datetime.datetime.now().astimezone()
-    lines.append(f"Current date/time: {now.strftime('%Y-%m-%d %H:%M:%S')} "
-                 f"({now.tzname() or 'local'} timezone)")
+        now = datetime.datetime.now().astimezone()
+        lines.append(f"Current date/time: {now.strftime('%Y-%m-%d %H:%M:%S')} "
+                     f"({now.tzname() or 'local'} timezone)")
 
-    scratchpad = _scratchpad_dir(Path.cwd())
-    scratchpad.mkdir(parents=True, exist_ok=True)
-    lines.append(f"Scratchpad (for temporary files): {scratchpad}")
+        scratchpad = _scratchpad_dir(Path.cwd())
+        scratchpad.mkdir(parents=True, exist_ok=True)
+        lines.append(f"Scratchpad (for temporary files): {scratchpad}")
 
-    model_line = f"Model: {model}"
-    if version:
-        model_line += f" (version {version})"
-    lines.append(model_line)
+        model_line = f"Model: {model}"
+        if version:
+            model_line += f" (version {version})"
+        lines.append(model_line)
 
-    # Harness identity: local import avoids a circular import with __init__.
-    from . import __version__ as _harness_version
-    lines.append(f"Harness: agentknit {_harness_version}")
+        # Harness identity: local import avoids a circular import with __init__.
+        from . import __version__ as _harness_version
+        lines.append(f"Harness: agentknit {_harness_version}")
 
     lines.append("")
+
     lines.append(attribution_block(model))
 
     return "\n".join(lines)
@@ -1593,6 +1759,16 @@ def read_repl_input(prompt: str, *, wake: "Callable[[], bool] | None" = None) ->
         raise EOFError
 
     text = first_line.rstrip("\n")
+    # Backslash continuation: "foo \" + Enter keeps the prompt open for the
+    # next line, like a shell.  This is the deliberate way to hand-type a
+    # newline — terminals send the same byte for Enter with and without
+    # Shift/Ctrl/Alt held, so there is nothing to intercept for those combos.
+    while text.endswith("\\"):
+        text = text[:-1]
+        cont = sys.stdin.readline()
+        if cont == "":
+            break
+        text += "\n" + cont.rstrip("\n")
     # If paste arrives line-by-line, keep draining until input has been idle briefly.
     while select.select([sys.stdin], [], [], PASTE_IDLE_TIMEOUT_S)[0]:
         line = sys.stdin.readline()
@@ -1803,6 +1979,23 @@ def _tool_timing_footer(session: Session) -> str | None:
             f'duration="{fmt_duration(ended - started)}" />')
 
 
+def _awareness_checklist(session: Session) -> None:
+    """Emit the startup situational-awareness checklist, one line per type.
+
+    Console output (default event handler) reads ``👤 user awareness: ✅``
+    for an enabled type and ``👤 user awareness: ❌`` when its flag is off,
+    in article order: user, system, git, time, token, change.  Each sense
+    leads with its emoji (see ``AWARENESS_EMOJI``) and reports ✅/❌ rather
+    than check/off so the checklist reads at a glance.
+    """
+    status = {t: bool(session.get(f"{t}_awareness_enabled", True))
+              for t in AWARENESS_TYPES}
+    fmt = "\n".join(
+        f"{AWARENESS_EMOJI[t]} {t} awareness: {'✅' if on else '❌'}"
+        for t, on in status.items())
+    _emit(session, "awareness_checklist", status=status, fmt=fmt)
+
+
 def _log(session: Session, record: "dict[str, Any]") -> None:
     record["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
     record["cwd"] = os.getcwd()
@@ -1918,6 +2111,12 @@ def _save_messages_snapshot(session: Session) -> None:
                     _iso_stamp(started_at)
                     if (started_at := session.get("time_awareness_started_at"))
                     else None),
+            },
+            # Situational-awareness switches for the remaining senses; the
+            # runtime state of change awareness is not snapshotted.
+            "awareness": {
+                t: bool(session.get(f"{t}_awareness_enabled", True))
+                for t in AWARENESS_TYPES
             },
         },
         "messages": annotated,
@@ -2591,6 +2790,18 @@ class Session(TypedDict):
     time_awareness_last_reply_at: NotRequired[float | None]  # epoch of the last final answer
     time_awareness_last_tool_ms: NotRequired[int | None]     # duration of the last tool call
     _time_awareness_pending_tool_span: NotRequired["tuple[float, float] | None"]
+    # situational awareness: the four remaining senses beyond token/time.
+    # NotRequired: sessions snapshotted before the switches existed lack
+    # these keys; the restore path backfills True.  New sessions always set
+    # all four.
+    user_awareness_enabled: NotRequired[bool]      # CLAUDE.md + identity line
+    system_awareness_enabled: NotRequired[bool]    # environment block lines
+    git_awareness_enabled: NotRequired[bool]       # git status block
+    change_awareness_enabled: NotRequired[bool]    # per-turn <ground_moved> note
+    # change-awareness runtime state (never snapshotted): git digest and
+    # (mtime_ns, size) per file observed through this session's tools.
+    _awareness_git_digest: NotRequired["str | None"]
+    _awareness_file_watch: NotRequired["dict[str, 'tuple[int, int] | None']"]
     # durability
     # NotRequired: sessions saved before the durable-recovery feature lack
     # this key; the restore path defaults it to True.
@@ -2647,6 +2858,10 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                  token_awareness_update_every: int | None = None,
                  time_awareness_enabled: bool | None = None,
                  time_awareness_tool_timestamps: bool | None = None,
+                 user_awareness_enabled: bool | None = None,
+                 system_awareness_enabled: bool | None = None,
+                 git_awareness_enabled: bool | None = None,
+                 change_awareness_enabled: bool | None = None,
                  durable: bool | None = None,
                  session_dir: str | Path | None = None,
                  durable_sink: DurableSink | None = None,
@@ -2838,6 +3053,11 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             _epoch_from_iso(restored.get("session_start_ts")) or time.time())
         restored.setdefault("time_awareness_last_reply_at", None)
         restored.setdefault("time_awareness_last_tool_ms", None)
+        # Old snapshots predate the awareness switches: backfill defaults.
+        for _t in AWARENESS_TYPES:
+            cast("dict[str, Any]", restored).setdefault(
+                f"{_t}_awareness_enabled", True)
+        cast("dict[str, Any]", restored).setdefault("_awareness_file_watch", {})
         # Replace event handler if a new one was provided.
         if on_event is not None:
             restored["on_event"] = on_event
@@ -2875,6 +3095,14 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             restored["time_awareness_enabled"] = time_awareness_enabled
         if time_awareness_tool_timestamps is not None:
             restored["time_awareness_tool_timestamps"] = time_awareness_tool_timestamps
+        if user_awareness_enabled is not None:
+            restored["user_awareness_enabled"] = user_awareness_enabled
+        if system_awareness_enabled is not None:
+            restored["system_awareness_enabled"] = system_awareness_enabled
+        if git_awareness_enabled is not None:
+            restored["git_awareness_enabled"] = git_awareness_enabled
+        if change_awareness_enabled is not None:
+            restored["change_awareness_enabled"] = change_awareness_enabled
         if durable is not None:
             restored["durable"] = durable
         # Hooks: restored sessions keep their configured hooks unless the
@@ -2904,6 +3132,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
               session_id=restored.get("session_id"),
               fmt=f"{DIM}Restored session {restored.get('session_id')} "
                   f"({len(restored.get('messages', []))} messages){RESET}")
+        _awareness_checklist(restored)
         return restored
 
     # ── Build a brand-new session ──────────────────────────────────────
@@ -2917,8 +3146,28 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     if system_prompt_supplement:
         sys_msg += "\n\n" + system_prompt_supplement
 
+    # User / system / git / change awareness switches: explicit kwarg →
+    # schema → default (on).  user/system/git gate the environment block
+    # and CLAUDE.md; change guards the per-turn <ground_moved> note.
+    user_enabled = (
+        user_awareness_enabled if user_awareness_enabled is not None
+        else schema.get("user_awareness_enabled", True)
+    )
+    system_enabled = (
+        system_awareness_enabled if system_awareness_enabled is not None
+        else schema.get("system_awareness_enabled", True)
+    )
+    git_enabled = (
+        git_awareness_enabled if git_awareness_enabled is not None
+        else schema.get("git_awareness_enabled", True)
+    )
+    change_enabled = (
+        change_awareness_enabled if change_awareness_enabled is not None
+        else schema.get("change_awareness_enabled", True)
+    )
+
     claude_md = Path.home() / ".claude" / "CLAUDE.md"
-    if claude_md.exists():
+    if user_enabled and claude_md.exists():
         sys_msg += "\n\n" + claude_md.read_text()
 
     agents_md = Path.cwd() / "AGENTS.md"
@@ -2926,7 +3175,9 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         sys_msg += "\n\n" + agents_md.read_text()
 
     # Environment awareness: user identity, git status, cwd, OS, date, scratchpad.
-    sys_msg += "\n\n" + environment_context(model, schema.get("version"))
+    sys_msg += "\n\n" + environment_context(
+        model, schema.get("version"),
+        enabled={"user": user_enabled, "system": system_enabled, "git": git_enabled})
 
     # Token awareness: resolve the four knobs (explicit kwarg → schema →
     # default) before building the system prompt, which declares the budget.
@@ -2964,6 +3215,9 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     )
     if time_enabled:
         sys_msg += "\n\n" + _TIME_AWARENESS_SYSTEM
+
+    if change_enabled:
+        sys_msg += "\n\n" + _CHANGE_AWARENESS_SYSTEM
 
     session_id = resumed_from if resumed_from else uuid.uuid4().hex[:12]
     streaming = bool(
@@ -3082,6 +3336,14 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                                       or time.time()),
         "time_awareness_last_reply_at": None,
         "time_awareness_last_tool_ms": None,
+        "user_awareness_enabled": bool(user_enabled),
+        "system_awareness_enabled": bool(system_enabled),
+        "git_awareness_enabled": bool(git_enabled),
+        "change_awareness_enabled": bool(change_enabled),
+        # change-awareness runtime state (not snapshotted): git digest and
+        # (mtime, size) of files observed through this session's tools.
+        "_awareness_git_digest": None,
+        "_awareness_file_watch": {},
         # Durable recovery: append-only WAL of every in-turn state change.
         "durable": (
             True if session_dir is not None else
@@ -3246,6 +3508,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                         ),
                         "ts": datetime.datetime.now().isoformat(timespec="seconds"),
                     })
+    _awareness_checklist(session)
     return session
 
 
@@ -3966,6 +4229,16 @@ def _handle_tool_call(
     cast("dict[str, Any]", session)["_time_awareness_pending_tool_span"] = (
         tool_started_at, tool_ended_at)
 
+    # Change awareness: record the post-tool state of every file this call
+    # touched (or read) so a later external modification shows up as a diff
+    # against what the session last observed — the session's own writes are
+    # thereby never misreported as external changes.
+    if session.get("change_awareness_enabled"):
+        _watch_files(session, log_data.get("files"))
+        path_arg = args.get("path")
+        if isinstance(path_arg, str):
+            _watch_files(session, [path_arg])
+
     fmt = fmt_result(result, streamed=streamed)
     if name == "read_file":
         path = args.get("path")
@@ -4365,6 +4638,12 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
     submitted = task
     if task is not None:
         preamble = _time_awareness_preamble(session)
+        # Change awareness rides in the same turn-opening preamble: the
+        # ground may have moved between turns, and the note must reach the
+        # model before it starts reasoning about files.
+        ground = _ground_moved_preamble(session)
+        if ground:
+            preamble = f"{preamble}\n{ground}" if preamble else ground
         if preamble:
             submitted = f"{task}\n\n{preamble}" if task else preamble
     if task is None:
@@ -5155,6 +5434,13 @@ def run_task(
     hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
     hooks_enabled: bool | None = None,
     step_reducer: "StepReducer | None" = None,
+    token_awareness_enabled: bool | None = None,
+    time_awareness_enabled: bool | None = None,
+    time_awareness_tool_timestamps: bool | None = None,
+    user_awareness_enabled: bool | None = None,
+    system_awareness_enabled: bool | None = None,
+    git_awareness_enabled: bool | None = None,
+    change_awareness_enabled: bool | None = None,
 ) -> SessionResult:
     """Run a single task against the agent and return a :class:`SessionResult`.
 
@@ -5210,6 +5496,13 @@ def run_task(
         hooks=hooks,
         hooks_enabled=hooks_enabled,
         step_reducer=step_reducer,
+        token_awareness_enabled=token_awareness_enabled,
+        time_awareness_enabled=time_awareness_enabled,
+        time_awareness_tool_timestamps=time_awareness_tool_timestamps,
+        user_awareness_enabled=user_awareness_enabled,
+        system_awareness_enabled=system_awareness_enabled,
+        git_awareness_enabled=git_awareness_enabled,
+        change_awareness_enabled=change_awareness_enabled,
     )
     try:
         return run_turn(client, schema["model"], session, task)
@@ -5229,6 +5522,13 @@ def run_agent(
     model: str,
     endpoint: str,
     tools: list[Tool],
+    token_awareness_enabled: bool | None = None,
+    time_awareness_enabled: bool | None = None,
+    time_awareness_tool_timestamps: bool | None = None,
+    user_awareness_enabled: bool | None = None,
+    system_awareness_enabled: bool | None = None,
+    git_awareness_enabled: bool | None = None,
+    change_awareness_enabled: bool | None = None,
     auth: str | None = None,
     non_interactive: bool = False,
     session_id: str | None = None,
@@ -5294,6 +5594,13 @@ def run_agent(
         hooks=hooks,
         hooks_enabled=hooks_enabled,
         step_reducer=step_reducer,
+        token_awareness_enabled=token_awareness_enabled,
+        time_awareness_enabled=time_awareness_enabled,
+        time_awareness_tool_timestamps=time_awareness_tool_timestamps,
+        user_awareness_enabled=user_awareness_enabled,
+        system_awareness_enabled=system_awareness_enabled,
+        git_awareness_enabled=git_awareness_enabled,
+        change_awareness_enabled=change_awareness_enabled,
     )
 
 
@@ -5303,6 +5610,13 @@ def run(
     *,
     model: str | None = None,
     endpoint: str | None = None,
+    token_awareness_enabled: bool | None = None,
+    time_awareness_enabled: bool | None = None,
+    time_awareness_tool_timestamps: bool | None = None,
+    user_awareness_enabled: bool | None = None,
+    system_awareness_enabled: bool | None = None,
+    git_awareness_enabled: bool | None = None,
+    change_awareness_enabled: bool | None = None,
     non_interactive: bool = False,
     session_id: str | None = None,
     cache_key: str | None = None,
@@ -5364,6 +5678,13 @@ def run(
         hooks=hooks,
         hooks_enabled=hooks_enabled,
         step_reducer=step_reducer,
+        token_awareness_enabled=token_awareness_enabled,
+        time_awareness_enabled=time_awareness_enabled,
+        time_awareness_tool_timestamps=time_awareness_tool_timestamps,
+        user_awareness_enabled=user_awareness_enabled,
+        system_awareness_enabled=system_awareness_enabled,
+        git_awareness_enabled=git_awareness_enabled,
+        change_awareness_enabled=change_awareness_enabled,
     )
 
 
@@ -5421,6 +5742,13 @@ def _repl_setup(
     schema: "dict[str, Any]",
     *,
     non_interactive: bool = False,
+    token_awareness_enabled: bool | None = None,
+    time_awareness_enabled: bool | None = None,
+    time_awareness_tool_timestamps: bool | None = None,
+    user_awareness_enabled: bool | None = None,
+    system_awareness_enabled: bool | None = None,
+    git_awareness_enabled: bool | None = None,
+    change_awareness_enabled: bool | None = None,
     session_id: str | None = None,
     cache_key: str | None = None,
     system_prompt_supplement: str = "",
@@ -5469,6 +5797,13 @@ def _repl_setup(
         hooks=hooks,
         hooks_enabled=hooks_enabled,
         step_reducer=step_reducer,
+        token_awareness_enabled=token_awareness_enabled,
+        time_awareness_enabled=time_awareness_enabled,
+        time_awareness_tool_timestamps=time_awareness_tool_timestamps,
+        user_awareness_enabled=user_awareness_enabled,
+        system_awareness_enabled=system_awareness_enabled,
+        git_awareness_enabled=git_awareness_enabled,
+        change_awareness_enabled=change_awareness_enabled,
     )
     model = schema["model"]
 
@@ -5686,6 +6021,13 @@ def run_repl(
     schema: "dict[str, Any]",
     *,
     non_interactive: bool = False,
+    token_awareness_enabled: bool | None = None,
+    time_awareness_enabled: bool | None = None,
+    time_awareness_tool_timestamps: bool | None = None,
+    user_awareness_enabled: bool | None = None,
+    system_awareness_enabled: bool | None = None,
+    git_awareness_enabled: bool | None = None,
+    change_awareness_enabled: bool | None = None,
     session_id: str | None = None,
     cache_key: str | None = None,
     system_prompt_supplement: str = "",
@@ -5742,11 +6084,18 @@ def run_repl(
         hooks=hooks,
         hooks_enabled=hooks_enabled,
         step_reducer=step_reducer,
+        token_awareness_enabled=token_awareness_enabled,
+        time_awareness_enabled=time_awareness_enabled,
+        time_awareness_tool_timestamps=time_awareness_tool_timestamps,
+        user_awareness_enabled=user_awareness_enabled,
+        system_awareness_enabled=system_awareness_enabled,
+        git_awareness_enabled=git_awareness_enabled,
+        change_awareness_enabled=change_awareness_enabled,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
 
     display_name = schema.get("display_name", f"agentknit {model}")
-    print(f"{BOLD}{display_name}{RESET}  (type 'exit' to quit)\n")
+    print(f"{BOLD}{display_name}{RESET}  (type 'exit' to quit; {NEWLINE_HINT})\n")
     try:
         while True:
             try:
@@ -5776,6 +6125,13 @@ def run_async_repl(
     schema: "dict[str, Any]",
     *,
     non_interactive: bool = False,
+    token_awareness_enabled: bool | None = None,
+    time_awareness_enabled: bool | None = None,
+    time_awareness_tool_timestamps: bool | None = None,
+    user_awareness_enabled: bool | None = None,
+    system_awareness_enabled: bool | None = None,
+    git_awareness_enabled: bool | None = None,
+    change_awareness_enabled: bool | None = None,
     session_id: str | None = None,
     cache_key: str | None = None,
     system_prompt_supplement: str = "",
@@ -5831,11 +6187,18 @@ def run_async_repl(
         hooks=hooks,
         hooks_enabled=hooks_enabled,
         step_reducer=step_reducer,
+        token_awareness_enabled=token_awareness_enabled,
+        time_awareness_enabled=time_awareness_enabled,
+        time_awareness_tool_timestamps=time_awareness_tool_timestamps,
+        user_awareness_enabled=user_awareness_enabled,
+        system_awareness_enabled=system_awareness_enabled,
+        git_awareness_enabled=git_awareness_enabled,
+        change_awareness_enabled=change_awareness_enabled,
     )
     resume_cmd = _build_resume_cmd(model, session["session_id"], sys.argv[0])
 
     display_name = schema.get("display_name", f"agentknit {model}")
-    print(f"{BOLD}{display_name}{RESET}  (type 'exit' to quit)\n")
+    print(f"{BOLD}{display_name}{RESET}  (type 'exit' to quit; {NEWLINE_HINT})\n")
     try:
         while True:
             try:
@@ -5919,6 +6282,11 @@ def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
                    default=None,
                    help="Disable all lifecycle hooks for this session, whatever their "
                         "source.")
+    for _sense in AWARENESS_TYPES:
+        p.add_argument(f"--no-{_sense}-awareness", action="store_false",
+                       dest=f"{_sense}_awareness_enabled", default=None,
+                       help=f"Disable {_sense} awareness (one of the six situational-"
+                            f"awareness senses injected at session start).")
     return p.parse_intermixed_args(argv)
 
 
@@ -5971,6 +6339,9 @@ def main(argv: "list[str] | None" = None) -> None:
         durable                  = args.durable,
         hooks                    = args.hooks,
         hooks_enabled            = args.hooks_enabled,
+        **{f"{_sense}_awareness_enabled":
+           getattr(args, f"{_sense}_awareness_enabled")
+           for _sense in AWARENESS_TYPES},
     )
 
     # Print the session header once, before any task runs.

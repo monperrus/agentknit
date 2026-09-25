@@ -56,6 +56,36 @@ def _stub_completions(monkeypatch) -> None:
     monkeypatch.setattr(_SubprocessCompletions, "create", _create)
 
 
+def _type_lines(monkeypatch, text: str) -> io.StringIO:
+    """Fake stdin + select() as if a human typed *text* line by line.
+
+    select() reports readable while unread text remains — except for the
+    paste-drain poll (``PASTE_IDLE_TIMEOUT_S``, patched here to a sentinel
+    timeout), which must see an idle stdin: consecutive lines in *text* are
+    separate keystroke bursts minutes apart, not one clipboard paste, so
+    they must land in separate REPL turns.  A blanket always-empty fake
+    hangs: the ``wake`` poll in ``read_repl_input`` would spin forever.
+
+    Also drains the module-global background-completion queue: earlier
+    tests in the same process may have left ``nohup`` completions there,
+    and the REPL would prepend their notice to the first typed line.
+    """
+    while not _core._async_module.async_completion_queue.empty():
+        _core._async_module.async_completion_queue.get_nowait()
+    stdin = io.StringIO(text)
+    monkeypatch.setattr(_core.sys, "stdin", stdin)
+    sentinel = object()
+    monkeypatch.setattr(_core, "PASTE_IDLE_TIMEOUT_S", sentinel)
+
+    def _select(rlist, _w, _x, timeout=None):
+        pending = stdin.tell() < len(stdin.getvalue())
+        ready = [stdin] if (pending and timeout is not sentinel) else []
+        return (ready, [], [])
+
+    monkeypatch.setattr(_core.select, "select", _select)
+    return stdin
+
+
 def test_run_task_accepts_injected_client(monkeypatch) -> None:
     """run_task uses the passed client and never calls create_client."""
     called = []
@@ -97,24 +127,24 @@ def test_repl_setup_accepts_injected_client(monkeypatch) -> None:
 def test_run_repl_uses_injected_client(monkeypatch) -> None:
     """End-to-end: run_repl drives the injected client for each turn."""
     _stub_completions(monkeypatch)
-    monkeypatch.setattr(_core.select, "select", lambda *_: ([], [], []))
+    _type_lines(monkeypatch, "hi\nexit\n")
     client = RecordingOpenAI(reply="repl-reply")
     buf = io.StringIO()
-    monkeypatch.setattr(_core.sys, "stdin", io.StringIO("hi\nexit\n"))
     with contextlib.redirect_stdout(buf):
         run_repl(_schema(), client=client)
     assert len(client.requests) == 1
-    # The prompt carries the time-awareness line; the typed text opens it.
+    # The typed text opens the final user message; a turn-opening preamble
+    # (time awareness, a <ground_moved> note) is appended after it, so anchor
+    # on the head, not the tail.
     assert client.requests[0]["messages"][-1]["content"].startswith("hi")
 
 
 def test_repl_continue_retries_without_adding_user_message(monkeypatch) -> None:
     """/c replays an interrupted transcript instead of appending "go"."""
     _stub_completions(monkeypatch)
-    monkeypatch.setattr(_core.select, "select", lambda *_: ([], [], []))
+    _type_lines(monkeypatch, "work\n/c\nexit\n")
     client = RecordingOpenAI(reply="repl-reply")
     buf = io.StringIO()
-    monkeypatch.setattr(_core.sys, "stdin", io.StringIO("work\n/c\nexit\n"))
     with contextlib.redirect_stdout(buf):
         run_repl(_schema(), client=client)
 

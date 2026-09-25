@@ -94,6 +94,31 @@ The system prompt gains a paragraph explaining both markers, framed like the tok
 | `time_awareness_tool_timestamps` | boolean | no | Stamp tool results with `<tool_time …>` (default `true`).  Turning it off keeps the per-turn timing line. |
 
 Both are also accepted as keyword arguments to `init_session`.  The `tool_result` event and its log record gain `started_at`, `ended_at` and `duration_ms`, so a journal replays the session's real timing distribution.  "Session elapsed" is anchored on `session_start_ts` and survives a resume: a session resumed a day later reports itself as a day old, because it is.
+
+### Situational awareness
+
+All six senses from [Situational Awareness for Coding Agents](https://www.monperrus.net/martin/situational-awareness-coding-agents), in article order — user, system, git, time, token, change:
+
+- **user** — the user dossier layer (`~/.claude/CLAUDE.md`) and the identity line in the environment block.
+- **system** — the environment block lines (working directory, OS, CPU/RAM, date, scratchpad, model, harness).
+- **git** — the git status block in the environment block.
+- **time** — the two injections described in [Time awareness](#time-awareness).
+- **token** — the three injections described in [Token awareness](#token-awareness).
+- **change** — a `<ground_moved>` note opening the next turn when the repository moved between turns: files this session read or wrote through its tools changed on disk outside those tool calls, or the git state (branch, HEAD, working tree) changed.  Provenance is honest: a listed file demonstrably changed outside the session's tool calls, but *who* wrote it cannot be determined from a stat — the note says so instead of guessing "user or linter".
+
+At session start the console prints a one-line checklist per sense (`👤 user awareness: ✅`, …; `❌` when disabled), each sense leading with its emoji (👤 user, 💻 system, 🌿 git, 🕐 time, 🪙 token, 🔄 change), emitted as an `awareness_checklist` event (`status`: map of sense → bool).  A `ground_moved` event (`git_changed`, `files`) accompanies each note.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `user_awareness_enabled` | boolean | no | Dossier + identity line (default `true`). |
+| `system_awareness_enabled` | boolean | no | Environment block lines, minus the git block (default `true`). |
+| `git_awareness_enabled` | boolean | no | Git status block inside the environment block (default `true`). |
+| `time_awareness_enabled` | boolean | no | See [Time awareness](#time-awareness). |
+| `token_awareness_enabled` | boolean | no | See [Token awareness](#token-awareness). |
+| `change_awareness_enabled` | boolean | no | Per-turn `<ground_moved>` note (default `true`). |
+
+All are also accepted as keyword arguments to `init_session` / `run_task` / `run` / `run_agent` / `run_repl`, and on the CLI as `--no-user-awareness`, `--no-system-awareness`, `--no-git-awareness`, `--no-time-awareness`, `--no-token-awareness`, `--no-change-awareness`.  Snapshot metadata records the six switches under `metadata.awareness`; change-awareness runtime state (git digest, per-file stat watch) is intentionally not snapshotted — a resumed session re-baselines on its first turn.
+
 | `provider` | string | no | OpenRouter provider hint pinned for the session. |
 | `provider_api_support` | object | no | Capability map written by llmprobe; `provider_api_support.streaming.supported` enables streaming. |
 

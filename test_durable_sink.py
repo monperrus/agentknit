@@ -47,8 +47,12 @@ def test_session_dir_persists_before_tool_execution_and_event_handlers(tmp_path:
     )
     try:
         _handle_tool_call("write", {"path": "x"}, session)
-        assert order == ["event", "tool", "event"]
-        assert [r["type"] for r in sink.records[:2]] == ["message", "tool_start"]
+        # awareness_checklist (init_session) and tool_call fire before the
+        # tool body; tool_result after it.
+        assert order == ["event", "event", "tool", "event"]
+        # message (init_session) then the awareness_checklist event; the
+        # tool_start write-ahead follows once a tool call is dispatched.
+        assert [r["type"] for r in sink.records[:3]] == ["message", "event", "tool_start"]
         journal = (tmp_path / "one-session" / "journal.jsonl")
         assert journal.exists()
         records = [json.loads(line) for line in journal.read_text().splitlines()]

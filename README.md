@@ -10,6 +10,7 @@ Features:
 * Automatic context compaction keeps long sessions inside the token budget
 * Model-facing [token awareness](https://www.monperrus.net/martin/token-awareness): a true countdown in the model's context, with a checkpoint reminder before compaction
 * Model-facing time awareness: every turn opens with `session elapsed · last tool · wall since your previous message`, and every tool result is stamped with its ISO-8601 start/end/duration
+* All six [situational-awareness](https://www.monperrus.net/martin/situational-awareness-coding-agents) senses — user, system, git, time, token, change — injected at session start, each reported on the console with a leading emoji (`👤 user awareness: ✅`) and individually switchable (`--no-time-awareness`, …)
 * Bubblewrap-sandboxed tool execution for untrusted replay workloads
 * `rtk` integration cuts shell tool output tokens by 60–90%
 
@@ -362,6 +363,20 @@ the same two halves via `async_toolkit.wait_interrupt_hook` (a predicate that
 cuts waits short) and `async_toolkit.drain_completions()` /
 `completion_notice()` (what to feed the model afterwards).
 
+### Multi-line input in the REPL
+
+Enter always submits — terminals send the same byte for Enter with
+Shift/Ctrl/Alt held, so those combos cannot be intercepted in a plain
+terminal REPL. Two supported ways to get a newline into a turn:
+
+- **Paste** multiline text: consecutive lines are coalesced into one turn
+  (the reader drains until stdin is briefly idle).
+- **Backslash continuation**, shell-style: end the line with `\` and keep
+  typing; the backslash is replaced by a newline when the turn is submitted.
+
+The banner reminds you of both (`Enter submits. Newline: paste … or end a
+line with '\' to continue`).
+
 Two consecutive `nohup_query` calls for the same still-running
 `tool_exec_id` get a response pointing at
 `nohup_wait(tool_exec_id, howmuch, unit)`, which returns as soon as the
@@ -492,6 +507,8 @@ generic `on_event` handler.
 | `cache_cold` | Resumed turn missed the (expired) prefix cache | `age`, `fmt` |
 | `journal_recovered` | A resumed session was rebuilt from the durable journal | `entries_replayed`, `messages_loaded`, `pending`, `mid_turn`, `fmt` |
 | `rate_limit_wait` | Before sleeping through a retryable HTTP 429 | `delay`, `resume_at`, `fmt` |
+| `awareness_checklist` | Startup situational-awareness report, one line per sense | `status`, `fmt` |
+| `ground_moved` | The repository moved between turns; note injected into the next turn | `git_changed`, `files`, `fmt` |
 
 Every event data dict includes a `"fmt"` key containing a pre-formatted ANSI
 string suitable for direct printing to a terminal — this is what the default

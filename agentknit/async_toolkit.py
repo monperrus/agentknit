@@ -623,20 +623,20 @@ def t_query_exec(tool_exec_id: str) -> tuple[str, dict[str, object]]:
 
 # ── nohup / nohup_query / nohup_wait ───────────────────────────────────────────────────────
 
-def t_nohup(command: str, timeout: float = NOHUP_TIMEOUT_MIN, timeout_unit: str = "m",
+def t_nohup(command: str, timeout: float = NOHUP_TIMEOUT_MIN, unit: str = "m",
             wait_before_s: float = 0) -> tuple[str, dict[str, object]]:
     """Bound the command with timeout(1) then hand off to t_execute_async.
 
-    *timeout* is expressed in *timeout_unit* (``s``/``m``/``h``/``d``, same
+    *timeout* is expressed in *unit* (``s``/``m``/``h``/``d``/``w``, same
     units as :func:`t_nohup_wait`); the default bound is
     ``NOHUP_TIMEOUT_MIN`` minutes for backward compatibility.  A
     ``wait_before_s`` delay elapses *before* the command starts and is not
     counted against the bound, which begins when the command runs.
     """
-    factor = WAIT_FOR_UNIT_SECONDS.get(timeout_unit)
+    factor = WAIT_FOR_UNIT_SECONDS.get(unit)
     if factor is None:
         expected = "/".join(sorted(WAIT_FOR_UNIT_SECONDS))
-        r = json.dumps({"error": f"unknown timeout_unit {timeout_unit!r}, expected one of {expected}"})
+        r = json.dumps({"error": f"unknown unit {unit!r}, expected one of {expected}"})
         return r, {"result": r}
     seconds = float(timeout) * factor
     if seconds <= 0:
@@ -652,13 +652,15 @@ def t_nohup(command: str, timeout: float = NOHUP_TIMEOUT_MIN, timeout_unit: str 
                            wait_before_s=wait_before_s)
 
 
-# Units understood by t_nohup_wait.  Wait durations are computed as
-# howmuch * WAIT_FOR_UNIT_SECONDS[unit]; unknown units are rejected.
+# Units understood by t_nohup_wait (wait budget) and t_nohup (timeout
+# bound).  Durations are computed as howmuch/timeout *
+# WAIT_FOR_UNIT_SECONDS[unit]; unknown units are rejected.
 WAIT_FOR_UNIT_SECONDS = {
     "s": 1,
     "m": 60,
     "h": 3600,
     "d": 86400,
+    "w": 604800,
 }
 # Cap so a typo in howmuch cannot block the tool thread for hours on end.
 WAIT_FOR_MAX_SECONDS = 3600
@@ -686,7 +688,8 @@ def t_nohup_wait(tool_exec_id: str, howmuch: int | None = None, unit: str = "s")
     runs, and the execution's completion is delivered later (see
     :func:`drain_completions`).
 
-    Supported units: ``s`` seconds, ``m`` minutes, ``h`` hours, ``d`` days.
+    Supported units: ``s`` seconds, ``m`` minutes, ``h`` hours, ``d`` days,
+    ``w`` weeks (waits above :data:`WAIT_FOR_MAX_SECONDS` are rejected).
     """
     # Validate the (optional) wait budget before touching the exec id.
     seconds: float | None = None
@@ -799,7 +802,7 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                     "tool_exec_id, the process id (pid), and local file paths for "
                     "stdin (FIFO), stdout, and stderr. Write to stdin_localfile "
                     "to send input to the running process. Execution is bounded: "
-                    "the command is killed after `timeout` × `timeout_unit` "
+                    "the command is killed after `timeout` × `unit` "
                     f"(default {timeout_min}m). "
                     f"If the command finishes within {int(ASYNC_FAST_THRESHOLD_S * 1000)} ms "
                     f"and both outputs are under {ASYNC_INLINE_MAX_BYTES} bytes, "
@@ -816,18 +819,19 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                             "type": "number",
                             "description": (
                                 "Maximum time the command may run before being "
-                                "killed, expressed in timeout_unit (default "
+                                "killed, expressed in unit (default "
                                 f"{timeout_min}). Counts from the moment the "
                                 "command starts, not from wait_before_s."
                             ),
                         },
-                        "timeout_unit": {
+                        "unit": {
                             "type": "string",
                             "enum": sorted(WAIT_FOR_UNIT_SECONDS),
                             "description": (
                                 "Time unit for timeout: s=seconds, m=minutes, "
-                                "h=hours, d=days. Mandatory whenever timeout is "
-                                "passed, so the bound is never ambiguous."
+                                "h=hours, d=days, w=weeks. Mandatory whenever "
+                                "timeout is passed, so the bound is never "
+                                "ambiguous."
                             ),
                         },
                         "wait_before_s": {
@@ -903,7 +907,7 @@ def nohup_tool_specs(timeout_min: int = NOHUP_TIMEOUT_MIN) -> list[dict[str, Any
                             "enum": sorted(WAIT_FOR_UNIT_SECONDS),
                             "description": (
                                 "Time unit for howmuch: s=seconds, m=minutes, h=hours, "
-                                f"d=days. Waits above {WAIT_FOR_MAX_SECONDS}s are rejected; "
+                                f"d=days, w=weeks. Waits above {WAIT_FOR_MAX_SECONDS}s are rejected; "
                                 "split long waits into several calls."
                             ),
                         },

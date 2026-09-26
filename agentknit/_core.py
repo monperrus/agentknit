@@ -1678,16 +1678,21 @@ def _total_ram_gib(meminfo: "Path | None" = None) -> "float | None":
 
 
 def environment_context(model: str, version: "str | None" = None,
-                        enabled: "dict[str, bool] | None" = None) -> str:
+                        enabled: "dict[str, bool] | None" = None,
+                        session_id: "str | None" = None,
+                        session_file: "str | Path | None" = None) -> str:
     """Build the environment-awareness block appended to the system prompt.
 
     Covers (per issue #31): user identity, git status, working directory,
     OS/architecture, CPU/RAM, current date & timezone, scratchpad dir,
-    model identity.
+    model identity, session identity.
 
     *enabled* is the session's awareness flag map; the ``user``, ``system``
     and ``git`` types gate the corresponding lines.  ``None`` means all on
     (backward-compatible signature for direct callers).
+
+    *session_id* / *session_file* add the session identity line (id and
+    transcript path) under the ``system`` gate; omitted when ``None``.
     """
     import getpass
     import platform
@@ -1740,6 +1745,13 @@ def environment_context(model: str, version: "str | None" = None,
         if version:
             model_line += f" (version {version})"
         lines.append(model_line)
+
+        # Session identity: id and transcript path of this very session.
+        if session_id:
+            session_line = f"Session: {session_id}"
+            if session_file:
+                session_line += f" (transcript: {session_file})"
+            lines.append(session_line)
 
         # Harness identity: local import avoids a circular import with __init__.
         from . import __version__ as _harness_version
@@ -3211,9 +3223,13 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     if agents_md.exists():
         sys_msg += "\n\n" + agents_md.read_text()
 
-    # Environment awareness: user identity, git status, cwd, OS, date, scratchpad.
+    # Environment awareness: user identity, git status, cwd, OS, date,
+    # scratchpad — plus this session's id and transcript path.
+    session_id = resumed_from if resumed_from else uuid.uuid4().hex[:12]
+    log_path = _open_log(model, session_id, session_dir)
     sys_msg += "\n\n" + environment_context(
-        model, schema.get("version"),
+        model, schema.get("version"), session_id=session_id,
+        session_file=log_path,
         enabled={"user": user_enabled, "system": system_enabled, "git": git_enabled})
 
     # Token awareness: resolve the four knobs (explicit kwarg → schema →
@@ -3256,7 +3272,6 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     if change_enabled:
         sys_msg += "\n\n" + _CHANGE_AWARENESS_SYSTEM
 
-    session_id = resumed_from if resumed_from else uuid.uuid4().hex[:12]
     streaming = bool(
         (schema.get("provider_api_support") or {})
         .get("streaming", {})
@@ -3315,7 +3330,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                            else {k: schema[k] for k in ("auth", "key_env")
                                  if schema.get(k) is not None}),
         "session_dir":     Path(session_dir) if session_dir is not None else None,
-        "log_path":        _open_log(model, session_id, session_dir),
+        "log_path":        log_path,
         "non_interactive": non_interactive,
         "usage_totals":    {"prompt": 0, "completion": 0, "total": 0,
                             "cached": 0, "cache_write": 0},

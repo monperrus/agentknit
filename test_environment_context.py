@@ -32,6 +32,20 @@ def test_system_prompt_contains_environment_block() -> None:
     assert "Model: test-model" in msg
 
 
+def test_session_identity_in_environment_block() -> None:
+    """Session awareness: id + transcript path ride the system sense."""
+    session = init_session(_MINIMAL_SCHEMA)
+    msg = session["messages"][0]["content"]
+    assert f"Session: {session['session_id']}" in msg
+    assert f"(transcript: {session['log_path']})" in msg
+
+
+def test_session_identity_gated_by_system_awareness() -> None:
+    session = init_session(_MINIMAL_SCHEMA, system_awareness_enabled=False)
+    msg = session["messages"][0]["content"]
+    assert "Session:" not in msg
+
+
 def test_user_identity_present() -> None:
     msg = _sys_msg(_MINIMAL_SCHEMA)
     assert f"unix user: {getpass.getuser()}" in msg

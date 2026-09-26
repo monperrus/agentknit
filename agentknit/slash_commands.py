@@ -415,12 +415,27 @@ def _handle_tool(session: Session, client: Any, model: str, args: str) -> None:
             for n in sorted(inactive):
                 print(f"  {RED}✗{RESET} {n}   {DIM}/tool activate {n}{RESET}")
         # TOOL_LIBRARY functions not yet advertised: candidates for activate.
-        from .tool_library import _ASK_USER_FNS
+        # Superseded shims (SUPERSEDED_TOOLS) are skipped — their canonical
+        # replacement is the real candidate — and so is plumbing already
+        # dispatched under another name (t_execute_async/t_query_exec behind
+        # an active nohup trio): listing them would be pure duplication.
+        from .tool_library import _ASK_USER_FNS, SUPERSEDED_TOOLS
         lib = _library_tool_specs()
         by_fn = {str(s.get("_function_name")): s for s in lib.values()}
         known = set(active) | set(inactive)
+        dispatched = {str(e.get("python_function"))
+                      for e in (session.get("tool_dispatch") or {}).values()}
         candidates: list[str] = []
-        for fn_name, fn in TOOL_LIBRARY.items():
+        for fn_name in TOOL_LIBRARY:
+            if fn_name in SUPERSEDED_TOOLS:
+                continue
+            if fn_name in dispatched:
+                continue
+            # Low-level plumbing hidden once its model-facing wrapper is
+            # dispatched: nohup is timeout-bounded t_execute_async, so
+            # advertising both is duplication.
+            if fn_name == "t_execute_async" and "t_nohup" in dispatched:
+                continue
             if session.get("non_interactive") and fn_name in _ASK_USER_FNS:
                 continue
             model_name = str((by_fn.get(fn_name) or {}).get("name")

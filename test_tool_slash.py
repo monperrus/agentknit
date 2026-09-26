@@ -125,6 +125,37 @@ def test_list_hides_ask_user_tools_in_non_interactive(capsys):
     assert "ask_user" not in out
 
 
+def test_list_hides_superseded_library_shims(capsys):
+    """t_update_file & co are kept callable but are not activate candidates."""
+    s = _session(Path("/tmp"))
+    REGISTRY.dispatch("/tool list", s, client=None, model="m")
+    out = capsys.readouterr().out
+    for shim in ("update_file", "list_directory", "find_files"):
+        assert shim not in out
+    # search_files IS a candidate: it maps to t_search, not the t_search_files shim
+    assert "search_files" in out
+
+
+def test_list_hides_plumbing_dispatched_under_another_name(capsys):
+    """t_execute_async/t_query_exec back the active nohup trio: not candidates."""
+    from agentknit.async_toolkit import enable_nohup
+
+    spec = {
+        "model": "m", "endpoint": "http://x",
+        "tool_specs": _core._DEFAULT_TOOL_SCHEMA,
+        "tool_dispatch": dict(_core._DEFAULT_TOOL_DISPATCH),
+        "behaviour": {"call_delivery_mode": "structured_tool_calls"},
+    }
+    enable_nohup(spec)
+    s = agentknit.init_session(spec, non_interactive=True)
+    s["log_path"] = Path("/tmp/log.jsonl")
+    REGISTRY.dispatch("/tool list", s, client=None, model="m")
+    out = capsys.readouterr().out
+    assert "nohup_query" in out          # active, advertised
+    assert "query_exec" not in out       # its implementation fn, hidden
+    assert "execute_async" not in out
+
+
 def test_unknown_subcommand(capsys):
     s = _session(Path("/tmp"))
     REGISTRY.dispatch("/tool frobnicate x", s, client=None, model="m")

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-import requests
+import httpx
 
 from agentknit._core import _run_turn
 from agentknit.exceptions import RateLimitError
@@ -51,15 +51,15 @@ def _session(tmp_path, endpoint: str = "https://api.example.test/v1") -> tuple[d
 
 
 def test_http_error_event_and_log_include_structured_fields(tmp_path) -> None:
-    response = requests.Response()
-    response.status_code = 500
-    exc = requests.HTTPError("server error", response=response)
+    request = httpx.Request("POST", "https://api.example.test/v1")
+    response = httpx.Response(500, request=request)
+    exc = httpx.HTTPStatusError("server error", request=request, response=response)
     session, events = _session(tmp_path)
 
     _run_turn(_FailingClient(exc), "model", session, "hello")
 
     event = next(data for event_type, data in events if event_type == "error")
-    assert event["error_class"] == "HTTPError"
+    assert event["error_class"] == "HTTPStatusError"
     assert event["http_status"] == 500
     assert event["adapter"] == "http"
     assert isinstance(event["elapsed_s"], float)
@@ -67,7 +67,7 @@ def test_http_error_event_and_log_include_structured_fields(tmp_path) -> None:
 
     record = json.loads(session["log_path"].read_text().splitlines()[-1])
     assert {key: record[key] for key in ("error_class", "http_status", "adapter")} == {
-        "error_class": "HTTPError", "http_status": 500, "adapter": "http",
+        "error_class": "HTTPStatusError", "http_status": 500, "adapter": "http",
     }
     assert record["elapsed_s"] == event["elapsed_s"]
 

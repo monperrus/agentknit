@@ -14,7 +14,7 @@ import datetime
 from unittest.mock import patch
 
 import pytest
-import requests
+import httpx
 
 from agentknit.exceptions import RateLimitError
 from agentknit.openai_compat import OpenAI, _kimi_quota_reset_delay
@@ -48,7 +48,8 @@ class _FakeResponse:
         self._json = json_data or {}
         self.text = text
         self.url = url
-        self.reason = reason
+        self.reason_phrase = reason
+        self.request = None
 
     def json(self):
         return self._json
@@ -62,8 +63,8 @@ def _client(base_url: str = _KIMI_BASE) -> OpenAI:
 
 def test_kimi_delay_reads_exhausted_window_reset():
     resp = _FakeResponse(200, json_data=_usages("0", reset_in=600))
-    with patch("agentknit.openai_compat.requests.get", return_value=resp):
-        delay = _kimi_quota_reset_delay(_KIMI_BASE, {})
+    with patch("agentknit.openai_compat.httpx.Client.get", return_value=resp):
+        delay = _kimi_quota_reset_delay(httpx.Client(), _KIMI_BASE, {})
     assert delay is not None and 570 <= delay <= 600
 
 
@@ -71,26 +72,26 @@ def test_kimi_delay_none_when_no_window_is_exhausted():
     # Quota left but still a 403 — the refusal is about permissions, not
     # the window, so waiting would be pointless.
     resp = _FakeResponse(200, json_data=_usages("42"))
-    with patch("agentknit.openai_compat.requests.get", return_value=resp):
-        assert _kimi_quota_reset_delay(_KIMI_BASE, {}) is None
+    with patch("agentknit.openai_compat.httpx.Client.get", return_value=resp):
+        assert _kimi_quota_reset_delay(httpx.Client(), _KIMI_BASE, {}) is None
 
 
 def test_kimi_delay_none_when_usages_endpoint_fails():
-    with patch("agentknit.openai_compat.requests.get",
-               side_effect=requests.exceptions.ConnectionError("boom")):
-        assert _kimi_quota_reset_delay(_KIMI_BASE, {}) is None
+    with patch("agentknit.openai_compat.httpx.Client.get",
+               side_effect=httpx.ConnectError("boom")):
+        assert _kimi_quota_reset_delay(httpx.Client(), _KIMI_BASE, {}) is None
 
 
 def test_kimi_delay_none_when_reset_is_implausibly_far():
     resp = _FakeResponse(200, json_data=_usages("0", reset_in=7 * 86400))
-    with patch("agentknit.openai_compat.requests.get", return_value=resp):
-        assert _kimi_quota_reset_delay(_KIMI_BASE, {}) is None
+    with patch("agentknit.openai_compat.httpx.Client.get", return_value=resp):
+        assert _kimi_quota_reset_delay(httpx.Client(), _KIMI_BASE, {}) is None
 
 
 def test_kimi_delay_zero_when_window_already_reset():
     resp = _FakeResponse(200, json_data=_usages("0", reset_in=-30))
-    with patch("agentknit.openai_compat.requests.get", return_value=resp):
-        assert _kimi_quota_reset_delay(_KIMI_BASE, {}) == 0.0
+    with patch("agentknit.openai_compat.httpx.Client.get", return_value=resp):
+        assert _kimi_quota_reset_delay(httpx.Client(), _KIMI_BASE, {}) == 0.0
 
 
 # ── _retry_post ──────────────────────────────────────────────────────────────
@@ -102,8 +103,8 @@ def test_403_quota_waits_for_the_window_then_succeeds():
     posts = [resp_403, resp_ok]
     seen = []
 
-    with patch("agentknit.openai_compat.requests.post", side_effect=lambda *a, **k: posts.pop(0)):
-        with patch("agentknit.openai_compat.requests.get",
+    with patch("agentknit.openai_compat.httpx.Client.send", side_effect=lambda *a, **k: posts.pop(0)):
+        with patch("agentknit.openai_compat.httpx.Client.get",
                    return_value=_FakeResponse(200, json_data=_usages("0", reset_in=120))):
             with patch("agentknit.openai_compat.time.sleep") as sleep:
                 resp = client.chat.completions._retry_post(
@@ -118,8 +119,8 @@ def test_403_quota_gives_up_after_the_retry_cap():
     client = _client()
     resp_403 = _FakeResponse(403, text='{"error":{"message":"quota exceeded"}}')
 
-    with patch("agentknit.openai_compat.requests.post", return_value=resp_403):
-        with patch("agentknit.openai_compat.requests.get",
+    with patch("agentknit.openai_compat.httpx.Client.send", return_value=resp_403):
+        with patch("agentknit.openai_compat.httpx.Client.get",
                    return_value=_FakeResponse(200, json_data=_usages("0", reset_in=60))):
             with patch("agentknit.openai_compat.time.sleep") as sleep:
                 with pytest.raises(RateLimitError) as caught:
@@ -134,7 +135,7 @@ def test_403_with_retry_after_header_is_waited_through_on_any_host():
     client = _client("https://example.test/v1")
     posts = [_FakeResponse(403, {"retry-after": "1"}), _FakeResponse(200, json_data={})]
 
-    with patch("agentknit.openai_compat.requests.post", side_effect=lambda *a, **k: posts.pop(0)):
+    with patch("agentknit.openai_compat.httpx.Client.send", side_effect=lambda *a, **k: posts.pop(0)):
         with patch("agentknit.openai_compat.time.sleep") as sleep:
             resp = client.chat.completions._retry_post("https://x", {}, {})
 
@@ -148,10 +149,10 @@ def test_403_permission_denied_raises_http_error_with_body():
     client = _client()
     resp_403 = _FakeResponse(403, text='{"error":{"message":"invalid api key"}}')
 
-    with patch("agentknit.openai_compat.requests.post", return_value=resp_403):
-        with patch("agentknit.openai_compat.requests.get",
+    with patch("agentknit.openai_compat.httpx.Client.send", return_value=resp_403):
+        with patch("agentknit.openai_compat.httpx.Client.get",
                    return_value=_FakeResponse(200, json_data=_usages("42"))):
-            with pytest.raises(requests.exceptions.HTTPError) as caught:
+            with pytest.raises(httpx.HTTPStatusError) as caught:
                 client.chat.completions._retry_post("https://x", {}, {})
 
     assert "invalid api key" in str(caught.value)
@@ -162,9 +163,9 @@ def test_403_on_non_kimi_host_never_queries_usages():
     client = _client("https://example.test/v1")
     resp_403 = _FakeResponse(403, text="nope")
 
-    with patch("agentknit.openai_compat.requests.post", return_value=resp_403):
-        with patch("agentknit.openai_compat.requests.get") as get:
-            with pytest.raises(requests.exceptions.HTTPError):
+    with patch("agentknit.openai_compat.httpx.Client.send", return_value=resp_403):
+        with patch("agentknit.openai_compat.httpx.Client.get") as get:
+            with pytest.raises(httpx.HTTPStatusError):
                 client.chat.completions._retry_post("https://x", {}, {})
 
     assert not get.called
@@ -174,8 +175,8 @@ def test_other_error_statuses_carry_the_body_too():
     client = _client("https://example.test/v1")
     resp_400 = _FakeResponse(400, text="context length exceeded", reason="Bad Request")
 
-    with patch("agentknit.openai_compat.requests.post", return_value=resp_400):
-        with pytest.raises(requests.exceptions.HTTPError) as caught:
+    with patch("agentknit.openai_compat.httpx.Client.send", return_value=resp_400):
+        with pytest.raises(httpx.HTTPStatusError) as caught:
             client.chat.completions.create(model="m", messages=[])
 
     assert "context length exceeded" in str(caught.value)

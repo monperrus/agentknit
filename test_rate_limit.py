@@ -13,8 +13,8 @@ from __future__ import annotations
 import datetime
 from unittest.mock import patch
 
+import httpx
 import pytest
-import requests
 
 from agentknit._core import _rate_limit_wait_callback
 from agentknit.exceptions import RateLimitError
@@ -124,13 +124,15 @@ class _FakeResponse:
         self.ok = status_code < 400
         self._json = json_data or {}
         self.text = text
+        self.request = None
 
     def json(self):
         return self._json
 
     def raise_for_status(self):
         if not self.ok:
-            raise requests.exceptions.HTTPError(f"{self.status_code} error")
+            raise httpx.HTTPStatusError(f"{self.status_code} error",
+                                        request=None, response=self)
 
 
 def _client(base_url: str = "https://example.test/v1") -> OpenAI:
@@ -140,7 +142,7 @@ def _client(base_url: str = "https://example.test/v1") -> OpenAI:
 def test_retry_post_raises_rate_limit_error_without_header():
     client = _client()
     resp_429 = _FakeResponse(429, {})
-    with patch("agentknit.openai_compat.requests.post", return_value=resp_429):
+    with patch("agentknit.openai_compat.httpx.Client.send", return_value=resp_429):
         with pytest.raises(RateLimitError):
             client.chat.completions._retry_post("https://x", {}, {})
 
@@ -154,7 +156,7 @@ def test_retry_post_retries_then_succeeds_with_header():
     def _fake_post(*args, **kwargs):
         return calls.pop(0)
 
-    with patch("agentknit.openai_compat.requests.post", side_effect=_fake_post):
+    with patch("agentknit.openai_compat.httpx.Client.send", side_effect=_fake_post):
         with patch("agentknit.openai_compat.time.sleep"):
             resp = client.chat.completions._retry_post("https://x", {}, {})
     assert resp is resp_ok
@@ -163,9 +165,9 @@ def test_retry_post_retries_then_succeeds_with_header():
 def test_retry_post_retries_read_timeouts_with_exponential_backoff():
     client = _client()
     resp_ok = _FakeResponse(200, {}, {"choices": []})
-    calls = [requests.exceptions.ReadTimeout("read timed out")] * 5 + [resp_ok]
+    calls = [httpx.ReadTimeout("read timed out")] * 5 + [resp_ok]
 
-    with patch("agentknit.openai_compat.requests.post", side_effect=calls):
+    with patch("agentknit.openai_compat.httpx.Client.send", side_effect=calls):
         with patch("agentknit.openai_compat.time.sleep") as sleep:
             resp = client.chat.completions._retry_post("https://x", {}, {})
 
@@ -175,11 +177,11 @@ def test_retry_post_retries_read_timeouts_with_exponential_backoff():
 
 def test_retry_post_reraises_after_five_read_timeout_retries():
     client = _client()
-    timeout = requests.exceptions.ReadTimeout("read timed out")
+    timeout = httpx.ReadTimeout("read timed out")
 
-    with patch("agentknit.openai_compat.requests.post", side_effect=[timeout] * 6):
+    with patch("agentknit.openai_compat.httpx.Client.send", side_effect=[timeout] * 6):
         with patch("agentknit.openai_compat.time.sleep") as sleep:
-            with pytest.raises(requests.exceptions.ReadTimeout):
+            with pytest.raises(httpx.ReadTimeout):
                 client.chat.completions._retry_post("https://x", {}, {})
 
     assert [call.args[0] for call in sleep.call_args_list] == [60, 120, 240, 480, 960]
@@ -194,7 +196,7 @@ def test_retry_post_parses_z_ai_body_and_retries():
     def _fake_post(*args, **kwargs):
         return calls.pop(0)
 
-    with patch("agentknit.openai_compat.requests.post", side_effect=_fake_post):
+    with patch("agentknit.openai_compat.httpx.Client.send", side_effect=_fake_post):
         with patch("agentknit.openai_compat.time.sleep") as sleep:
             resp = client.chat.completions._retry_post("https://x", {}, {})
     assert resp is resp_ok
@@ -206,7 +208,7 @@ def test_retry_post_ignores_body_on_non_zai_hosts():
     # must still raise instead of being scraped for timestamps.
     client = _client()
     resp_429 = _FakeResponse(429, {}, text=_ZAI_BODY + _reset_at_in(60) + '"}}')
-    with patch("agentknit.openai_compat.requests.post", return_value=resp_429):
+    with patch("agentknit.openai_compat.httpx.Client.send", return_value=resp_429):
         with pytest.raises(RateLimitError):
             client.chat.completions._retry_post("https://x", {}, {})
 
@@ -219,7 +221,7 @@ def test_z_ai_non_retryable_rate_limit_preserves_business_error_details():
             'overloaded, please try again later"}}'
         ),
     )
-    with patch("agentknit.openai_compat.requests.post", return_value=resp_429):
+    with patch("agentknit.openai_compat.httpx.Client.send", return_value=resp_429):
         with pytest.raises(RateLimitError) as caught:
             client.chat.completions._retry_post("https://x", {}, {})
 
@@ -230,7 +232,7 @@ def test_z_ai_non_retryable_rate_limit_preserves_business_error_details():
 def test_create_raises_rate_limit_error_without_header():
     client = _client()
     resp_429 = _FakeResponse(429, {})
-    with patch("agentknit.openai_compat.requests.post", return_value=resp_429):
+    with patch("agentknit.openai_compat.httpx.Client.send", return_value=resp_429):
         with pytest.raises(RateLimitError):
             client.chat.completions.create(model="m", messages=[])
 
@@ -245,7 +247,7 @@ def test_retry_post_calls_on_rate_limit_wait_before_sleeping():
     def _fake_post(*args, **kwargs):
         return calls.pop(0)
 
-    with patch("agentknit.openai_compat.requests.post", side_effect=_fake_post):
+    with patch("agentknit.openai_compat.httpx.Client.send", side_effect=_fake_post):
         with patch("agentknit.openai_compat.time.sleep") as sleep:
             resp = client.chat.completions._retry_post(
                 "https://x", {}, {}, on_rate_limit_wait=lambda *a: seen.append(a)
@@ -287,7 +289,7 @@ def test_retry_post_retries_502_with_exponential_backoff():
     resp_ok = _FakeResponse(200, {}, {"choices": []})
     calls = [_FakeResponse(502, {}, text="Bad Gateway")] * 5 + [resp_ok]
 
-    with patch("agentknit.openai_compat.requests.post", side_effect=calls):
+    with patch("agentknit.openai_compat.httpx.Client.send", side_effect=calls):
         with patch("agentknit.openai_compat.time.sleep") as sleep:
             resp = client.chat.completions._retry_post("https://x", {}, {})
 
@@ -299,10 +301,10 @@ def test_retry_post_gives_up_after_five_5xx_retries():
     client = _client()
     resp_502 = _FakeResponse(502, {}, text="Bad Gateway")
 
-    with patch("agentknit.openai_compat.requests.post",
+    with patch("agentknit.openai_compat.httpx.Client.send",
                return_value=resp_502) as post:
         with patch("agentknit.openai_compat.time.sleep") as sleep:
-            with pytest.raises(requests.exceptions.HTTPError):
+            with pytest.raises(httpx.HTTPStatusError):
                 client.chat.completions._retry_post("https://x", {}, {})
 
     assert post.call_count == 6  # initial attempt + 5 retries
@@ -318,7 +320,7 @@ def test_retry_post_honours_retry_after_header_on_5xx():
     def _fake_post(*args, **kwargs):
         return calls.pop(0)
 
-    with patch("agentknit.openai_compat.requests.post", side_effect=_fake_post):
+    with patch("agentknit.openai_compat.httpx.Client.send", side_effect=_fake_post):
         with patch("agentknit.openai_compat.time.sleep") as sleep:
             resp = client.chat.completions._retry_post("https://x", {}, {})
 
@@ -330,7 +332,7 @@ def test_retry_post_does_not_retry_other_client_errors():
     client = _client()
     resp_400 = _FakeResponse(400, {}, text="bad request")
 
-    with patch("agentknit.openai_compat.requests.post",
+    with patch("agentknit.openai_compat.httpx.Client.send",
                return_value=resp_400) as post:
         with patch("agentknit.openai_compat.time.sleep") as sleep:
             resp = client.chat.completions._retry_post("https://x", {}, {})

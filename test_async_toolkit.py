@@ -65,10 +65,10 @@ def test_t_nohup_bounds_with_timeout(monkeypatch) -> None:
     t_nohup("sleep 30", timeout=90, unit="s")
     t_nohup("sleep 30", wait_before_s=300)
     assert seen == [
-        ("timeout 600 sleep 30", 0),
-        ("timeout 180 sleep 30", 0),
-        ("timeout 90 sleep 30", 0),
-        ("timeout 600 sleep 30", 300),   # bound applies to the command, not the delay
+        ("timeout -k 30 600 sleep 30", 0),
+        ("timeout -k 30 180 sleep 30", 0),
+        ("timeout -k 30 90 sleep 30", 0),
+        ("timeout -k 30 600 sleep 30", 300),   # bound applies to the command, not the delay
     ]
 
 

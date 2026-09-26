@@ -104,6 +104,7 @@ import re
 import readline  # noqa: F401 — enables arrow keys / history in input()
 import select
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -149,6 +150,11 @@ from ._journal import (
 
 DEFAULT_ENDPOINT = "https://openrouter.ai/api/v1"
 DEFAULT_MAX_TOKENS = 3_000_000
+# Per-request bound on the OpenAI client (covers DNS + connect + read).
+# Without this, a request that never gets a response hangs the underlying
+# socket call forever — run_turn's cooperative `timeout=` only checks
+# between requests, so it cannot preempt one that is already in flight.
+DEFAULT_REQUEST_TIMEOUT_S = 300.0
 LOG_BASE = Path.home() / ".local" / "share" / "agent_probe"
 
 # Recovery note injected into the conversation when a resumed session's
@@ -407,12 +413,51 @@ def enable_osc8_hyperlinks() -> None:
 _in_turn: bool = False
 
 
+def _terminate_active_proc(grace_s: float = 2.0) -> None:
+    """Abort the in-flight subprocess (if any): SIGTERM now, SIGKILL after *grace_s*.
+
+    Sends SIGTERM to the process group immediately and returns without
+    blocking; a daemon thread escalates to SIGKILL if the process hasn't
+    exited within *grace_s*. Callable from any thread (a signal handler or a
+    :class:`CancelToken`), so cancellation never waits on the tool itself.
+    """
+    proc = _tool_module._active_proc
+    if proc is None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        return
+
+    def _escalate() -> None:
+        try:
+            proc.wait(timeout=grace_s)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    threading.Thread(target=_escalate, daemon=True).start()
+
+
 def _sigint_handler(sig: int, frame: object) -> None:
-    """SIGINT handler: kill the active subprocess and abort the turn.
+    """SIGINT handler: abort the active subprocess and the turn.
 
     When the agent is executing a tool (run_turn is active), immediately
-    SIGKILL the current subprocess (if any) then raise KeyboardInterrupt so
-    run_turn unwinds back to the REPL.  When idle at the prompt, do nothing.
+    SIGTERM the current subprocess (if any), escalating to SIGKILL after a
+    short grace period, then raise KeyboardInterrupt so run_turn unwinds back
+    to the REPL without waiting for the tool to finish. When idle at the
+    prompt, do nothing.
 
     Before aborting, Interrupt hooks fire (advisory, 1 s budget): they can
     record the interruption or clean up work a hook started, but cannot
@@ -428,15 +473,7 @@ def _sigint_handler(sig: int, frame: object) -> None:
                         .get("turn_id"))
         except Exception:
             pass
-    proc = _tool_module._active_proc
-    if proc is not None:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+    _terminate_active_proc()
     raise KeyboardInterrupt()
 
 
@@ -4309,9 +4346,11 @@ class CancelToken:
     """Cooperative cancellation handle for :func:`run_turn`.
 
     Call :meth:`cancel` from any thread (e.g. a TUI "stop" button) to request
-    that the current turn abort at its next iteration boundary.  The turn raises
-    ``KeyboardInterrupt`` when it sees the flag, which the REPL and TUI loops
-    both already handle.
+    that the current turn abort. Any subprocess the current tool call has in
+    flight is aborted immediately (SIGTERM, escalating to SIGKILL) rather than
+    being left to run to completion; the turn itself raises
+    ``KeyboardInterrupt`` at its next iteration boundary, which the REPL and
+    TUI loops both already handle.
 
     Example::
 
@@ -4331,6 +4370,7 @@ class CancelToken:
 
     def cancel(self) -> None:
         self._cancelled = True
+        _terminate_active_proc()
 
 
 class _InputCollector:
@@ -4901,6 +4941,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                     "ts": now_ts,
                 })
                 for tc in msg.tool_calls:
+                    _check_cancelled()
                     if tc.type == "custom":
                         # Custom tool call: the raw text input is dispatched
                         # as a single `input` kwarg — no JSON decoding.
@@ -5424,13 +5465,20 @@ def create_client(schema: "dict[str, Any]") -> "openai.OpenAI | SubprocessOpenAI
     If the schema contains a ``max_rpm`` key, it is passed to the OpenAI
     client constructor to enforce a client-side rate limit (e.g. 40 RPM
     for NVIDIA NIM free-tier endpoints).
+
+    Every request also gets a client-level ``timeout`` (``request_timeout``
+    in the schema, default :data:`DEFAULT_REQUEST_TIMEOUT_S`). Without it,
+    a request that never gets a response (a stale connection or hung DNS
+    lookup after suspend/resume, say) blocks ``client.chat.completions.create``
+    forever; ``run_turn``'s cooperative ``timeout=`` cannot preempt that
+    single in-flight call, so nothing ever bounds it.
     """
     schema = _normalize_schema(schema)
     endpoint    = schema.get("endpoint") or DEFAULT_ENDPOINT
     binary_path = _parse_run_uri(endpoint) or _parse_run_uri(schema.get("model", ""))
     auth        = schema.get("auth")
     max_rpm     = schema.get("max_rpm")
-    kwargs: dict[str, Any] = {}
+    kwargs: dict[str, Any] = {"timeout": schema.get("request_timeout", DEFAULT_REQUEST_TIMEOUT_S)}
     if max_rpm is not None:
         kwargs["max_rpm"] = max_rpm
     if binary_path is not None:

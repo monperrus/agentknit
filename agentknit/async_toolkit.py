@@ -648,7 +648,11 @@ def t_nohup(command: str, timeout: float = NOHUP_TIMEOUT_MIN, unit: str = "m",
     if wait_before_s > WAIT_BEFORE_MAX_SECONDS:
         r = json.dumps({"error": f"wait_before_s exceeds the {WAIT_BEFORE_MAX_SECONDS}s cap"})
         return r, {"result": r}
-    return t_execute_async(f"timeout {seconds:g} {command}",
+    # -k: SIGKILL 30s after the initial SIGTERM if the command is still
+    # around — a command whose own cleanup/cancellation hangs (e.g. stuck
+    # in a network call) would otherwise survive an unheeded SIGTERM
+    # forever, since plain `timeout` never escalates on its own.
+    return t_execute_async(f"timeout -k 30 {seconds:g} {command}",
                            wait_before_s=wait_before_s)
 
 

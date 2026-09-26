@@ -1,4 +1,4 @@
-"""Minimal OpenAI-compatible client backed by requests.
+"""Minimal OpenAI-compatible client backed by httpx (HTTP/2 enabled).
 
 Implements only the surface used by agent_probe.py:
   OpenAI(api_key, base_url)
@@ -25,7 +25,7 @@ import re
 import subprocess
 import time
 import urllib.parse
-import requests
+import httpx
 import threading
 import collections
 from typing import TYPE_CHECKING, Any
@@ -149,7 +149,8 @@ def _z_ai_error_details(text: str) -> tuple[str | None, str | None]:
             str(message) if message is not None else None)
 
 
-def _kimi_quota_reset_delay(base_url: str, headers: collections.abc.Mapping[str, str]
+def _kimi_quota_reset_delay(http: httpx.Client, base_url: str,
+                            headers: collections.abc.Mapping[str, str]
                             ) -> float | None:
     """Return seconds until the exhausted Kimi quota window resets, or None.
 
@@ -162,13 +163,13 @@ def _kimi_quota_reset_delay(base_url: str, headers: collections.abc.Mapping[str,
     """
     url = base_url.rstrip("/").split("?", 1)[0] + "/usages"
     try:
-        resp = requests.get(url, headers={k: v for k, v in headers.items()
-                                          if k.lower() != "content-type"},
-                            timeout=30)
-        if not resp.ok:
+        resp = http.get(url, headers={k: v for k, v in headers.items()
+                                      if k.lower() != "content-type"},
+                        timeout=30)
+        if resp.status_code >= 400:
             return None
         data = resp.json()
-    except (requests.RequestException, ValueError):
+    except (httpx.RequestError, ValueError):
         return None
 
     buckets = [entry.get("detail") or {} for entry in (data.get("limits") or [])]
@@ -207,7 +208,7 @@ def _parse_iso_utc(value: object) -> "_dt.datetime | None":
     return parsed.astimezone(_dt.timezone.utc)
 
 
-def _http_error(resp: requests.Response) -> requests.exceptions.HTTPError:
+def _http_error(resp: httpx.Response) -> httpx.HTTPStatusError:
     """An HTTPError carrying the provider's body, not just the status line.
 
     ``resp.raise_for_status()`` produces "403 Client Error: Forbidden for
@@ -220,12 +221,12 @@ def _http_error(resp: requests.Response) -> requests.exceptions.HTTPError:
         body = (resp.text or "").strip()
     except Exception:  # noqa: BLE001 — a consumed stream must not mask the error
         pass
-    reason = getattr(resp, "reason", None) or "Error"
+    reason = getattr(resp, "reason_phrase", None) or "Error"
     url = getattr(resp, "url", None) or ""
     message = f"{resp.status_code} {reason} for url: {url}"
     if body:
         message += f" — {body[:2000]}"
-    return requests.exceptions.HTTPError(message, response=resp)
+    return httpx.HTTPStatusError(message, request=resp.request, response=resp)
 
 
 def _retry_delay_seconds(headers: collections.abc.Mapping[str, str]) -> float | None:
@@ -373,7 +374,7 @@ class _Completions:
 
     def _retry_post(self, url: str, headers: dict[str, str], payload: dict[str, Any],
                     stream: bool = False, on_rate_limit_wait: "Callable[..., None] | None" = None,
-                    on_request_attempt: "Callable[[Any], None] | None" = None) -> requests.Response:
+                    on_request_attempt: "Callable[[Any], None] | None" = None) -> httpx.Response:
         read_timeout_retries = 0
         server_error_retries = 0
         quota_retries = 0
@@ -382,9 +383,10 @@ class _Completions:
             try:
                 if on_request_attempt is not None:
                     on_request_attempt({"payload": payload})
-                resp = requests.post(url, headers=headers, json=payload,
-                                     stream=stream, timeout=self._client._timeout)
-            except requests.exceptions.ReadTimeout:
+                request = self._client._http.build_request(
+                    "POST", url, headers=headers, json=payload)
+                resp = self._client._http.send(request, stream=stream)
+            except httpx.ReadTimeout:
                 if read_timeout_retries >= _MAX_READ_TIMEOUT_RETRIES:
                     raise
                 delay = _READ_TIMEOUT_INITIAL_DELAY_SECONDS * (2 ** read_timeout_retries)
@@ -447,7 +449,8 @@ class _Completions:
                 host = (self._client.base_url.host or "").lower()
                 delay = _retry_delay_seconds(resp.headers)
                 if delay is None and any(h in host for h in _KIMI_HOSTS):
-                    delay = _kimi_quota_reset_delay(self._client._base_url, headers)
+                    delay = _kimi_quota_reset_delay(self._client._http,
+                                                    self._client._base_url, headers)
                 if delay is not None and quota_retries < _MAX_QUOTA_RETRIES:
                     quota_retries += 1
                     self._sleep_until_reset(delay, on_rate_limit_wait,
@@ -511,7 +514,7 @@ class _Completions:
 
         resp = self._retry_post(url, headers, payload, on_rate_limit_wait=on_rate_limit_wait,
                                 on_request_attempt=on_request_attempt)
-        if not resp.ok:
+        if resp.status_code >= 400:
             print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
             raise _http_error(resp)
         data = resp.json()
@@ -537,11 +540,11 @@ class _Completions:
         resp = self._retry_post(url, headers, payload, stream=True,
                                 on_rate_limit_wait=on_rate_limit_wait,
                                 on_request_attempt=on_request_attempt)
-        if not resp.ok:
+        if resp.status_code >= 400:
             print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
             raise _http_error(resp)
 
-        with resp:
+        try:
             for raw_line in resp.iter_lines():
                 line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
                 if on_raw_response is not None:
@@ -602,6 +605,8 @@ class _Completions:
                             entry["function"]["name"] += fn["name"]
                         if fn.get("arguments"):
                             entry["function"]["arguments"] += fn["arguments"]
+        finally:
+            resp.close()
 
         tool_calls_list = [assembled_tool_calls[i]
                            for i in sorted(assembled_tool_calls)] or None
@@ -733,6 +738,12 @@ class OpenAI:
         self._auth_header = auth_header
         self._extra_headers = dict(extra_headers) if extra_headers else None
         self._timeout = timeout
+        # http2=True negotiates HTTP/2 with providers that offer it via ALPN
+        # (all four in-use endpoints do) and falls back to HTTP/1.1
+        # transparently with those that don't. One persistent client per
+        # instance also means repeated calls reuse the connection instead of
+        # paying a fresh TCP+TLS handshake each time.
+        self._http = httpx.Client(http2=True, timeout=timeout)
         self.base_url = _BaseURL(base_url)
         self.chat = _Chat(self)
         # Acquire a per-base-url rate limiter (default 40 RPM for NVIDIA NIM).

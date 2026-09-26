@@ -5291,6 +5291,49 @@ def _endpoint_is_openrouter(endpoint: str | None) -> bool:
     return "openrouter.ai" in host
 
 
+KEYRING_LOOKUP_TIMEOUT_S = 5.0
+
+
+def _keyring_get_password_with_timeout(
+    kr_module: Any, service: str, username: str, timeout: float = KEYRING_LOOKUP_TIMEOUT_S,
+) -> str | None:
+    """Call ``keyring.get_password`` with a bounded wait.
+
+    A locked or unresponsive SecretService/D-Bus backend (e.g. the login
+    keyring wasn't auto-unlocked, or no prompt agent is running to show its
+    unlock dialog) makes ``keyring.get_password`` block forever with no
+    exception and no visible prompt — and that block ignores Ctrl-C, so the
+    whole process becomes killable only with SIGKILL. Running the call on a
+    daemon thread and joining with a timeout turns that hang into a fast,
+    clear :class:`AuthenticationError` instead; the stuck thread is abandoned
+    (daemon=True keeps it from blocking interpreter exit).
+    """
+    result: dict[str, str | None] = {}
+    error: dict[str, Exception] = {}
+
+    def _lookup() -> None:
+        try:
+            result["value"] = kr_module.get_password(service, username)
+        except Exception as exc:  # noqa: BLE001 — surfaced via `error`, not raised here
+            error["value"] = exc
+
+    thread = threading.Thread(target=_lookup, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise AuthenticationError(
+            f"Keyring lookup for ({service}/{username}) did not respond within "
+            f"{timeout:g}s — the SecretService/D-Bus backend is likely locked "
+            "or has no unlock-prompt agent running. Unlock your keyring "
+            "(e.g. restart gnome-keyring-daemon and log back in) or set the "
+            f"key via the {username.upper().replace('-', '_')} environment "
+            "variable instead."
+        )
+    if "value" in error:
+        return None
+    return result.get("value")
+
+
 def _get_key_for_schema(schema: "dict[str, Any]") -> str:
     """Return the API key appropriate for this schema.
 
@@ -5319,10 +5362,7 @@ def _get_key_for_schema(schema: "dict[str, Any]") -> str:
         except Exception as e:  # optional dependency may be missing
             import_error = e
         else:
-            try:
-                val = _kr.get_password(ks, ku)
-            except Exception:
-                val = None
+            val = _keyring_get_password_with_timeout(_kr, ks, ku)
         if val:
             return val
         # Fall back to env var named by keyring_username uppercased

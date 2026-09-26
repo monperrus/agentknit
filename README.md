@@ -489,8 +489,8 @@ generic `on_event` handler.
 
 | Event type | When it fires | Data keys |
 |---|---|---|
-| `tool_call` | Before dispatching a tool | `name`, `args`, `fmt` |
-| `tool_result` | After receiving tool result | `name`, `result`, `streamed`, `files`, `diff_summary`, `fmt` |
+| `tool_call` | Before dispatching a tool | `name`, `args`, `ts`, `fmt` |
+| `tool_result` | After receiving tool result | `name`, `result`, `streamed`, `files`, `diff_summary`, `started_at`, `ended_at`, `duration_ms`, `fmt` |
 | `content_delta` | Streaming text chunk from the model | `text`, `first`, `no_newline`, `fmt` |
 | `reasoning_delta` | Streaming reasoning trace | `text`, `first`, `no_newline`, `fmt` |
 | `content_stream_end` | End of a streaming content sequence | `no_newline`, `fmt` |

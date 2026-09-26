@@ -1124,11 +1124,29 @@ def extract_inline_calls(text: str) -> list[tuple[str, dict[str, Any]]]:
 
 # ── prompts & display ─────────────────────────────────────────────────────────
 
-def fmt_call(name: str, args: dict[str, Any]) -> str:
+def _hhmm(ts: "str | None" = None) -> str:
+    """``HH:MM`` local time for an ISO timestamp, or for now when omitted."""
+    dt = None
+    if ts:
+        try:
+            dt = datetime.datetime.fromisoformat(ts)
+        except ValueError:
+            dt = None
+    if dt is None:
+        dt = datetime.datetime.now()
+    return dt.strftime("%H:%M")
+
+
+def fmt_call(name: str, args: dict[str, Any], ts: "str | None" = None) -> str:
+    """One-line rendering of a tool call, prefixed with its ``HH:MM`` time.
+
+    *ts* is the call's ISO timestamp; the current time when omitted (inline
+    mode and other callers without a recorded time).
+    """
     pretty = ", ".join(f"{k}={v!r}" for k, v in args.items())
     if len(pretty) > 400:
         pretty = pretty[:400] + "…"
-    return f"{CYAN}{BOLD}▶ {name}({pretty}){RESET}"
+    return f"{DIM}{_hhmm(ts)}{RESET} {CYAN}{BOLD}▶ {name}({pretty}){RESET}"
 
 def fmt_usage(usage: object, *, compaction_trigger: int | None = None,
               prompt_tokens_known: bool = True) -> str:
@@ -1861,7 +1879,8 @@ def print_session_history(session: Session) -> None:
                     if custom:
                         # Custom tool call: raw text input, no JSON args.
                         print(fmt_call(custom.get("name", "?"),
-                                       {"input": custom.get("input", "")}))
+                                       {"input": custom.get("input", "")},
+                                       msg.get("ts")))
                         continue
                     fn   = tc.get("function") or {}
                     name = fn.get("name", "?")
@@ -1871,7 +1890,7 @@ def print_session_history(session: Session) -> None:
                         args = {}
                     if not isinstance(args, dict):
                         args = {}
-                    print(fmt_call(name, args))
+                    print(fmt_call(name, args, msg.get("ts")))
             elif content:
                 if not structured:
                     calls = extract_inline_calls(content)
@@ -4134,7 +4153,9 @@ def _handle_tool_call(
             _write_journal_record(session, {"type": "tool_end", "call_id": call_id,
                                             "name": name, "result": result,
                                             "outcome": "hook_deny"})
-        _emit(session, "tool_call", name=name, args=args, fmt=fmt_call(name, args))
+        _emit(session, "tool_call", name=name, args=args,
+              ts=datetime.datetime.now().isoformat(timespec="seconds"),
+              fmt=fmt_call(name, args))
         _emit(session, "tool_result", name=name, result=result, streamed=False,
               files=None, diff_summary=None, fmt=fmt_result(result))
         _log(session, {"type": "tool_result", "name": name,
@@ -4173,10 +4194,12 @@ def _handle_tool_call(
 
     pf_name = getattr(entry.get("python_function"), "__name__",
                       entry.get("python_function"))
+    call_ts = datetime.datetime.now().isoformat(timespec="seconds")
     _log(session, {"type": "tool_call", "name": name,
                    "python_function": pf_name, "args": args,
-                   "ts": datetime.datetime.now().isoformat(timespec="seconds")})
-    _emit(session, "tool_call", name=name, args=args, fmt=fmt_call(name, args))
+                   "ts": call_ts})
+    _emit(session, "tool_call", name=name, args=args, ts=call_ts,
+          fmt=fmt_call(name, args, call_ts))
 
     _tool_module._tool_context.session_id = session.get("session_id")
     _tool_module._tool_context.tool_dispatch = tool_dispatch

@@ -383,7 +383,7 @@ class _Completions:
                 if on_request_attempt is not None:
                     on_request_attempt({"payload": payload})
                 resp = requests.post(url, headers=headers, json=payload,
-                                     stream=stream, timeout=300)
+                                     stream=stream, timeout=self._client._timeout)
             except requests.exceptions.ReadTimeout:
                 if read_timeout_retries >= _MAX_READ_TIMEOUT_RETRIES:
                     raise
@@ -726,11 +726,13 @@ class OpenAI:
             return cls._rate_limiters[base_url]
 
     def __init__(self, *, api_key: str, base_url: str, auth_header: str = "Authorization",
-                 max_rpm: int = 40, extra_headers: dict[str, str] | None = None) -> None:
+                 max_rpm: int = 40, extra_headers: dict[str, str] | None = None,
+                 timeout: float = 300.0) -> None:
         self._api_key = api_key
         self._base_url = base_url
         self._auth_header = auth_header
         self._extra_headers = dict(extra_headers) if extra_headers else None
+        self._timeout = timeout
         self.base_url = _BaseURL(base_url)
         self.chat = _Chat(self)
         # Acquire a per-base-url rate limiter (default 40 RPM for NVIDIA NIM).

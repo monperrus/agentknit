@@ -804,6 +804,52 @@ result = run_task(schema, task,
 A `journal_recovered` event is emitted whenever a resume rebuilt state from
 the journal.
 
+## Control Socket
+
+Pass `control_socket=True` (SDK) or `--control-socket` (CLI) to bind a
+unix-domain-socket control plane for the session, so another process can
+inject a message or check busy/idle status without tmux keystrokes or
+re-parsing the journal:
+
+```
+<session_dir>/control.sock                                          # session_dir given
+~/.local/share/agent_probe/<model>/<session_id>_control.sock         # otherwise
+```
+
+Wire format: newline-delimited JSON, one request per line, one reply per line.
+
+```python
+from agentknit import send_control_message
+
+send_control_message(socket_path, "say hello")
+# -> {"ok": True}
+```
+
+```json
+{"cmd": "send", "message": "say hello"}    -> {"ok": true}
+{"cmd": "status"}                          -> {"ok": true, "busy": false, "pending": 0, "session_id": "..."}
+```
+
+Anything else (bad JSON, unknown `cmd`) gets `{"ok": false, "error": "..."}`;
+the connection stays open. `busy`/`pending`/`status` are read from in-memory
+state — no file I/O.
+
+A sent message sits in an in-process FIFO inbox until something drains it
+with `poll_control_inbox(session)`. The interactive CLI REPL is the reference
+consumer: it polls before each prompt and runs a pending message as that
+turn's task, exactly as if typed. Nothing else drains the inbox
+automatically — a custom driver loop must poll it itself.
+
+Local only: a unix socket, `0600` permissions, no network exposure and no
+auth beyond filesystem ownership (mirrors `~/secrets/*`). Off by default —
+no thread, no discoverable socket unless you opt in.
+
+`control_socket_enabled`, `control_socket_path`, and the runtime-only
+`_control_inbox` / `_control_server` keys are `NotRequired` on `Session`: a
+snapshot saved before this feature lacks them, and restoring such a session
+just leaves the control socket disabled unless `control_socket=True` is
+passed again.
+
 ## Resuming sessions
 
 A session is resumed with ``--session <id>`` (CLI) or ``session_id=`` (SDK).

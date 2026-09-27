@@ -71,6 +71,13 @@ from ._core import (
     _maybe_compact,
     _is_context_window_error,
     _journal_path,
+    poll_control_inbox,
+)
+
+from ._control import (
+    ControlServer,
+    send_control_message,
+    _control_socket_path,
 )
 
 from ._journal import (
@@ -177,6 +184,8 @@ __all__ = [
     "compact_session", "_compact_session", "_maybe_compact",
     "_is_context_window_error",
     "_journal_path",
+    # control socket
+    "poll_control_inbox", "ControlServer", "send_control_message", "_control_socket_path",
     # durable recovery
     "DurableSink", "SessionJournal", "JournalState", "PendingToolCall", "KnownToolResult",
     "new_call_id", "replay_journal",

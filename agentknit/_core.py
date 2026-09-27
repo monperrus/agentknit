@@ -148,6 +148,7 @@ from ._journal import (
     new_call_id,
     replay_journal,
 )
+from ._control import ControlServer, _control_socket_path
 
 
 DEFAULT_ENDPOINT = "https://openrouter.ai/api/v1"
@@ -2998,6 +2999,15 @@ class Session(TypedDict):
     # runtime tool management (/tool remove → parked, /tool activate → restore)
     _removed_tools: NotRequired[dict[str, dict[str, Any]]]
     _removed_dispatch: NotRequired[dict[str, dict[str, Any]]]
+    # Control socket: opt-in unix-domain-socket inbox + status query for this
+    # session (see agentknit/_control.py).  NotRequired: absent on every
+    # session predating this feature, and never durable-captured — a fresh
+    # ControlServer is started on restore like step_reducer, not replayed.
+    control_socket_enabled: NotRequired[bool]
+    control_socket_path: NotRequired[Path]
+    _control_inbox: NotRequired["queue.Queue[str]"]
+    _control_server: NotRequired["ControlServer | None"]
+    _busy: NotRequired[bool]
 
 
 def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
@@ -3035,6 +3045,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                  hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
                  hooks_enabled: bool | None = None,
                  step_reducer: "StepReducer | None" = None,
+                 control_socket: bool = False,
                  ) -> "Session":
     """Build a stateful session dict (:class:`Session`).
 
@@ -3137,6 +3148,14 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     request (e.g. end on a ``user`` or ``tool`` message).  Use it for
     per-step context policies, such as replacing raw tool output by a
     bounded digest obtained with :func:`side_query`.  Default ``None``.
+
+    ``control_socket`` — when ``True``, bind a unix-domain-socket control
+    plane for this session (see :mod:`agentknit._control`) so another
+    process can inject a message into the session's inbox
+    (:func:`poll_control_inbox` drains it) or query busy/idle status,
+    without tmux keystrokes or re-parsing the journal.  Default ``False``
+    (no thread, no discoverable socket).  Runtime-only: never
+    durable-captured, absent on every session predating this feature.
     """
     # A resumed session must run (and re-save its snapshot) on the endpoint
     # it was created on — bind here so every caller is covered, including
@@ -3299,6 +3318,24 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         restored.setdefault("hooks_enabled", True)
         if step_reducer is not None:
             restored["step_reducer"] = step_reducer
+        # Control socket: runtime-only, like step_reducer above.  A passed-in
+        # *session* dict may still carry a live server (e.g. a caller
+        # rebuilding the client in place) — close it before deciding whether
+        # to start a fresh one, so restoring never leaks the old thread/socket.
+        _old_server = restored.get("_control_server")
+        if _old_server is not None:
+            _old_server.close()
+        if control_socket:
+            restored["_control_inbox"] = queue.Queue()
+            _ctrl_path = _control_socket_path(
+                model, restored.get("session_id") or "", restored.get("session_dir"))
+            restored["_control_server"] = ControlServer(_ctrl_path, restored)
+            restored["control_socket_enabled"] = True
+            restored["control_socket_path"] = _ctrl_path
+        else:
+            restored.pop("_control_server", None)
+            restored.pop("_control_inbox", None)
+            restored["control_socket_enabled"] = False
         # Reopen (or start) the session journal on restore.
         restored["_journal"] = (
             SessionJournal(_journal_path(restored.get("model") or "unknown",
@@ -3707,6 +3744,12 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                         ),
                         "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
                     })
+    if control_socket:
+        session["_control_inbox"] = queue.Queue()
+        control_path = _control_socket_path(model, session_id, session_dir)
+        session["_control_server"] = ControlServer(control_path, session)
+        session["control_socket_enabled"] = True
+        session["control_socket_path"] = control_path
     _awareness_checklist(session)
     return session
 
@@ -4658,6 +4701,7 @@ def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Sess
 
     global _in_turn
     _in_turn = True
+    session["_busy"] = True
     # Interrupt hooks need the live session; SIGINT may arrive mid-turn.
     _sigint_handler.session = session  # type: ignore[attr-defined]
     try:
@@ -4671,7 +4715,25 @@ def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Sess
         if timer is not None:
             timer.cancel()
         _in_turn = False
+        session["_busy"] = False
         _sigint_handler.session = None  # type: ignore[attr-defined]
+
+
+def poll_control_inbox(session: Session) -> str | None:
+    """Pop one pending message from *session*'s control-socket inbox, FIFO.
+
+    Returns ``None`` when the control socket is disabled
+    (``control_socket=False`` at :func:`init_session`) or the inbox is
+    empty.  A caller drives the model with it exactly as if it were typed
+    (see the REPL loop in :func:`run_repl`, the reference consumer).
+    """
+    inbox = session.get("_control_inbox")
+    if inbox is None:
+        return None
+    try:
+        return inbox.get_nowait()
+    except queue.Empty:
+        return None
 
 
 SIDE_QUERY_PREAMBLE = (
@@ -6079,6 +6141,7 @@ def _repl_setup(
     hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
     hooks_enabled: bool | None = None,
     step_reducer: "StepReducer | None" = None,
+    control_socket: bool = False,
 ) -> tuple[Any, ...]:
     """Common REPL setup: validate, create client, init session, return (client, session, model, hist_file)."""
     if session_id is not None and session_dir is None:
@@ -6107,6 +6170,7 @@ def _repl_setup(
         hooks=hooks,
         hooks_enabled=hooks_enabled,
         step_reducer=step_reducer,
+        control_socket=control_socket,
         token_awareness_enabled=token_awareness_enabled,
         time_awareness_enabled=time_awareness_enabled,
         time_awareness_tool_timestamps=time_awareness_tool_timestamps,
@@ -6126,6 +6190,9 @@ def _repl_setup(
 
     if session_id:
         print_session_history(session)
+
+    if session.get("control_socket_enabled"):
+        print(f"Control socket: {session['control_socket_path']}")
 
     import hashlib as _hashlib
     _hist_dir = Path.home() / ".local" / "share" / "agent_probe" / "repl_history"
@@ -6149,6 +6216,17 @@ def _fire_session_end(session: Session, reason: str) -> None:
         pass
 
 
+def _close_control_server(session: Session) -> None:
+    """Stop the control socket's accept loop and unlink its socket file.
+
+    A dead (or discarded) session must not leave a stale, still-bound path
+    a client could connect to; call on every normal-exit teardown path.
+    """
+    server = session.get("_control_server")
+    if server is not None:
+        server.close()
+
+
 def _repl_teardown(session: Session, hist_file: Path, resume_cmd: str) -> None:
     """Common REPL teardown: save history, snapshot, log."""
     try:
@@ -6159,6 +6237,7 @@ def _repl_teardown(session: Session, hist_file: Path, resume_cmd: str) -> None:
     _log(session, {"type": "session_end", "session_id": session["session_id"],
                    "reason": "repl_exit"})
     _fire_session_end(session, "prompt_input_exit")
+    _close_control_server(session)
     journal = session.get("_journal")
     if journal is not None:
         journal.close()
@@ -6359,6 +6438,7 @@ def run_repl(
     hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
     hooks_enabled: bool | None = None,
     step_reducer: "StepReducer | None" = None,
+    control_socket: bool = False,
 ) -> None:
     """Start an interactive REPL session against the agent (sync, no background thread).
 
@@ -6371,6 +6451,12 @@ def run_repl(
 
     This is the *sync* variant — no background reader thread, so tools that
     call ``input()`` (e.g. ``ask_user_question``) work without stdin races.
+
+    ``control_socket=True`` binds a unix-domain-socket control plane (see
+    :mod:`agentknit._control`): a message sent with :func:`send_control_message`
+    is drained via :func:`poll_control_inbox` before each prompt and run as
+    that turn's task, exactly as if typed — the reference consumer proving
+    the control socket end to end.
     """
     client, session, model, hist_file = _repl_setup(
         schema,
@@ -6396,6 +6482,7 @@ def run_repl(
         hooks=hooks,
         hooks_enabled=hooks_enabled,
         step_reducer=step_reducer,
+        control_socket=control_socket,
         token_awareness_enabled=token_awareness_enabled,
         time_awareness_enabled=time_awareness_enabled,
         time_awareness_tool_timestamps=time_awareness_tool_timestamps,
@@ -6410,6 +6497,11 @@ def run_repl(
     print(f"{BOLD}{display_name}{RESET}  (type 'exit' to quit; {NEWLINE_HINT})\n")
     try:
         while True:
+            pending = poll_control_inbox(session)
+            if pending is not None:
+                print(f"{DIM}[control] {pending}{RESET}")
+                _repl_loop_body(pending, client, session, model, use_async_input=False)
+                continue
             try:
                 t = read_repl_input(f"{RL_BOLD}>{RL_RESET} ",
                                     wake=_background_completions_pending)
@@ -6602,6 +6694,14 @@ def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
                    default=None,
                    help="Disable all lifecycle hooks for this session, whatever their "
                         "source.")
+    p.add_argument("--control-socket", action="store_true", dest="control_socket",
+                   default=False,
+                   help="Bind a unix-domain-socket control plane for this session "
+                        "(path printed at startup under the session's log directory, "
+                        "*_control.sock). Another process can inject a message with "
+                        "agentknit.send_control_message(path, 'text') — the interactive "
+                        "REPL drains it before each prompt, so a session can be driven "
+                        "without tmux keystrokes.")
     for _sense in AWARENESS_TYPES:
         p.add_argument(f"--no-{_sense}-awareness", action="store_false",
                        dest=f"{_sense}_awareness_enabled", default=None,
@@ -6660,6 +6760,7 @@ def main(argv: "list[str] | None" = None) -> None:
         durable                  = args.durable,
         hooks                    = args.hooks,
         hooks_enabled            = args.hooks_enabled,
+        control_socket           = args.control_socket,
         **{f"{_sense}_awareness_enabled":
            getattr(args, f"{_sense}_awareness_enabled")
            for _sense in AWARENESS_TYPES},
@@ -6672,6 +6773,8 @@ def main(argv: "list[str] | None" = None) -> None:
     print(f"{DIM}Model: {model}{mode_str}  |  "
           f"{len(tool_names)} tools: {', '.join(tool_names)}{RESET}\n")
     print(f"{DIM}Session: {session['session_id']}  |  log: {session['log_path']}{RESET}\n")
+    if session.get("control_socket_enabled"):
+        print(f"{DIM}Control socket: {session['control_socket_path']}{RESET}\n")
 
     if args.session:
         print_session_history(session)
@@ -6686,6 +6789,7 @@ def main(argv: "list[str] | None" = None) -> None:
             _log(session, {"type": "session_end", "session_id": session["session_id"],
                            "reason": "one_shot_task"})
             _fire_session_end(session, "other")
+            _close_control_server(session)
             print(f"\n{DIM}Resume: {resume_cmd}{RESET}")
         return
 
@@ -6699,10 +6803,18 @@ def main(argv: "list[str] | None" = None) -> None:
                 _log(session, {"type": "session_end", "session_id": session["session_id"],
                                "reason": "stdin_task"})
                 _fire_session_end(session, "other")
+                _close_control_server(session)
                 print(f"\n{DIM}Resume: {resume_cmd}{RESET}")
+        else:
+            _close_control_server(session)
         return
 
-    # Interactive REPL — reuse the already-created client + session.
+    # Interactive REPL builds its own client + session (possibly resuming a
+    # different session_id than the one just printed above), so the eager
+    # session created for the header is discarded here — close its control
+    # server first or its socket thread and bound file would leak for the
+    # life of the process.
+    _close_control_server(session)
     repl_opts = {k: v for k, v in opts.items() if k != "resumed_from"}
     repl_opts["session_id"] = opts.get("resumed_from")
     run_repl(schema, **repl_opts)

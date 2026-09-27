@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from datetime import datetime as _dt
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -398,7 +399,9 @@ def t_execute_async(command: str, wait_before_s: float = 0) -> tuple[str, dict[s
 
     now = time.monotonic()
     t0 = now + wait_before_s
-    started_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + wait_before_s))
+    # ISO 8601 with UTC offset: log times must be unambiguous about timezone.
+    started_at = (_dt.fromtimestamp(time.time() + wait_before_s)
+                  .astimezone().isoformat(timespec="seconds"))
 
     with _async_exec_lock:
         _async_executions[exec_id] = {

@@ -4286,7 +4286,7 @@ def _handle_tool_call(
                                    entry.get("python_function"), "__name__",
                                    entry.get("python_function")),
                                "result": result, "hook": "PreToolUse:ask-deny",
-                               "ts": datetime.datetime.now().isoformat(
+                               "ts": datetime.datetime.now().astimezone().isoformat(
                                    timespec="seconds")})
                 return result
         try:

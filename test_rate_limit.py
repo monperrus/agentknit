@@ -278,7 +278,7 @@ def test_rate_limit_wait_callback_emits_session_event():
     event_type, data = events[0]
     assert event_type == "rate_limit_wait"
     assert data["delay"] == 2.5
-    assert data["resume_at"] == resume_at.isoformat()
+    assert data["resume_at"] == resume_at.astimezone().isoformat()
     assert data["fmt"] == "  [rate-limited] waiting 2.5s …"
 
 

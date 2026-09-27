@@ -184,7 +184,7 @@ class SessionJournal:
         self._seq += 1
         rec = {
             "seq": self._seq,
-            "ts": _dt.now().isoformat(timespec="milliseconds"),
+            "ts": _dt.now().astimezone().isoformat(timespec="milliseconds"),
             **record,
         }
         with self.path.open("a", encoding="utf-8") as f:

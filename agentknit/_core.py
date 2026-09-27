@@ -550,7 +550,8 @@ def _emit(session: Session, event_type: str, **data: Any) -> None:
 def _rate_limit_wait_callback(session: Session) -> "Callable[[float, datetime.datetime, str], None]":
     """Build an ``on_rate_limit_wait`` callback that emits a ``rate_limit_wait`` event."""
     def _on_rate_limit_wait(delay: float, resume_at: datetime.datetime, fmt: str) -> None:
-        _emit(session, "rate_limit_wait", delay=delay, resume_at=resume_at.isoformat(), fmt=fmt)
+        _emit(session, "rate_limit_wait", delay=delay,
+              resume_at=resume_at.astimezone().isoformat(), fmt=fmt)
     return _on_rate_limit_wait
 
 
@@ -1214,7 +1215,10 @@ def _last_message_age_seconds(session: Session) -> float | None:
         last_dt = datetime.datetime.fromisoformat(last_ts)
     except (ValueError, TypeError):
         return None
-    now = datetime.datetime.now()
+    now = datetime.datetime.now().astimezone()
+    # Old transcripts may carry naive stamps; assume they were local time.
+    if last_dt.tzinfo is None:
+        last_dt = last_dt.astimezone()
     return (now - last_dt).total_seconds()
 
 
@@ -1632,7 +1636,7 @@ def _fire_hooks(session: Session, event: str, matcher_values: "list[str]" = [],
               fmt=f"{YEL}⚠ hook error: {decision.error}{RESET}")
         _log(session, {"type": "hook_error", "event": event,
                        "error": decision.error,
-                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                       "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
     if decision.system_message and decision.error != decision.system_message:
         _emit(session, "hook_warning", text=decision.system_message,
               fmt=f"{YEL}[hook] {decision.system_message}{RESET}")
@@ -1982,13 +1986,25 @@ def fmt_duration(seconds: float) -> str:
 
 
 def _epoch_from_iso(ts: str | None) -> float | None:
-    """Epoch seconds for an ISO timestamp written by this module, or None."""
+    """Epoch seconds for an ISO timestamp written by this module, or None.
+
+    Naive stamps from older transcripts are read as local time.
+    """
     if not ts:
         return None
     try:
-        return datetime.datetime.fromisoformat(ts).timestamp()
+        dt = datetime.datetime.fromisoformat(ts)
     except ValueError:
         return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.timestamp()
+
+
+def _parse_iso_local(ts: str) -> datetime.datetime:
+    """Parse an ISO stamp; naive values (older caches) read as local time."""
+    dt = datetime.datetime.fromisoformat(ts)
+    return dt if dt.tzinfo is not None else dt.astimezone()
 
 
 def _iso_stamp(epoch: float) -> str:
@@ -2065,7 +2081,7 @@ def _awareness_checklist(session: Session) -> None:
 
 
 def _log(session: Session, record: "dict[str, Any]") -> None:
-    record["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
+    record["ts"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     record["cwd"] = os.getcwd()
     with session["log_path"].open("a") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -2126,7 +2142,7 @@ def _save_messages_snapshot(session: Session) -> None:
     for m in session["messages"]:
         entry = dict(m)
         if "ts" not in entry:
-            entry["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
+            entry["ts"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
         annotated.append(entry)
     # Tool provenance: whether the default tool schema was used (no explicit
     # tools given) plus the resolved tool-name list, so a snapshot records
@@ -3195,7 +3211,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         # Log the restoration event.
         _log(restored, {"type": "session_restored",
                         "session_id": restored.get("session_id"),
-                        "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                        "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
         _emit(restored, "session_restored",
               session_id=restored.get("session_id"),
               fmt=f"{DIM}Restored session {restored.get('session_id')} "
@@ -3296,7 +3312,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         .get("streaming", {})
         .get("supported", False)
     )
-    session_start_ts = datetime.datetime.now().isoformat(timespec="seconds")
+    session_start_ts = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     # ── hooks: discover config layers, merge additively ───────────────────
     from .hooks import dedupe_entries as _dedupe_hook_entries
     from .hooks import parse_hooks_config as _parse_hooks_config
@@ -3479,7 +3495,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             session["messages"] = loaded
             _log(session, {"type": "session_resumed", "resumed_from": resumed_from,
                            "messages_loaded": len(loaded),
-                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                           "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
             _emit(session, "session_resumed",
                   session_id=resumed_from, messages_loaded=len(loaded),
                   fmt=f"{DIM}Resumed session {resumed_from} "
@@ -3492,7 +3508,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                 _log(session, {"type": "session_resumed", "resumed_from": resumed_from,
                                "resumed_from_model": source_model,
                                "messages_loaded": len(loaded_other),
-                               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                               "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
                 _emit(session, "session_resumed",
                       session_id=resumed_from, messages_loaded=len(loaded_other),
                       source_model=source_model,
@@ -3528,7 +3544,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                                {"call_id": p.call_id, "name": p.name}
                                for p in journal_state.pending_tool_calls],
                            "mid_turn": journal_state.mid_turn,
-                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                           "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
             _emit(session, "journal_recovered",
                   entries_replayed=journal_state.entries_replayed,
                   messages_loaded=len(journal_state.messages),
@@ -3543,7 +3559,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                 session["messages"].append({
                     "role": "user",
                     "content": _PENDING_TOOL_NOTE.format(calls=calls),
-                    "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
                 })
             if journal_state.unreceived_results:
                 # Only results for calls still part of the resumed
@@ -3577,7 +3593,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                             "full output):\n"
                             f"{results}"
                         ),
-                        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                        "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
                     })
     _awareness_checklist(session)
     return session
@@ -3633,7 +3649,7 @@ def _emit_and_log_error(
     fields = _error_metadata(exc, session, client, request_started_at)
     _emit(session, "error", text=text, **fields, fmt=fmt)
     record = {"type": log_type, "error": text, **fields,
-              "ts": datetime.datetime.now().isoformat(timespec="seconds")}
+              "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
     if error_kind is not None:
         record["error_kind"] = error_kind
     _log(session, record)
@@ -3753,7 +3769,7 @@ def _complete(client: openai.OpenAI | SubprocessOpenAI, session: Session, **kwar
             _emit(session, "provider_pinned", provider=served,
                   fmt=f"{DIM}{MAG}[provider] pinned to {served} for this session{RESET}")
             _log(session, {"type": "provider_pinned", "provider": served,
-                   "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                   "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
     return resp
 
 
@@ -3959,7 +3975,7 @@ def _compact_once(
         "role": "assistant",
         "content": summary,
         "compacted_summary": True,
-        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
     }
     session["messages"] = system_msgs + [summary_msg] + suffix
     _write_journal_record(session, {"type": "reset_messages", "reason": "compaction",
@@ -3983,7 +3999,7 @@ def _compact_once(
                    "summary_length": len(summary),
                    "compaction_ratio": round(ratio, 2),
                    "summary": summary,
-                   "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                   "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
     _save_messages_snapshot(session)
     # ── PostCompact hooks (advisory + additionalContext) ────────────────
     _fire_hooks(session, "PostCompact", matcher_values=[trigger_kind],
@@ -4154,7 +4170,7 @@ def _handle_tool_call(
                                             "name": name, "result": result,
                                             "outcome": "hook_deny"})
         _emit(session, "tool_call", name=name, args=args,
-              ts=datetime.datetime.now().isoformat(timespec="seconds"),
+              ts=datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
               fmt=fmt_call(name, args))
         _emit(session, "tool_result", name=name, result=result, streamed=False,
               files=None, diff_summary=None, fmt=fmt_result(result))
@@ -4163,7 +4179,7 @@ def _handle_tool_call(
                                                   "__name__",
                                                   entry.get("python_function")),
                        "result": result, "hook": "PreToolUse:deny",
-                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                       "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
         return result
     if pre.updated_input is not None:
         # Claude/Codex updatedInput replaces the whole input object.  Alias
@@ -4177,7 +4193,7 @@ def _handle_tool_call(
         else:
             _log(session, {"type": "tool_call_rewritten", "name": name,
                            "args": args,
-                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                           "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
     if pre.permission_decision == "ask" and not non_interactive:
         # Map "ask" onto agentknit's interactive surface: confirm with the
         # user before dispatch (the ask_user machinery pauses the input
@@ -4194,7 +4210,7 @@ def _handle_tool_call(
 
     pf_name = getattr(entry.get("python_function"), "__name__",
                       entry.get("python_function"))
-    call_ts = datetime.datetime.now().isoformat(timespec="seconds")
+    call_ts = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     _log(session, {"type": "tool_call", "name": name,
                    "python_function": pf_name, "args": args,
                    "ts": call_ts})
@@ -4295,7 +4311,7 @@ def _handle_tool_call(
                   files=None, diff_summary=None, fmt=fmt_result(failure))
             _log(session, {"type": "tool_error", "name": name,
                            "python_function": pf_name, "result": failure,
-                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                           "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
             raise
 
     tool_ended_at = time.time()
@@ -4362,7 +4378,7 @@ def _handle_tool_call(
                    "started_at": _iso_stamp(tool_started_at),
                    "ended_at": _iso_stamp(tool_ended_at),
                    "duration_ms": tool_duration_ms,
-                   "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                   "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
     return result
 
 
@@ -4675,7 +4691,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
     if repaired != messages:
         _log(session, {"type": "repair_tool_call_pairing",
                        "delta": len(repaired) - len(messages),
-                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                       "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
         messages[:] = repaired
 
     # Per-turn hook state: fresh prompt_id, reset the Stop-continuation guard.
@@ -4693,7 +4709,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                       or "prompt blocked by UserPromptSubmit hook")
             notice = f"Prompt rejected by hook: {reason}"
             _log(session, {"type": "user_prompt_blocked", "reason": reason,
-                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                           "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
             _emit(session, "hook_warning", text=notice,
                   fmt=f"{YEL}{notice}{RESET}")
             return _session_result_with_reply(session, notice)
@@ -4707,7 +4723,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             _write_journal_record(session, {"type": "message", "msg": msg})
         messages.append(msg)
 
-    now_ts = datetime.datetime.now().isoformat(timespec="seconds")
+    now_ts = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     # Time awareness: the submitted prompt carries the turn's timing line.
     # Suffixed onto the user message rather than sent as its own message —
     # same reasoning as the token countdown: no extra messages, valid role
@@ -4798,7 +4814,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             kept, final = list(out.messages), out.final_reply
         else:
             kept, final = list(out), None
-        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        ts = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
         kept = [m if "ts" in m else {**m, "ts": ts} for m in kept]
         live[step_start:] = kept
         if journal is not None:
@@ -4917,7 +4933,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                                    max(0, (session.get("token_awareness_budget_tokens", 0) or 0)
                                        - (getattr(usage, "prompt_tokens", 0) or 0))}
                                   if session.get("token_awareness_enabled") else {}),
-                               "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                               "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
             elif session.get("strict_cache_proof", True) and session.get("llm_call_count", 0) >= 1:
                 age = _last_message_age_seconds(session)
                 if age is not None and age > CACHE_COLD_GAP_SECONDS:
@@ -4970,7 +4986,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             # ── structured tool_calls ────────────────────────────────────────────
             if structured and msg.tool_calls:
                 step_start = len(messages)
-                now_ts = datetime.datetime.now().isoformat(timespec="seconds")
+                now_ts = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
                 _append_message({
                     "role": "assistant",
                     "tool_calls": [
@@ -5013,16 +5029,16 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                             _log(session, {"type": "tool_error",
                                            "name": tc.function.name,
                                            "result": result,
-                                           "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                                           "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
                             _append_message({"role": "tool", "tool_call_id": tc.id,
                                              "content": _with_pending_ta(result),
-                                             "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                                             "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
                             continue
                     result = _handle_tool_call(tc.function.name, args, session,
                                                call_id=tc.id)
                     _append_message({"role": "tool", "tool_call_id": tc.id,
                                      "content": _with_pending_ta(result),
-                                     "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                                     "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
                 forced_final = _reduce_step(step_start)
                 if forced_final is None:
                     continue
@@ -5032,7 +5048,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             # ── inline JSON tool calls ───────────────────────────────────────────
             if not structured and forced_final is None:
                 step_start = len(messages)
-                now_ts = datetime.datetime.now().isoformat(timespec="seconds")
+                now_ts = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
                 _append_message({"role": "assistant", "content": text, "ts": now_ts})
                 calls = extract_inline_calls(text)
                 if calls:
@@ -5042,7 +5058,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                         results.append(f"[{name}] {_with_pending_ta(result)}")
                     _append_message({"role": "user",
                                      "content": "Tool results:\n" + "\n\n".join(results),
-                                     "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                                     "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
                     forced_final = _reduce_step(step_start)
                     if forced_final is None:
                         continue
@@ -5053,9 +5069,9 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             # a reducer-forced reply was never appended in either mode.
             if structured or forced_final is not None:
                 _append_message({"role": "assistant", "content": text,
-                                 "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                                 "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
             _log(session, {"type": "assistant", "content": text,
-                       "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                       "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
             already_streamed = session.get("_content_was_streamed", False)
             # Time awareness: anchor "wall since your previous message" on
             # the moment this reply left, so the next turn measures how long
@@ -5083,7 +5099,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                     state["stop_hook_active"] = True
                     _append_message({
                         "role": "user", "content": stop.reason,
-                        "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                        "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
                     continue
             else:
                 # Guarded continuation: report the active flag but ignore a
@@ -5145,7 +5161,9 @@ def _load_azure_price_cache() -> "dict[str, Any]" | None:
         cached_at = cache.get("cached_at")
         if cached_at is None:
             return None
-        age = datetime.datetime.now() - datetime.datetime.fromisoformat(cached_at)
+        # Naive stamps from an older cache read as local time.
+        age = (datetime.datetime.now().astimezone()
+               - _parse_iso_local(cached_at))
         if age.days >= 7:
             return None
         return cache
@@ -5156,7 +5174,7 @@ def _load_azure_price_cache() -> "dict[str, Any]" | None:
 def _save_azure_price_cache(items: list[dict[str, Any]]) -> None:
     """Save Azure pricing data to the cache file with a timestamp."""
     cache = {
-        "cached_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "cached_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "items": items,
     }
     path = _azure_price_cache_path()

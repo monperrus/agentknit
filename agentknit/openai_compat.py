@@ -386,6 +386,12 @@ class _Completions:
                 request = self._client._http.build_request(
                     "POST", url, headers=headers, json=payload)
                 resp = self._client._http.send(request, stream=stream)
+                if stream and resp.status_code >= 400:
+                    # An errored streaming response is handled below via
+                    # resp.text/.json(), which httpx forbids on an unread
+                    # stream — read it now while the 2xx path stays lazy
+                    # for iter_lines().
+                    resp.read()
             except httpx.ReadTimeout:
                 if read_timeout_retries >= _MAX_READ_TIMEOUT_RETRIES:
                     raise

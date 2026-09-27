@@ -112,6 +112,7 @@ import traceback
 import urllib.parse
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeAlias, TypedDict, cast
 
@@ -2894,6 +2895,11 @@ class Session(TypedDict):
     durable_sink: NotRequired[DurableSink | None]
     # NotRequired: absent (None) means the tool library's built-in default TTL.
     tool_ttl_seconds: NotRequired[int | None]  # TTL budget (s) for one sync tool exec
+    # Opt-in concurrent dispatch of several tool calls in one assistant
+    # message.  NotRequired: sessions snapshotted before the feature lack
+    # these keys; the restore path backfills defaults (off, 8 workers).
+    parallel_tool_dispatch: NotRequired[bool]
+    parallel_tool_dispatch_max_workers: NotRequired[int]
     # ── runtime-only state (set after construction) ──────────────────
     log_path: NotRequired[Path]      # JSONL transcript path (always set in practice)
     auth: NotRequired[dict[str, Any]]          # auth *configuration* (never the key itself)
@@ -3150,6 +3156,16 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             restored["cache_key"] = cache_key
         if max_output_tokens is not None:
             restored["max_output_tokens"] = max_output_tokens
+        # Opt-in parallel tool dispatch: an explicit schema flag re-applies on
+        # resume; otherwise the restored value is kept.  Old snapshots predate
+        # the feature — backfill the defaults (off, 8 workers).
+        if "parallel_tool_dispatch" in schema:
+            restored["parallel_tool_dispatch"] = bool(schema["parallel_tool_dispatch"])
+        restored.setdefault("parallel_tool_dispatch", False)
+        if "parallel_tool_dispatch_max_workers" in schema:
+            restored["parallel_tool_dispatch_max_workers"] = int(
+                schema["parallel_tool_dispatch_max_workers"])
+        restored.setdefault("parallel_tool_dispatch_max_workers", 8)
         if tool_executor is not None:
             restored["tool_executor"] = tool_executor
         # Compaction overrides.
@@ -3412,6 +3428,12 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             tool_ttl_seconds if tool_ttl_seconds is not None
             else schema.get("tool_ttl_seconds")
         ),
+        # Opt-in concurrent dispatch of several tool calls in one assistant
+        # message (schema["parallel_tool_dispatch"]); off by default keeps
+        # the sequential loop, and the worker cap bounds the fan-out.
+        "parallel_tool_dispatch": bool(schema.get("parallel_tool_dispatch", False)),
+        "parallel_tool_dispatch_max_workers": int(
+            schema.get("parallel_tool_dispatch_max_workers", 8)),
         "token_awareness_enabled": bool(ta_enabled),
         "token_awareness_budget_tokens": int(ta_budget),
         "token_awareness_reminder_tokens": int(ta_reminder),
@@ -4994,8 +5016,14 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                     ],
                     "ts": now_ts,
                 })
-                for tc in msg.tool_calls:
-                    _check_cancelled()
+                def _run_one(tc: Any) -> dict[str, Any]:
+                    """Parse args and dispatch one tool call; return its message.
+
+                    Under ``parallel_tool_dispatch`` this runs in a worker
+                    thread, so Pre/PostToolUse hooks and the tool itself may
+                    fire off the main thread; the returned message is always
+                    appended by the main thread, in ``tool_calls`` order.
+                    """
                     if tc.type == "custom":
                         # Custom tool call: the raw text input is dispatched
                         # as a single `input` kwarg — no JSON decoding.
@@ -5030,15 +5058,52 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                                            "name": tc.function.name,
                                            "result": result,
                                            "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
-                            _append_message({"role": "tool", "tool_call_id": tc.id,
-                                             "content": _with_pending_ta(result),
-                                             "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
-                            continue
+                            return {"role": "tool", "tool_call_id": tc.id,
+                                    "content": _with_pending_ta(result),
+                                    "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
                     result = _handle_tool_call(tc.function.name, args, session,
                                                call_id=tc.id)
-                    _append_message({"role": "tool", "tool_call_id": tc.id,
-                                     "content": _with_pending_ta(result),
-                                     "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
+                    return {"role": "tool", "tool_call_id": tc.id,
+                            "content": _with_pending_ta(result),
+                            "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+
+                # Opt-in concurrent dispatch: only several calls in one
+                # assistant message are worth an executor.  The default (flag
+                # off, or a single call) keeps the sequential loop below
+                # byte-for-byte.
+                if session.get("parallel_tool_dispatch") and len(msg.tool_calls) > 1:
+                    max_workers = min(len(msg.tool_calls),
+                                      session.get("parallel_tool_dispatch_max_workers", 8))
+                    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                        futures = [pool.submit(_run_one, tc) for tc in msg.tool_calls]
+                        tool_messages: list[dict[str, Any]] = []
+                        for tc, future in zip(msg.tool_calls, futures):
+                            try:
+                                tool_messages.append(future.result())
+                            except Exception as exc:
+                                # _handle_tool_call reports unknown tools and
+                                # hook denials as normal results but re-raises
+                                # other tool exceptions; surface those as this
+                                # call's error result rather than killing the
+                                # whole turn from a worker thread.
+                                failure = (f"ERROR: tool {tc.function.name!r} raised "
+                                           f"{type(exc).__name__}: {exc}")
+                                tool_messages.append({
+                                    "role": "tool", "tool_call_id": tc.id,
+                                    "content": _with_pending_ta(failure),
+                                    "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
+                    # Append in tool_calls order so history/replay stay
+                    # deterministic whatever order the calls completed in.
+                    for message in tool_messages:
+                        _append_message(message)
+                    # Cooperative timeout: worker threads are never killed
+                    # mid-call; the turn raises here, at its next safe
+                    # boundary, once every dispatched call has returned.
+                    _check_cancelled()
+                else:
+                    for tc in msg.tool_calls:
+                        _check_cancelled()
+                        _append_message(_run_one(tc))
                 forced_final = _reduce_step(step_start)
                 if forced_final is None:
                     continue

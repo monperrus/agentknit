@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime as _dt
@@ -105,6 +106,9 @@ class SessionJournal:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fsync_directory()
+        # Serializes _seq + the record write: concurrent tool workers may
+        # append from threads.
+        self._append_lock = threading.Lock()
         self._lock_fd: int | None = None
         if exclusive:
             # A session directory has one ordered writer.  A non-blocking
@@ -181,16 +185,19 @@ class SessionJournal:
 
     def append(self, record: dict[str, Any]) -> None:
         """Append one record with a sequence number and timestamp, fsync'd."""
-        self._seq += 1
-        rec = {
-            "seq": self._seq,
-            "ts": _dt.now().astimezone().isoformat(timespec="milliseconds"),
-            **record,
-        }
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        # Hold the lock across both the seq assignment and the write:
+        # concurrent tool workers may append from threads.
+        with self._append_lock:
+            self._seq += 1
+            rec = {
+                "seq": self._seq,
+                "ts": _dt.now().astimezone().isoformat(timespec="milliseconds"),
+                **record,
+            }
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
 
     # ── record builders ───────────────────────────────────────────────────
 

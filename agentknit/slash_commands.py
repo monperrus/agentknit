@@ -552,6 +552,23 @@ def _handle_usage(session: Session, client: Any, model: str, args: str) -> None:
         parts.append(f"    └─ cached: {cached:>9,} ({pct:.0f}%)")
     if cache_write:
         parts.append(f"    └─ cache-write: {cache_write:>6,}")
+
+    # Prefix-cache warmth: how long the provider's entry is expected to live.
+    # A read or write renews it, so the countdown restarts from the last
+    # cache proof.  Shown so a full cache re-write after a pause is an
+    # expected event (cold) instead of a silent cost.
+    from ._core import _cache_ttl_seconds, _cache_warmth
+    ttl = _cache_ttl_seconds(session)
+    warmth = _cache_warmth(session)
+    if warmth is not None:
+        left = warmth["expires_in"]
+        if left > 0:
+            parts.append(f"    └─ cache warm: {int(left):>5,}s of {int(ttl):,}s TTL left")
+        else:
+            parts.append(f"    └─ cache expired {int(-left):,}s ago (TTL {int(ttl):,}s; "
+                         f"next turn re-writes the prompt prefix)")
+    else:
+        parts.append(f"    └─ cache TTL: {int(ttl):,}s (no cache activity observed yet)")
     parts.append(f"  completion: {completion:>10,} tokens")
     parts.append(f"  {CYAN}total:      {total:>10,} tokens{RESET}")
 

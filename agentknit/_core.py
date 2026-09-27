@@ -74,9 +74,10 @@ Event types
     ``provider``, ``fmt``.
 ``cache_cold``
     A resumed turn was served with no cache hit because the prefix cache
-    had expired (last message older than ``CACHE_COLD_GAP_SECONDS``).
+    had expired (last message older than the session's cache TTL —
+    ``CACHE_COLD_GAP_SECONDS`` / ``cache_ttl_seconds``).
     Strict cache-proof enforcement is relaxed for this case.  Data:
-    ``age``, ``fmt``.
+    ``age``, ``ttl``, ``fmt``.
 ``cache_proof_missing``
     A call after the first exposed no cache accounting / no cache hit while
     strict cache mode is on.  The turn continues automatically (the tokens
@@ -202,12 +203,22 @@ DEFAULT_COMPACTION_TARGET_TOKENS = 20_000
 DEFAULT_COMPACTION_KEEP_LAST_TURNS = 2
 
 # Prefix-cache "cold resume" threshold.  Provider prefix caches expire after
-# a few minutes (OpenAI ~5–10 min, Anthropic 5 min).  If the last message in
-# a resumed session is older than this, the cache has almost certainly
-# evaporated through no fault of the caller, so strict cache-proof
-# enforcement would spuriously abort the turn.  Such turns are marked "cold"
-# and warn instead of failing — see :func:`_enforce_cache_proof`.
+# a few minutes (OpenAI ~5–10 min, Anthropic 5 min, Kimi 5 min by default).
+# If the last message in a resumed session is older than this, the cache has
+# almost certainly evaporated through no fault of the caller, so strict
+# cache-proof enforcement would spuriously abort the turn.  Such turns are
+# marked "cold" and warn instead of failing — see :func:`_enforce_cache_proof`.
 CACHE_COLD_GAP_SECONDS = 3600
+
+# Default prefix-cache TTL used when a session doesn't declare
+# cache_ttl_seconds.  Mirrors CACHE_COLD_GAP_SECONDS so an undeclared session
+# keeps exactly today's cold-resume classification.  Providers with a
+# documented TTL should set schema["cache_ttl_seconds"] (or pass
+# cache_ttl_seconds=... to init_session/run_task/run) so a resume after the
+# real TTL is classified "cold" instead of tripping the stricter
+# cache_proof_missing warning: Kimi 5 min (300), DeepSeek's disk cache
+# "a few hours to a few days" (21600), z.ai undocumented (leave default).
+DEFAULT_CACHE_TTL_SECONDS = CACHE_COLD_GAP_SECONDS
 
 # Default minimum cacheable prompt size (in prompt tokens) used by
 # _enforce_cache_proof() when a session doesn't declare its own
@@ -1223,6 +1234,42 @@ def _last_message_age_seconds(session: Session) -> float | None:
     return (now - last_dt).total_seconds()
 
 
+def _cache_ttl_seconds(session: Session) -> float:
+    """The session's effective prefix-cache TTL, in seconds.
+
+    ``session["cache_ttl_seconds"]`` when the face/spec declared one, else
+    :data:`DEFAULT_CACHE_TTL_SECONDS`.  This is the horizon over which the
+    provider's prefix cache is assumed to live: resuming after it means a
+    full cache re-write (input price paid again), which strict cache-proof
+    mode treats as a "cold" resume rather than a caching failure.
+    """
+    ttl = session.get("cache_ttl_seconds")
+    try:
+        ttl_f = float(ttl) if ttl is not None else 0.0
+    except (TypeError, ValueError):
+        return float(DEFAULT_CACHE_TTL_SECONDS)
+    return ttl_f if ttl_f > 0 else float(DEFAULT_CACHE_TTL_SECONDS)
+
+
+def _cache_warmth(session: Session, now: float | None = None) -> "dict[str, Any] | None":
+    """How much prefix-cache lifetime is left, or None when unmeasurable.
+
+    Warmth is anchored on the last observed cache activity — a cache read
+    *or* write renews the provider's entry (Kimi renews on hit; OpenAI and
+    DeepSeek refresh on any matching request) — so ``_cache_last_proof_ts``
+    is stamped whenever a usage block proves caching worked.  Returns a
+    dict with ``ttl_seconds`` and ``expires_in`` (seconds left; negative
+    once certainly expired) for ``/usage`` and the TUI status bar; ``None``
+    when no cache activity has been observed yet.
+    """
+    last = session.get("_cache_last_proof_ts")
+    if not last:
+        return None
+    now = time.time() if now is None else now
+    ttl = _cache_ttl_seconds(session)
+    return {"ttl_seconds": ttl, "expires_in": ttl - (now - float(last))}
+
+
 def _enforce_cache_proof(session: Session, usage: object) -> None:
     """Fail closed at the start of the session; warn-and-continue afterwards.
 
@@ -1236,10 +1283,11 @@ def _enforce_cache_proof(session: Session, usage: object) -> None:
     flips to ``"ok"`` (clearing the warning) as soon as any call reports a
     cache read or write.
 
-    A resumed session whose last message is older than
-    :data:`CACHE_COLD_GAP_SECONDS` is assumed to be a *cold resume*: the
-    provider's prefix cache has expired through no fault of the caller, so
-    the first post-resume call is allowed to miss without even a warning
+    A resumed session whose last message is older than the session's
+    prefix-cache TTL (:data:`DEFAULT_CACHE_TTL_SECONDS` unless
+    ``cache_ttl_seconds`` is declared) is assumed to be a *cold resume*:
+    the provider's prefix cache has expired through no fault of the caller,
+    so the first post-resume call is allowed to miss without even a warning
     escalation.  A dim notice is emitted instead so the output is not broken.
 
     Below ``session["min_cacheable_tokens"]`` prompt tokens, providers cache
@@ -1277,6 +1325,10 @@ def _enforce_cache_proof(session: Session, usage: object) -> None:
     # so any temporary "no cache proof" status-bar warning can clear itself.
     if has_cache_proof and (cached_tokens > 0 or cache_creation > 0):
         session["_cache_status"] = "ok"
+        # Cache warmth anchor: every read or write renews the provider's
+        # cache entry (Kimi renews on hit; OpenAI/DeepSeek refresh on any
+        # matching request), so TTL countdown restarts from here.
+        session["_cache_last_proof_ts"] = time.time()
 
     # Beginning of the session: the first call must expose cache accounting,
     # otherwise strict cache mode cannot work at all.  Aborting here is
@@ -1299,13 +1351,14 @@ def _enforce_cache_proof(session: Session, usage: object) -> None:
     # prefix cache has surely expired.  Don't break the turn for something
     # outside the caller's control; warn once instead.
     age = _last_message_age_seconds(session)
-    cold_resume = age is not None and age > CACHE_COLD_GAP_SECONDS
+    cold_resume = age is not None and age > _cache_ttl_seconds(session)
     if cold_resume and not (has_cache_proof and cached_tokens > 0):
         notice = (
             f"{DIM}Prefix cache expired (last message {int(age or 0)}s old); "
             f"this turn was not served from cache and will re-process the prompt.{RESET}"
         )
-        _emit(session, "cache_cold", age=int(age or 0), fmt=notice)
+        _emit(session, "cache_cold", age=int(age or 0), ttl=int(_cache_ttl_seconds(session)),
+              fmt=notice)
         session["_cache_cold_warned"] = True
         return
 
@@ -2168,6 +2221,13 @@ def _save_messages_snapshot(session: Session) -> None:
             "tools": tool_names,
             "agentknit_commit": _agentknit_commit(),
             "auth": dict(session.get("auth") or {}),
+            # Prefix-cache knobs: the provider's minimum cacheable prompt
+            # and TTL, so a resumed session classifies cold resumes with the
+            # same thresholds it was started with.
+            "cache": {
+                "min_cacheable_tokens": session.get("min_cacheable_tokens"),
+                "ttl_seconds": session.get("cache_ttl_seconds"),
+            },
             # Compaction knobs so a resumed session keeps the trigger that
             # matches its context window (informational; runtime state lives
             # in the session dict itself).
@@ -2613,6 +2673,14 @@ def _bind_schema_to_resumed_session(
     if endpoint and endpoint != (bound.get("endpoint") or ""):
         changes.append(f"endpoint {bound.get('endpoint') or '∅'!r} → {endpoint!r}")
         bound["endpoint"] = endpoint
+    # Cache knobs recorded by the snapshot (metadata.cache) travel with the
+    # session: a face that declared a TTL at start keeps classifying cold
+    # resumes with it after resume, even when launched by the generic CLI.
+    cache_meta = meta.get("cache")
+    if isinstance(cache_meta, dict):
+        for key in ("min_cacheable_tokens", "cache_ttl_seconds"):
+            if cache_meta.get(key) is not None:
+                bound.setdefault(key, cache_meta[key])
     auth = meta.get("auth")
     if isinstance(auth, dict) and auth:
         # Key sources the resumed session never used are dropped, not merged:
@@ -2787,7 +2855,7 @@ _REQUIRED_SESSION_KEYS = frozenset({
     "on_event", "streaming", "options", "session_start_ts",
     "compaction_enabled", "compaction_trigger_tokens", "compaction_target_tokens",
     "compaction_keep_last_turns", "compaction_policy", "compaction_min_chars",
-    "compaction_last_prompt_tokens", "min_cacheable_tokens",
+    "compaction_last_prompt_tokens", "min_cacheable_tokens", "cache_ttl_seconds",
 })
 
 
@@ -2837,6 +2905,11 @@ class Session(TypedDict):
     strict_cache_proof: bool
     reports_prompt_tokens: bool
     min_cacheable_tokens: int
+    # Provider prefix-cache TTL (s).  Resuming after this gap is a "cold"
+    # resume: the cache has expired and the prompt is fully re-processed.
+    # NotRequired: sessions saved before this feature lack the key; the
+    # restore path backfills DEFAULT_CACHE_TTL_SECONDS.
+    cache_ttl_seconds: NotRequired[int]
     streaming: bool
     options: list[str]               # extra request options passed verbatim
     # events
@@ -2914,6 +2987,9 @@ class Session(TypedDict):
     _cwd: NotRequired[Path]
     _cache_cold_warned: NotRequired[bool]
     _cache_unmeasurable_warned: NotRequired[bool]
+    # Epoch stamp of the last usage block that proved a cache read or write;
+    # anchors the TTL countdown shown by /usage and the TUI status bar.
+    _cache_last_proof_ts: NotRequired[float | None]
     # "ok" once a cache read/write has been observed, "missing" when a
     # post-first-call response exposed no cache proof.  A UI can surface
     # "missing" as a temporary status-bar warning and clear it on "ok".
@@ -2941,6 +3017,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                  compaction_policy: "str | Callable[..., bool] | None" = None,
                  compaction_min_chars: int | None = None,
                  min_cacheable_tokens: int | None = None,
+                 cache_ttl_seconds: int | None = None,
                  tool_ttl_seconds: int | None = None,
                  token_awareness_enabled: bool | None = None,
                  token_awareness_budget_tokens: int | None = None,
@@ -3108,6 +3185,10 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
 
     # ── Restore from an existing session dict ──────────────────────────
     if session is not None:
+        # Old snapshots predate cache TTL tracking: backfill the default so
+        # validation passes and the cold-resume threshold stays as before.
+        cast("dict[str, Any]", session).setdefault(
+            "cache_ttl_seconds", DEFAULT_CACHE_TTL_SECONDS)
         _validate_session_dict(session)
         # Messages, usage totals, call count, session id, cache key, etc.
         # are preserved from the saved session.
@@ -3183,6 +3264,8 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             restored["compaction_min_chars"] = compaction_min_chars
         if min_cacheable_tokens is not None:
             restored["min_cacheable_tokens"] = min_cacheable_tokens
+        if cache_ttl_seconds is not None:
+            restored["cache_ttl_seconds"] = int(cache_ttl_seconds)
         if token_awareness_enabled is not None:
             restored["token_awareness_enabled"] = token_awareness_enabled
         if token_awareness_budget_tokens is not None:
@@ -3424,6 +3507,13 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             min_cacheable_tokens if min_cacheable_tokens is not None
             else schema.get("min_cacheable_tokens", DEFAULT_MIN_CACHEABLE_TOKENS)
         ),
+        # Prefix-cache TTL: explicit kwarg → schema → DEFAULT_CACHE_TTL_SECONDS
+        # (= CACHE_COLD_GAP_SECONDS), so undeclared sessions keep the old
+        # cold-resume classification unchanged.
+        "cache_ttl_seconds": int(
+            cache_ttl_seconds if cache_ttl_seconds is not None
+            else schema.get("cache_ttl_seconds", DEFAULT_CACHE_TTL_SECONDS)),
+        "_cache_last_proof_ts": None,
         "tool_ttl_seconds": (
             tool_ttl_seconds if tool_ttl_seconds is not None
             else schema.get("tool_ttl_seconds")
@@ -4943,6 +5033,9 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                       total=getattr(usage, "total_tokens", 0) or 0,
                       cached=getattr(usage, "cached_tokens", 0) or 0,
                       cache_write=getattr(usage, "cache_creation_tokens", 0) or 0,
+                      cache_ttl=_cache_ttl_seconds(session),
+                      **({"cache_expires_in": warmth["expires_in"]}
+                         if (warmth := _cache_warmth(session)) is not None else {}),
                       fmt=f"{DIM}{MAG}[tokens] "
                           f"{fmt_usage(usage, compaction_trigger=trigger, prompt_tokens_known=session.get('reports_prompt_tokens', True))}{RESET}")
                 _log(session, {"type": "usage",
@@ -4958,14 +5051,15 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                                "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
             elif session.get("strict_cache_proof", True) and session.get("llm_call_count", 0) >= 1:
                 age = _last_message_age_seconds(session)
-                if age is not None and age > CACHE_COLD_GAP_SECONDS:
+                if age is not None and age > _cache_ttl_seconds(session):
                     # Cold resume: cache has expired; a missing usage block on
                     # the first post-resume call is not a hard violation.
                     notice = (
                         f"{DIM}Prefix cache expired (last message {int(age or 0)}s old); "
                         f"usage metadata unavailable this turn.{RESET}"
                     )
-                    _emit(session, "cache_cold", age=int(age or 0), fmt=notice)
+                    _emit(session, "cache_cold", age=int(age or 0),
+                          ttl=int(_cache_ttl_seconds(session)), fmt=notice)
                     session["_cache_cold_warned"] = True
                 else:
                     # Tokens for this call are already paid; aborting would
@@ -5636,6 +5730,7 @@ def run_task(
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
+    cache_ttl_seconds: int | None = None,
     durable: bool | None = None,
     session_dir: str | Path | None = None,
     durable_sink: DurableSink | None = None,
@@ -5699,6 +5794,7 @@ def run_task(
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
+        cache_ttl_seconds=cache_ttl_seconds,
         durable=durable,
         session_dir=session_dir,
         durable_sink=durable_sink,
@@ -5754,6 +5850,7 @@ def run_agent(
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
+    cache_ttl_seconds: int | None = None,
     durable: bool | None = None,
     session_dir: str | Path | None = None,
     durable_sink: DurableSink | None = None,
@@ -5796,6 +5893,7 @@ def run_agent(
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
+        cache_ttl_seconds=cache_ttl_seconds,
         durable=durable,
         session_dir=session_dir,
         durable_sink=durable_sink,
@@ -5841,6 +5939,7 @@ def run(
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
+    cache_ttl_seconds: int | None = None,
     durable: bool | None = None,
     session_dir: str | Path | None = None,
     durable_sink: DurableSink | None = None,
@@ -5880,6 +5979,7 @@ def run(
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
+        cache_ttl_seconds=cache_ttl_seconds,
         durable=durable,
         session_dir=session_dir,
         durable_sink=durable_sink,
@@ -5971,6 +6071,7 @@ def _repl_setup(
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
+    cache_ttl_seconds: int | None = None,
     durable: bool | None = None,
     session_dir: str | Path | None = None,
     durable_sink: DurableSink | None = None,
@@ -6250,6 +6351,7 @@ def run_repl(
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
+    cache_ttl_seconds: int | None = None,
     durable: bool | None = None,
     session_dir: str | Path | None = None,
     durable_sink: DurableSink | None = None,
@@ -6286,6 +6388,7 @@ def run_repl(
         compaction_policy=compaction_policy,
         compaction_min_chars=compaction_min_chars,
         min_cacheable_tokens=min_cacheable_tokens,
+        cache_ttl_seconds=cache_ttl_seconds,
         durable=durable,
         session_dir=session_dir,
         durable_sink=durable_sink,
@@ -6354,6 +6457,7 @@ def run_async_repl(
     compaction_policy: "str | Callable[..., bool] | None" = None,
     compaction_min_chars: int | None = None,
     min_cacheable_tokens: int | None = None,
+    cache_ttl_seconds: int | None = None,
     durable: bool | None = None,
     session_dir: str | Path | None = None,
     durable_sink: DurableSink | None = None,
@@ -6474,6 +6578,13 @@ def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
                         "size, a zero-cache-hit response under strict cache-proof mode is "
                         "treated as expected rather than a failure. Overrides the spec's "
                         "min_cacheable_tokens.")
+    p.add_argument("--cache-ttl-seconds", type=int, dest="cache_ttl_seconds", default=None,
+                   metavar="N",
+                   help="Provider's prefix-cache TTL in seconds (e.g. 300 for Kimi's 5m "
+                        "default, 21600 for DeepSeek's disk cache). Resuming after this "
+                        "gap classifies the turn as a cold resume (cache expired, full "
+                        "re-write expected) instead of a cache-proof warning. Overrides "
+                        "the spec's cache_ttl_seconds.")
     p.add_argument("--no-durable", action="store_false", dest="durable", default=None,
                    help="Disable the write-ahead journal; fall back to turn-boundary "
                         "snapshots only. With durability on (default), every message, tool "
@@ -6545,6 +6656,7 @@ def main(argv: "list[str] | None" = None) -> None:
         max_output_tokens        = args.max_tokens,
         strict_cache_proof       = not args.no_strict_cache_proof,
         min_cacheable_tokens     = args.min_cacheable_tokens,
+        cache_ttl_seconds        = args.cache_ttl_seconds,
         durable                  = args.durable,
         hooks                    = args.hooks,
         hooks_enabled            = args.hooks_enabled,

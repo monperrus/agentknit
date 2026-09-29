@@ -11,6 +11,7 @@ Two halves of the same guarantee:
 from __future__ import annotations
 
 import json
+import os
 import time
 
 import pytest
@@ -64,14 +65,20 @@ def test_wait_hook_is_off_by_default() -> None:
     at._async_executions[exec_id]["proc"].kill()  # type: ignore[union-attr]
 
 
-def test_completion_is_drained_into_a_notice() -> None:
+def test_completion_is_drained_into_a_notice(tmp_path) -> None:
     """An execution finishing with nobody waiting becomes a model-facing ping."""
-    exec_id = json.loads(t_start("echo hi"))["tool_exec_id"]
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and not at.async_completion_queue.qsize():
-        time.sleep(0.02)
+    # A fast finish is inlined in the t_nohup result and never queued, so the
+    # command is held on a FIFO until t_nohup has returned: the queued path is
+    # taken whatever the machine's speed.
+    gate = tmp_path / "gate"
+    os.mkfifo(gate)
+    exec_id = json.loads(t_start(f"read _ < {gate}; echo hi"))["tool_exec_id"]
+    with open(gate, "w") as fh:     # blocks until the command opens it
+        fh.write("go\n")
 
-    completions = at.drain_completions()
+    # Blocking get; the timeout only guards against a hang.
+    completions = [at.async_completion_queue.get(timeout=30)]
+    completions += at.drain_completions()
     assert [c["tool_exec_id"] for c in completions] == [exec_id]
     assert at.drain_completions() == []          # drained exactly once
 

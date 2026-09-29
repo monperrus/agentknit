@@ -3046,6 +3046,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                  hooks_enabled: bool | None = None,
                  step_reducer: "StepReducer | None" = None,
                  control_socket: bool = False,
+                 bare: bool = False,
                  ) -> "Session":
     """Build a stateful session dict (:class:`Session`).
 
@@ -3156,7 +3157,20 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     without tmux keystrokes or re-parsing the journal.  Default ``False``
     (no thread, no discoverable socket).  Runtime-only: never
     durable-captured, absent on every session predating this feature.
+
+    ``bare`` — when ``True``, send no agentknit prompting and no awareness
+    at all: the six situational-awareness senses are forced off (overriding
+    their kwargs and schema keys), and the system prompt drops the default
+    agent instruction, ``~/.claude/CLAUDE.md``, ``AGENTS.md`` and the
+    environment block.  What remains is only what the caller supplies
+    (``system_prompt_supplement``) plus, in inline call-delivery mode, the
+    tool-call protocol the model needs to call tools at all.  The startup
+    awareness checklist is not emitted either.  Default ``False``.
     """
+    if bare:
+        user_awareness_enabled = system_awareness_enabled = False
+        git_awareness_enabled = change_awareness_enabled = False
+        time_awareness_enabled = token_awareness_enabled = False
     # A resumed session must run (and re-save its snapshot) on the endpoint
     # it was created on — bind here so every caller is covered, including
     # ones that build their own client and call init_session directly.
@@ -3352,11 +3366,13 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
               session_id=restored.get("session_id"),
               fmt=f"{DIM}Restored session {restored.get('session_id')} "
                   f"({len(restored.get('messages', []))} messages){RESET}")
-        _awareness_checklist(restored)
+        if not bare:
+            _awareness_checklist(restored)
         return restored
 
     # ── Build a brand-new session ──────────────────────────────────────
     sys_msg = (
+        "" if structured and bare else
         "You are a helpful coding agent. Use the provided tools to complete the task."
         " When finished, reply in plain text."
         if structured else inline_system_prompt(tools)
@@ -3364,7 +3380,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
 
     # Append any model-specific system prompt supplement.
     if system_prompt_supplement:
-        sys_msg += "\n\n" + system_prompt_supplement
+        sys_msg += ("\n\n" if sys_msg else "") + system_prompt_supplement
 
     # User / system / git / change awareness switches: explicit kwarg →
     # schema → default (on).  user/system/git gate the environment block
@@ -3391,17 +3407,18 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         sys_msg += "\n\n" + claude_md.read_text()
 
     agents_md = Path.cwd() / "AGENTS.md"
-    if agents_md.exists():
+    if not bare and agents_md.exists():
         sys_msg += "\n\n" + agents_md.read_text()
 
     # Environment awareness: user identity, git status, cwd, OS, date,
     # scratchpad — plus this session's id and transcript path.
     session_id = resumed_from if resumed_from else uuid.uuid4().hex[:12]
     log_path = _open_log(model, session_id, session_dir)
-    sys_msg += "\n\n" + environment_context(
-        model, schema.get("version"), session_id=session_id,
-        session_file=log_path,
-        enabled={"user": user_enabled, "system": system_enabled, "git": git_enabled})
+    if not bare:
+        sys_msg += "\n\n" + environment_context(
+            model, schema.get("version"), session_id=session_id,
+            session_file=log_path,
+            enabled={"user": user_enabled, "system": system_enabled, "git": git_enabled})
 
     # Token awareness: resolve the four knobs (explicit kwarg → schema →
     # default) before building the system prompt, which declares the budget.
@@ -3750,7 +3767,8 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         session["_control_server"] = ControlServer(control_path, session)
         session["control_socket_enabled"] = True
         session["control_socket_path"] = control_path
-    _awareness_checklist(session)
+    if not bare:
+        _awareness_checklist(session)
     return session
 
 
@@ -6702,6 +6720,12 @@ def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
                         "agentknit.send_control_message(path, 'text') — the interactive "
                         "REPL drains it before each prompt, so a session can be driven "
                         "without tmux keystrokes.")
+    p.add_argument("--bare", action="store_true", default=False,
+                   help="Send no agentknit prompting and no awareness at all: all "
+                        "six awareness senses off, and the system prompt carries "
+                        "neither the default agent instruction, CLAUDE.md, AGENTS.md "
+                        "nor the environment block — only --system-prompt-supplement "
+                        "(and the tool-call protocol in inline call-delivery mode).")
     for _sense in AWARENESS_TYPES:
         p.add_argument(f"--no-{_sense}-awareness", action="store_false",
                        dest=f"{_sense}_awareness_enabled", default=None,
@@ -6761,6 +6785,7 @@ def main(argv: "list[str] | None" = None) -> None:
         hooks                    = args.hooks,
         hooks_enabled            = args.hooks_enabled,
         control_socket           = args.control_socket,
+        bare                     = args.bare,
         **{f"{_sense}_awareness_enabled":
            getattr(args, f"{_sense}_awareness_enabled")
            for _sense in AWARENESS_TYPES},

@@ -11,6 +11,7 @@ Features:
 * Model-facing [token awareness](https://www.monperrus.net/martin/token-awareness): a true countdown in the model's context, with a checkpoint reminder before compaction
 * Model-facing time awareness: every turn opens with `session elapsed · last tool · wall since your previous message`, and every tool result is stamped with its ISO-8601 start/end/duration
 * All six [situational-awareness](https://www.monperrus.net/martin/situational-awareness-coding-agents) senses — user, system, git, time, token, change — injected at session start, each reported on the console with a leading emoji (`👤 user awareness: ✅`) and individually switchable (`--no-time-awareness`, …)
+* Bare mode (`--bare`, `init_session(bare=True)`): no agentknit prompting and no awareness at all — the model sees only `--system-prompt-supplement`, the task and raw tool results
 * Bubblewrap-sandboxed tool execution for untrusted replay workloads
 * `rtk` integration cuts shell tool output tokens by 60–90%
 

@@ -294,6 +294,18 @@ from agentknit import set_tool_output_stream
 set_tool_output_stream(sys.stderr)
 ```
 
+Likewise `ask_user` / `ask_user_question` prompt on stdin. When the user is
+elsewhere (a chat, a phone), route the question to them:
+
+```python
+from agentknit import set_ask_user_handler
+
+set_ask_user_handler(lambda question, options: my_chat.ask(question))
+```
+
+`options` is the list of choices (empty for a free answer); an exception from
+the handler becomes a failed tool call. `None` restores the stdin prompt.
+
 A worked example is [agentknit-over-mcp](https://github.com/monperrus/agentknit-over-mcp),
 which publishes this runtime as an MCP server.
 
@@ -490,8 +502,8 @@ generic `on_event` handler.
 
 | Event type | When it fires | Data keys |
 |---|---|---|
-| `tool_call` | Before dispatching a tool | `name`, `args`, `ts`, `fmt` |
-| `tool_result` | After receiving tool result | `name`, `result`, `streamed`, `files`, `diff_summary`, `started_at`, `ended_at`, `duration_ms`, `fmt` |
+| `tool_call` | Before dispatching a tool | `name`, `args`, `call_id`, `ts`, `fmt` |
+| `tool_result` | After receiving tool result | `name`, `result`, `streamed`, `call_id`, `files`, `diff_summary`, `started_at`, `ended_at`, `duration_ms`, `fmt` |
 | `content_delta` | Streaming text chunk from the model | `text`, `first`, `no_newline`, `fmt` |
 | `reasoning_delta` | Streaming reasoning trace | `text`, `first`, `no_newline`, `fmt` |
 | `content_stream_end` | End of a streaming content sequence | `no_newline`, `fmt` |
@@ -515,6 +527,9 @@ Every event data dict includes a `"fmt"` key containing a pre-formatted ANSI
 string suitable for direct printing to a terminal — this is what the default
 handler uses.  Custom handlers may ignore `"fmt"` and use the other keys
 instead.
+
+`call_id` pairs a `tool_call` with its `tool_result` (parallel calls can
+interleave); it is the API tool-call id and the `tool_use_id` hooks receive.
 
 The `tool_result` event includes additional metadata for file-writing tools:
 

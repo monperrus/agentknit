@@ -133,6 +133,7 @@ from .tool_library import (
     enable_rtk_rewrite,
     get_tool_output_stream,
     set_tool_output_stream,
+    set_ask_user_handler,
     CANONICAL_TOOLS,
     SUPERSEDED_TOOLS,
 )
@@ -210,6 +211,8 @@ __all__ = [
     "enable_rtk_rewrite",
     # where live tool output goes
     "get_tool_output_stream", "set_tool_output_stream",
+    # where ask_user questions go
+    "set_ask_user_handler",
     # which tool implementation to use
     "CANONICAL_TOOLS", "SUPERSEDED_TOOLS",
     # nohup tools (async_toolkit)

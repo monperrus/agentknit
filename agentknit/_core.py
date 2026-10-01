@@ -4367,11 +4367,11 @@ def _handle_tool_call(
             _write_journal_record(session, {"type": "tool_end", "call_id": call_id,
                                             "name": name, "result": result,
                                             "outcome": "hook_deny"})
-        _emit(session, "tool_call", name=name, args=args,
+        _emit(session, "tool_call", name=name, args=args, call_id=call_id,
               ts=datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
               fmt=fmt_call(name, args))
         _emit(session, "tool_result", name=name, result=result, streamed=False,
-              files=None, diff_summary=None, fmt=fmt_result(result))
+              call_id=call_id, files=None, diff_summary=None, fmt=fmt_result(result))
         _log(session, {"type": "tool_result", "name": name,
                        "python_function": getattr(entry.get("python_function"),
                                                   "__name__",
@@ -4412,7 +4412,7 @@ def _handle_tool_call(
     _log(session, {"type": "tool_call", "name": name,
                    "python_function": pf_name, "args": args,
                    "ts": call_ts})
-    _emit(session, "tool_call", name=name, args=args, ts=call_ts,
+    _emit(session, "tool_call", name=name, args=args, call_id=call_id, ts=call_ts,
           fmt=fmt_call(name, args, call_ts))
 
     _tool_module._tool_context.session_id = session.get("session_id")
@@ -4455,7 +4455,7 @@ def _handle_tool_call(
                                                     "result": result,
                                                     "outcome": "hook_ask_deny"})
                 _emit(session, "tool_result", name=name, result=result,
-                      streamed=False, files=None, diff_summary=None,
+                      streamed=False, call_id=call_id, files=None, diff_summary=None,
                       fmt=fmt_result(result))
                 _log(session, {"type": "tool_result", "name": name,
                                "python_function": getattr(
@@ -4506,7 +4506,7 @@ def _handle_tool_call(
                                                 "name": name, "result": failure,
                                                 "outcome": "error"})
             _emit(session, "tool_result", name=name, result=failure, streamed=False,
-                  files=None, diff_summary=None, fmt=fmt_result(failure))
+                  call_id=call_id, files=None, diff_summary=None, fmt=fmt_result(failure))
             _log(session, {"type": "tool_error", "name": name,
                            "python_function": pf_name, "result": failure,
                            "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
@@ -4563,7 +4563,7 @@ def _handle_tool_call(
     # Pass file-change metadata from log_data to the event payload
     # so consumers (e.g. Telegram controller) can show "Changed path +5 -2".
     _emit(session, "tool_result",
-          name=name, result=result, streamed=streamed,
+          name=name, result=result, streamed=streamed, call_id=call_id,
           files=log_data.get("files"),
           diff_summary=log_data.get("diff_summary"),
           started_at=_iso_stamp(tool_started_at),
@@ -5252,7 +5252,8 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                                 "name": tc.function.name, "result": result,
                                 "outcome": "error"})
                             _emit(session, "tool_result", name=tc.function.name,
-                                  result=result, streamed=False, fmt=fmt_result(result))
+                                  result=result, streamed=False, call_id=tc.id,
+                                  fmt=fmt_result(result))
                             _log(session, {"type": "tool_error",
                                            "name": tc.function.name,
                                            "result": result,

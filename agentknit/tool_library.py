@@ -105,6 +105,21 @@ def set_tool_output_stream(stream: "IO[str] | None") -> None:
     _tool_output_stream = stream
 
 
+_ask_user_handler: "Callable[[str, list[str]], str] | None" = None
+
+
+def set_ask_user_handler(handler: "Callable[[str, list[str]], str] | None") -> None:
+    """Answer ``ask_user`` / ``ask_user_question`` with *handler* instead of stdin.
+
+    For hosts where the user is not at this terminal (a chat bridge, a phone).
+    The handler gets the question and the list of options (empty for a free
+    answer) and returns the answer; raising makes the tool report a failure.
+    Pass ``None`` to restore the stdin prompt.
+    """
+    global _ask_user_handler
+    _ask_user_handler = handler
+
+
 def get_tool_output_stream() -> "IO[str]":
     """Return the stream live tool output is currently written to."""
     return _tool_output_stream if _tool_output_stream is not None else sys.stdout
@@ -482,12 +497,18 @@ def t_run(command: str) -> tuple[str, dict[str, object]]:
 
 def t_ask_user(question: str) -> tuple[str, dict[str, object]]:
     """Prompt the user interactively and return their answer."""
-    print(f"\n{_YEL}{_BOLD}? {question}{_RESET}")
-    try:
-        answer = input(f"{_RL_BOLD}Your answer:{_RL_RESET} ").strip()
-    except (EOFError, KeyboardInterrupt):
-        answer = ""
-        print()
+    if _ask_user_handler is not None:
+        try:
+            answer = _ask_user_handler(question, [])
+        except Exception as e:
+            return _tool_failure(f"ERROR: no answer from user: {e}")
+    else:
+        print(f"\n{_YEL}{_BOLD}? {question}{_RESET}")
+        try:
+            answer = input(f"{_RL_BOLD}Your answer:{_RL_RESET} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+            print()
     r = json.dumps({"answer": answer})
     return r, {"result": r}
 
@@ -532,23 +553,29 @@ def t_ask_user_question(question: str = '', options: str = '') -> tuple[str, dic
             except (json.JSONDecodeError, TypeError):
                 parsed_options = [opt.strip() for opt in options.split(',') if opt.strip()]
 
-    _play_ask_sound()
-    print(f"\n{_YEL}{_BOLD}? {question}{_RESET}")
-    if parsed_options:
-        for i, opt in enumerate(parsed_options, 1):
-            print(f"  {i}. {opt}")
+    if _ask_user_handler is not None:
+        try:
+            answer = _ask_user_handler(question, [str(o) for o in parsed_options]).strip()
+        except Exception as e:
+            return _tool_failure(f"ERROR: no answer from user: {e}")
+    else:
+        _play_ask_sound()
+        print(f"\n{_YEL}{_BOLD}? {question}{_RESET}")
+        if parsed_options:
+            for i, opt in enumerate(parsed_options, 1):
+                print(f"  {i}. {opt}")
 
-    # Pause the background _InputCollector so it doesn't steal stdin.
-    collector = _input_collector
-    if collector is not None:
-        collector.pause()
-    try:
-        answer = input(f"{_RL_BOLD}Your answer:{_RL_RESET} ").strip()
-    except (EOFError, KeyboardInterrupt):
-        return _tool_failure('ERROR: No user input available')
-    finally:
+        # Pause the background _InputCollector so it doesn't steal stdin.
+        collector = _input_collector
         if collector is not None:
-            collector.resume()
+            collector.pause()
+        try:
+            answer = input(f"{_RL_BOLD}Your answer:{_RL_RESET} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return _tool_failure('ERROR: No user input available')
+        finally:
+            if collector is not None:
+                collector.resume()
 
     if parsed_options and answer.isdigit():
         idx = int(answer)

@@ -5802,7 +5802,7 @@ def create_client(schema: "dict[str, Any]") -> "openai.OpenAI | SubprocessOpenAI
     single in-flight call, so nothing ever bounds it.
     """
     schema = _normalize_schema(schema)
-    if schema.get("inference_db"):
+    if schema.get("inference_db") and schema.get("_inference_db_applied") != schema["inference_db"]:
         from . import inference_db
         schema = inference_db.apply_entry(schema)
     endpoint    = schema.get("endpoint") or DEFAULT_ENDPOINT

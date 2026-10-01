@@ -101,6 +101,15 @@ def test_create_client_uses_entry(db: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert client._extra_headers == {"x-extra": "1"}
 
 
+def test_endpoint_override_after_load_is_kept(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENTKNIT_TEST_AZ_KEY", "k")
+    schema = load_specification("k3", inference_db="az")
+    schema["endpoint"] = "https://gateway.example/v1"
+    client = _core.create_client(schema)
+    assert client._base_url == "https://gateway.example/v1"
+    assert client._auth_header == "api-key"
+
+
 def test_auth_none(db: Path) -> None:
     schema = load_specification("m", inference_db="free")
     assert _core._get_key_for_schema(schema) == ""

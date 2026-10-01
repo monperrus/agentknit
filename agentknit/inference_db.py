@@ -76,6 +76,9 @@ def apply_entry(schema: dict[str, Any], entry: dict[str, Any] | None = None) -> 
     model = str(schema.get("model") or "")
     out = dict(schema)
     out["inference_db"] = entry["id"]
+    # Marks the entry as applied, so create_client does not re-apply it over
+    # a caller's later, deliberate override (e.g. an ad-hoc gateway endpoint).
+    out["_inference_db_applied"] = entry["id"]
     out["endpoint"] = entry_url(entry, model)
     out["auth_header"] = AUTH_HEADERS.get(str(entry.get("auth", "bearer")), "Authorization")
     if entry.get("headers"):

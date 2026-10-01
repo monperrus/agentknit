@@ -120,5 +120,11 @@ def test_session_records_entry_for_resume(db: Path) -> None:
     assert session["auth"]["inference_db"] == "az"
 
 
+def test_openrouter_entry_keeps_rotation(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_core, "get_api_key", lambda: "rotated")
+    schema = {"model": "m", "endpoint": "https://openrouter.ai/api/v1", "inference_db": "free"}
+    assert _core._get_key_for_schema(schema) == "rotated"
+
+
 def test_entry_url_without_query() -> None:
     assert inference_db.entry_url({"url": "https://x.example/v1/"}) == "https://x.example/v1"

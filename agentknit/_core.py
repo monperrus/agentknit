@@ -5751,11 +5751,15 @@ def _get_key_for_schema(schema: "dict[str, Any]") -> str:
             f"Cannot obtain API key: environment variable {key_env} is not set."
         )
 
+    endpoint = schema.get("endpoint") or DEFAULT_ENDPOINT
     if schema.get("inference_db"):
+        # OpenRouter keeps its balance check + rotation (same key name as
+        # the db's openrouter entry); every other entry uses its own sources.
+        if _endpoint_is_openrouter(endpoint):
+            return get_api_key()
         from . import inference_db
         return inference_db.resolve_key(inference_db.load_entry(str(schema["inference_db"])))
 
-    endpoint = schema.get("endpoint") or DEFAULT_ENDPOINT
     if _endpoint_is_openrouter(endpoint):
         return get_api_key()
 

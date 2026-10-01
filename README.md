@@ -873,6 +873,31 @@ endpoint/key of the model you named, and a later resume of that session binds
 to the new provider. The original file is left untouched as the record of
 where the history came from.
 
+## inference-db endpoints
+
+An [inference-db](https://github.com/monperrus/inference-db) entry
+(`~/.config/inference-db/endpoints.toml`, or `$INFERENCE_DB`) can supply the
+endpoint, the key and the provider's request quirks, read with the standard
+library only:
+
+```bash
+agentknit k3 --inference-db kimi-coding "task"
+```
+
+```python
+schema = agentknit.load_specification("k3", inference_db="kimi-coding")
+# or, on an already loaded schema: schema["inference_db"] = "kimi-coding"
+```
+
+The entry decides the endpoint (`url` with `{model}` filled, plus its
+`query`), the auth header style (`bearer`, `x-api-key`, `api-key`, `none`),
+extra headers, and body fields forced on every request (`params` and
+`model_params.<model>`, e.g. Kimi `k3` only accepts `temperature = 1`). The
+key comes from the entry's sources in order (keyring, env, JSON file,
+command), unless the schema sets `keyring_service`+`keyring_username` or
+`key_env` explicitly, which still win. The entry id is recorded in the
+session's `auth`, so a resume uses it again.
+
 ## rtk Integration (optional token savings)
 
 [rtk](https://github.com/rtk-ai/rtk) is a CLI proxy that rewrites shell

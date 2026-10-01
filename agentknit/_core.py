@@ -748,7 +748,25 @@ def _load_spec_file(path: Path) -> "dict[str, Any]":
     return data
 
 
-def load_specification(model: str, endpoint: str, spec_path: str | None = None) -> "dict[str, Any]":
+def load_specification(model: str, endpoint: str = "", spec_path: str | None = None,
+                       inference_db: str | None = None) -> "dict[str, Any]":
+    """Load an agent spec for `model`; see :func:`_load_specification`.
+
+    :param inference_db: Optional inference-db entry id. When set, the
+        endpoint comes from that entry (``endpoint`` is ignored) and the
+        returned schema carries ``inference_db`` plus the entry's quirks
+        (auth header, extra headers, forced request params); the key is
+        resolved from the entry's sources at client creation.
+    """
+    if not inference_db:
+        return _load_specification(model, endpoint, spec_path)
+    from . import inference_db as idb
+    entry = idb.load_entry(inference_db)
+    schema = _load_specification(model, idb.entry_url(entry, model), spec_path)
+    return idb.apply_entry(schema, entry)
+
+
+def _load_specification(model: str, endpoint: str, spec_path: str | None = None) -> "dict[str, Any]":
     """Load an agent spec for `model`, without ever probing the model itself.
 
     agentknit only consumes specs — it does not generate them by talking to a
@@ -2687,7 +2705,7 @@ def _bind_schema_to_resumed_session(
         # Key sources the resumed session never used are dropped, not merged:
         # resolution order (keyring → key_env → OPENROUTER_API_KEY) would
         # otherwise resurrect a key for the wrong provider.
-        for key in ("auth", "keyring_service", "keyring_username", "key_env"):
+        for key in ("auth", "inference_db", "keyring_service", "keyring_username", "key_env"):
             if key in auth:
                 if bound.get(key) != auth[key]:
                     changes.append(f"{key} → {auth[key]!r}")
@@ -2913,6 +2931,9 @@ class Session(TypedDict):
     cache_ttl_seconds: NotRequired[int]
     streaming: bool
     options: list[str]               # extra request options passed verbatim
+    # Body fields forced on every request (inference-db params/model_params).
+    # NotRequired: sessions saved before inference-db support lack the key.
+    request_params: NotRequired[dict[str, Any]]
     # events
     on_event: EventCallback
     # compaction
@@ -3512,10 +3533,10 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         # order.  "auth" (the scheme, e.g. "opencode-github-copilot") is
         # orthogonal and always recorded when present.
         "auth":            ({k: schema[k] for k in
-                            ("auth", "keyring_service", "keyring_username")
+                            ("auth", "inference_db", "keyring_service", "keyring_username")
                             if schema.get(k) is not None}
                            if schema.get("keyring_service") and schema.get("keyring_username")
-                           else {k: schema[k] for k in ("auth", "key_env")
+                           else {k: schema[k] for k in ("auth", "inference_db", "key_env")
                                  if schema.get(k) is not None}),
         "session_dir":     Path(session_dir) if session_dir is not None else None,
         "log_path":        log_path,
@@ -3531,6 +3552,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         "on_event":        on_event or _default_event_handler,
         "streaming":       streaming,
         "options":         schema.get("options") or [],
+        "request_params":  dict(schema.get("request_params") or {}),
         "session_start_ts": session_start_ts,
         "compaction_enabled": (
             compaction_enabled if compaction_enabled is not None
@@ -3829,6 +3851,9 @@ def _emit_and_log_error(
 
 
 def _complete(client: openai.OpenAI | SubprocessOpenAI, session: Session, **kwargs: Any) -> Any:
+    # Endpoint-declared body fields (e.g. a model that only accepts
+    # temperature=1) win over whatever the caller passed.
+    kwargs.update(session.get("request_params") or {})
     kwargs["user"] = session["cache_key"]
     if session.get("max_output_tokens"):
         kwargs.setdefault("max_tokens", session["max_output_tokens"])
@@ -5726,6 +5751,10 @@ def _get_key_for_schema(schema: "dict[str, Any]") -> str:
             f"Cannot obtain API key: environment variable {key_env} is not set."
         )
 
+    if schema.get("inference_db"):
+        from . import inference_db
+        return inference_db.resolve_key(inference_db.load_entry(str(schema["inference_db"])))
+
     endpoint = schema.get("endpoint") or DEFAULT_ENDPOINT
     if _endpoint_is_openrouter(endpoint):
         return get_api_key()
@@ -5769,6 +5798,9 @@ def create_client(schema: "dict[str, Any]") -> "openai.OpenAI | SubprocessOpenAI
     single in-flight call, so nothing ever bounds it.
     """
     schema = _normalize_schema(schema)
+    if schema.get("inference_db"):
+        from . import inference_db
+        schema = inference_db.apply_entry(schema)
     endpoint    = schema.get("endpoint") or DEFAULT_ENDPOINT
     binary_path = _parse_run_uri(endpoint) or _parse_run_uri(schema.get("model", ""))
     auth        = schema.get("auth")
@@ -5788,6 +5820,10 @@ def create_client(schema: "dict[str, Any]") -> "openai.OpenAI | SubprocessOpenAI
     if auth == "opencode-github-copilot":
         return openai.OpenAI(api_key=_get_opencode_token(), base_url=endpoint,
                              auth_header="X-API-Key", **kwargs)
+    if schema.get("auth_header"):
+        kwargs["auth_header"] = schema["auth_header"]
+    if schema.get("extra_headers"):
+        kwargs["extra_headers"] = schema["extra_headers"]
     return openai.OpenAI(api_key=_get_key_for_schema(schema), base_url=endpoint, **kwargs)
 
 
@@ -6654,6 +6690,9 @@ def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
     p.add_argument("model", help="Model ID, e.g. qwen/qwen3-vl-32b-instruct")
     p.add_argument("task", nargs="*", help="Task to run (omit for REPL or stdin)")
     p.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="Endpoint base URL")
+    p.add_argument("--inference-db", metavar="ID", dest="inference_db", default=None,
+                   help="Take endpoint, key and request quirks from this inference-db "
+                        "entry (~/.config/inference-db/endpoints.toml); overrides --endpoint")
     p.add_argument("--spec-path", metavar="PATH", dest="spec_path", default=None,
                    help="Load the agent spec from this JSON file, skipping all "
                         "name-based spec lookup and model probing")
@@ -6745,7 +6784,10 @@ def main(argv: "list[str] | None" = None) -> None:
         enable_osc8_hyperlinks()
     args   = parse_args(argv)
     try:
-        schema = load_specification(args.model, args.endpoint, spec_path=args.spec_path)
+        # inference_db is passed only when given: keeps old-signature
+        # replacements of load_specification working.
+        idb_kw = {"inference_db": args.inference_db} if args.inference_db else {}
+        schema = load_specification(args.model, args.endpoint, spec_path=args.spec_path, **idb_kw)
         if args.session:
             # A resumed session must continue on the endpoint it was run on,
             # not on whatever --endpoint / the OpenRouter default resolves to.

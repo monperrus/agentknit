@@ -65,6 +65,11 @@ def request_params(entry: dict[str, Any], model: str = "") -> dict[str, Any]:
     return {**(entry.get("params") or {}), **((entry.get("model_params") or {}).get(model) or {})}
 
 
+def tool_loading(entry: dict[str, Any], model: str = "") -> str:
+    """Deferred tool loading mechanism: ``model_tool_loading[model]``, else ``tool_loading``, else ``none``."""
+    return str((entry.get("model_tool_loading") or {}).get(model) or entry.get("tool_loading") or "none")
+
+
 def apply_entry(schema: dict[str, Any], entry: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return a copy of *schema* with the entry's endpoint and quirks applied.
 
@@ -86,6 +91,10 @@ def apply_entry(schema: dict[str, Any], entry: dict[str, Any] | None = None) -> 
     params = request_params(entry, model)
     if params:
         out["request_params"] = {**(schema.get("request_params") or {}), **params}
+    # The endpoint's native deferred tool loading; an explicit spec value wins.
+    mode = tool_loading(entry, model)
+    if mode != "none":
+        out.setdefault("tool_loading", mode)
     return out
 
 

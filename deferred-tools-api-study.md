@@ -49,10 +49,13 @@ Background: provider survey and measurements in `deferred-tool-experiments/docs/
 
 ## Open issues before merging
 
-1. **Mode selection belongs in inference-db.**
-   - Today the caller must know that `kimi-coding` means `"kimi"` and `zai-coding` means `"glm"`.
-   - A `tool_loading` quirk per entry (and per model: Kimi documents it only for `kimi-k3`) would make it automatic.
-   - Unknown endpoints should fall back to a portable `"grow"` mode (append the definition to `tools`), which works everywhere but costs a cache miss.
+1. ✅ **Mode selection comes from inference-db** (inference-db branch `tool-loading`, data commit `692ac2f`).
+   - `tool_loading` / `model_tool_loading` name the mechanism: `none`, `system-message-tools` or `defer-loading-tool-reference`.
+   - `apply_entry` copies it into the spec unless the spec sets one, and the strategy is chosen from it.
+   - Measured values, 2026-10-03:
+     - `kimi-coding`: `k3`, `k3-256k` and `kimi-for-coding` use system-message-tools; `kimi-for-coding-highspeed` answers 400 "tokenization failed".
+     - `zai-coding`: endpoint-wide defer-loading-tool-reference. Every model name is served by `glm-5.3` or `glm-5.3-flash` (see the entry's notes).
+   - Still open: a portable `"grow"` fallback for endpoints without native support.
 2. **Resume is only partly covered.**
    - The catalogue is rebuilt from the schema, and the reveal messages survive in the snapshot.
    - But the GLM un-deferred set and `_revealed_tools` are not persisted. A GLM tool revealed before a compaction is hidden again after resume.
@@ -62,8 +65,7 @@ Background: provider survey and measurements in `deferred-tool-experiments/docs/
    - Porting must rewrite reveals to the target's mechanism, or to plain eager `tools`.
 4. **Step reducers see the reveal messages** as part of the step. A reducer that drops them silently hides the tools.
    - Contract: reducers must keep `role:system` messages carrying `tools`. Alternatively, reveals could be applied after the reducer.
-5. **Hooks:** `search_tools` bypasses `PreToolUse`/`PostToolUse` and the durable journal's `tool_start`/`tool_end`, but still emits `tool_call`/`tool_result` events.
-   - Decide whether hooks should see it.
+5. **Hooks:** decided that `search_tools` stays internal. It bypasses `PreToolUse`/`PostToolUse` and the journal's `tool_start`/`tool_end`, but still emits `tool_call`/`tool_result` events.
 6. **Inline mode** (non-structured tool calls) is not supported. Deferred tools stay invisible there.
 7. **Events:** a `tools_revealed` event (names, mode) would let UIs show what the model loaded. The prototype only logs the search result.
 8. **Search quality:** the keyword default reveals decoys (top 3), about +150 tokens each.

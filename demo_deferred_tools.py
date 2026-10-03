@@ -85,7 +85,11 @@ def run(mode: str, compact: bool = False) -> tuple[list[bool], list[str], list[t
     session = agentknit.init_session(schema, non_interactive=True, bare=True, on_event=on_event,
                                      system_prompt_supplement=SYSTEM,
                                      strict_cache_proof=False,
-                                     tool_loading=None if mode.startswith("eager") else provider)
+                                     # Deferred modes come from inference-db's tool_loading quirk.
+                                     tool_loading="eager" if mode.startswith("eager") else None)
+    if not mode.startswith("eager"):
+        print(f"tool_loading from inference-db: {schema.get('tool_loading')} -> {session.get('tool_loading')}",
+              flush=True)
     client = agentknit.create_client(schema)
     ok = []
     turn_calls = []

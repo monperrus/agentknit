@@ -28,6 +28,9 @@ from typing import Any, Callable
 
 SEARCH_TOOL_NAME = "search_tools"
 MODES = ("eager", "kimi", "glm")
+# inference-db names the mechanism, not the vendor (`tool_loading` quirk).
+MODE_ALIASES = {"none": "eager", "system-message-tools": "kimi",
+                "defer-loading-tool-reference": "glm"}
 
 ToolSearch = Callable[[str, list[dict[str, Any]]], list[str]]
 
@@ -81,6 +84,7 @@ def keyword_search(query: str, catalog: list[dict[str, Any]], limit: int = 3) ->
 
 def prepare(session: dict[str, Any], mode: str, search: ToolSearch | None = None) -> None:
     """Rewrite ``session["tools"]`` for *mode* and record the deferred catalog."""
+    mode = MODE_ALIASES.get(mode, mode)
     if mode not in MODES:
         raise ValueError(f"tool_loading must be one of {MODES}, got {mode!r}")
     tools: list[dict[str, Any]] = session["tools"]

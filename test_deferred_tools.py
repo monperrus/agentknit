@@ -176,6 +176,13 @@ def test_resume_normalisation_accepts_reveal_messages() -> None:
     assert core._normalise_for_resume(msgs) == msgs
 
 
+def test_inference_db_mechanism_names_select_the_strategy(tmp_path) -> None:
+    assert names(session_for("system-message-tools", tmp_path / "a")["tools"]) == ["search_tools", "echo"]
+    glm = session_for("defer-loading-tool-reference", tmp_path / "b")
+    assert glm["tool_loading"] == "glm" and len(glm["tools"]) == 4
+    assert session_for("none", tmp_path / "c")["tool_loading"] == "eager"
+
+
 def test_unknown_mode_rejected(tmp_path) -> None:
     with pytest.raises(ValueError):
         session_for("anthropic", tmp_path)

@@ -64,6 +64,20 @@ def test_load_specification_applies_entry(db: Path) -> None:
     assert schema["request_params"] == {"seed": 7, "temperature": 1}
 
 
+def test_tool_loading_from_entry() -> None:
+    entry = {"id": "x", "url": "https://x.example/v1", "tool_loading": "defer-loading-tool-reference",
+             "model_tool_loading": {"k3": "system-message-tools"}}
+    assert inference_db.tool_loading(entry, "k3") == "system-message-tools"
+    assert inference_db.tool_loading(entry, "other") == "defer-loading-tool-reference"
+    assert inference_db.tool_loading({"id": "y"}, "k3") == "none"
+    schema = inference_db.apply_entry({"model": "k3"}, entry)
+    assert schema["tool_loading"] == "system-message-tools"
+    # An explicit spec choice wins over the entry.
+    assert inference_db.apply_entry({"model": "k3", "tool_loading": "eager"}, entry)["tool_loading"] == "eager"
+    # Endpoints without native support leave the spec untouched.
+    assert "tool_loading" not in inference_db.apply_entry({"model": "k3"}, {"id": "y", "url": "u"})
+
+
 def test_unknown_entry_is_a_spec_error(db: Path) -> None:
     with pytest.raises(AgentSpecInvalidError, match="no entry 'nope'"):
         load_specification("m", inference_db="nope")

@@ -2434,7 +2434,9 @@ def _normalise_for_resume(
     # Keep only the latest token-awareness reading across the transcript.
     last_ta_idx = -1
     for i, m in enumerate(msgs):
-        if _TA_WARNING_RE.search(m.get("content") or ""):
+        # Content may be a block list (glm tool_reference results).
+        content = m.get("content")
+        if isinstance(content, str) and _TA_WARNING_RE.search(content):
             last_ta_idx = i
     if last_ta_idx >= 0:
         msgs = [

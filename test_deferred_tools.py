@@ -164,6 +164,18 @@ def test_glm_compaction_rewrites_references_and_undefers(tmp_path) -> None:
     assert not deferred.is_deferred(weather) and deferred.is_deferred(stock)
 
 
+def test_resume_normalisation_accepts_reveal_messages() -> None:
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                                              "function": {"name": "search_tools", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": [{"type": "tool_reference", "name": "get_weather"}]},
+        {"role": "system", "tools": [{"type": "function", "function": {"name": "get_weather"}}]},
+    ]
+    assert core._normalise_for_resume(msgs) == msgs
+
+
 def test_unknown_mode_rejected(tmp_path) -> None:
     with pytest.raises(ValueError):
         session_for("anthropic", tmp_path)

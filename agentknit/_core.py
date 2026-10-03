@@ -4109,7 +4109,8 @@ def _compact_once(
         pre_resp = client.chat.completions.create(
             model=model,
             messages=pre_compaction_messages,
-            temperature=0,
+            # Endpoint quirk (e.g. Kimi k3 accepts only temperature=1).
+            temperature=(session.get("request_params") or {}).get("temperature", 0),
             max_tokens=session.get("compaction_target_tokens", DEFAULT_COMPACTION_TARGET_TOKENS),
             on_rate_limit_wait=_rate_limit_wait_callback(session),
         )
@@ -4140,7 +4141,7 @@ def _compact_once(
         resp = client.chat.completions.create(
             model=model,
             messages=compaction_messages,
-            temperature=0,
+            temperature=(session.get("request_params") or {}).get("temperature", 0),
             max_tokens=session.get("compaction_target_tokens", DEFAULT_COMPACTION_TARGET_TOKENS),
             on_rate_limit_wait=_rate_limit_wait_callback(session),
         )

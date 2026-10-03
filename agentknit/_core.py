@@ -128,6 +128,7 @@ from . import async_toolkit as _async_module
 from . import tool_library as _tool_module
 from .tool_library import TOOL_LIBRARY, _ASK_USER_FNS
 from .tool import Tool, build_tool_spec, register_tools_in_library
+from . import _deferred_tools as _deferred
 from .exceptions import (
     AgentSpecDisabledError, AgentSpecInvalidError,
     PricingLimitExceededError, AuthenticationError, CacheProofError,
@@ -3068,6 +3069,8 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                  step_reducer: "StepReducer | None" = None,
                  control_socket: bool = False,
                  bare: bool = False,
+                 tool_loading: str | None = None,
+                 tool_search: "_deferred.ToolSearch | None" = None,
                  ) -> "Session":
     """Build a stateful session dict (:class:`Session`).
 
@@ -3789,6 +3792,11 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         session["_control_server"] = ControlServer(control_path, session)
         session["control_socket_enabled"] = True
         session["control_socket_path"] = control_path
+    # Deferred tool loading: kwarg → spec → off.  Only touches sessions that
+    # opt in or declare deferred tools, so existing sessions are unchanged.
+    loading = tool_loading or schema.get("tool_loading")
+    if loading or any(_deferred.is_deferred(t) for t in session["tools"]):
+        _deferred.prepare(cast("dict[str, Any]", session), loading or "eager", tool_search)
     if not bare:
         _awareness_checklist(session)
     return session
@@ -4080,6 +4088,9 @@ def _compact_once(
 
     prefix = messages[:split_idx]
     suffix = messages[split_idx:]
+    # The summary calls go out without `tools`: deferred-tool references in
+    # the summarized prefix would not resolve (glm answers 400).
+    prefix = _deferred.before_compaction(prefix)
 
     if not any(m.get("role") != "system" for m in prefix):
         return False  # boundary snapping left nothing to compact
@@ -4177,6 +4188,7 @@ def _compact_once(
         "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
     }
     session["messages"] = system_msgs + [summary_msg] + suffix
+    _deferred.after_compaction(cast("dict[str, Any]", session))
     _write_journal_record(session, {"type": "reset_messages", "reason": "compaction",
                                     "messages": list(session["messages"])})
 
@@ -5216,6 +5228,29 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                     ],
                     "ts": now_ts,
                 })
+                # Messages a deferred-tool reveal adds after this step's tool
+                # results (kimi: a system message carrying the tools).
+                step_extra: list[dict[str, Any]] = []
+
+                def _search_tools_message(tc: Any, args: dict[str, Any]) -> dict[str, Any]:
+                    """Answer the framework's search_tools call (deferred tool loading)."""
+                    call_ts = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+                    _emit(session, "tool_call", name=tc.function.name, args=args,
+                          call_id=tc.id, ts=call_ts, fmt=fmt_call(tc.function.name, args, call_ts))
+                    content, extra, text = _deferred.handle_search(cast("dict[str, Any]", session), args)
+                    step_extra.extend(extra)
+                    _emit(session, "tool_result", name=tc.function.name, result=text,
+                          streamed=False, call_id=tc.id, fmt=fmt_result(text))
+                    _log(session, {"type": "tool_result", "name": tc.function.name,
+                                   "args": args, "result": text, "ts": call_ts})
+                    if isinstance(content, str):
+                        content = _with_pending_ta(content)
+                    # A glm reference list must stay pure (the server drops
+                    # any text block), so pending awareness text waits for the
+                    # next string tool result.
+                    return {"role": "tool", "tool_call_id": tc.id, "content": content,
+                            "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+
                 def _run_one(tc: Any) -> dict[str, Any]:
                     """Parse args and dispatch one tool call; return its message.
 
@@ -5262,6 +5297,9 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                             return {"role": "tool", "tool_call_id": tc.id,
                                     "content": _with_pending_ta(result),
                                     "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+                    if (tc.function.name == _deferred.SEARCH_TOOL_NAME
+                            and _deferred.active(cast("dict[str, Any]", session))):
+                        return _search_tools_message(tc, args)
                     result = _handle_tool_call(tc.function.name, args, session,
                                                call_id=tc.id)
                     return {"role": "tool", "tool_call_id": tc.id,
@@ -5305,6 +5343,11 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                     for tc in msg.tool_calls:
                         _check_cancelled()
                         _append_message(_run_one(tc))
+                # Reveal messages go after *all* the step's tool results: a
+                # message between a tool_call and its result breaks pairing.
+                for extra_msg in step_extra:
+                    _append_message({**extra_msg,
+                                     "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
                 forced_final = _reduce_step(step_start)
                 if forced_final is None:
                     continue
@@ -5867,6 +5910,8 @@ def run_task(
     system_awareness_enabled: bool | None = None,
     git_awareness_enabled: bool | None = None,
     change_awareness_enabled: bool | None = None,
+    tool_loading: str | None = None,
+    tool_search: "_deferred.ToolSearch | None" = None,
 ) -> SessionResult:
     """Run a single task against the agent and return a :class:`SessionResult`.
 
@@ -5930,6 +5975,8 @@ def run_task(
         system_awareness_enabled=system_awareness_enabled,
         git_awareness_enabled=git_awareness_enabled,
         change_awareness_enabled=change_awareness_enabled,
+        tool_loading=tool_loading,
+        tool_search=tool_search,
     )
     try:
         return run_turn(client, schema["model"], session, task)
@@ -5980,6 +6027,8 @@ def run_agent(
     hooks: "str | Path | dict[str, Any] | list[Any] | None" = None,
     hooks_enabled: bool | None = None,
     step_reducer: "StepReducer | None" = None,
+    tool_loading: str | None = None,
+    tool_search: "_deferred.ToolSearch | None" = None,
 ) -> SessionResult:
     """Run a one-shot agent from direct tool definitions.
 
@@ -6030,6 +6079,8 @@ def run_agent(
         system_awareness_enabled=system_awareness_enabled,
         git_awareness_enabled=git_awareness_enabled,
         change_awareness_enabled=change_awareness_enabled,
+        tool_loading=tool_loading,
+        tool_search=tool_search,
     )
 
 

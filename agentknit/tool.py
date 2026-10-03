@@ -67,6 +67,13 @@ class Tool:
         Responses form and the chat-completions nesting
         ``{"type": "grammar", "grammar": {...}}`` — and are re-emitted
         exactly as given.
+    deferred
+        When ``True`` the tool is hidden from the model until it is found
+        through the framework's ``search_tools`` tool.  ``build_tool_spec``
+        marks it with ``"defer_loading": true`` inside ``function``; the
+        session's ``tool_loading`` mode decides how it is revealed (see
+        :mod:`agentknit._deferred_tools`).  With the default ``"eager"`` mode
+        the marker is stripped and the tool is sent up front as before.
     """
 
     name: str
@@ -75,6 +82,7 @@ class Tool:
     parameters: dict[str, object] | None = None
     param_map: dict[str, str] | None = None
     custom_format: dict[str, object] | None = None
+    deferred: bool = False
 
     @property
     def python_function_name(self) -> str:
@@ -228,14 +236,14 @@ def build_tool_spec(
             })
         else:
             params = tool.resolved_parameters
-            schema.append({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": params,
-                },
-            })
+            function: dict[str, object] = {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": params,
+            }
+            if tool.deferred:
+                function["defer_loading"] = True
+            schema.append({"type": "function", "function": function})
 
         # ── dispatch entry ───────────────────────────────────────────────
         dispatch[tool.name] = {

@@ -2154,11 +2154,31 @@ def _awareness_checklist(session: Session) -> None:
     _emit(session, "awareness_checklist", status=status, fmt=fmt)
 
 
+# Records that only frame a session.  A session that logs nothing else never
+# received a task, so it leaves no transcript at all (see _log).
+_LIFECYCLE_RECORDS = frozenset({
+    "session_start", "session_resumed", "session_restored",
+    "journal_recovered", "session_end",
+})
+
+
 def _log(session: Session, record: "dict[str, Any]") -> None:
     record["ts"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     record["cwd"] = os.getcwd()
+    records = [record]
+    # Lifecycle records are held back until the first record of substance
+    # (user message, tool call, ...): sessions opened and closed without a
+    # task used to leave thousands of empty transcripts behind.
+    pending = session.get("_log_pending")
+    if pending is not None:
+        if record.get("type") in _LIFECYCLE_RECORDS:
+            pending.append(record)
+            return
+        session["_log_pending"] = None
+        records = pending + records
     with session["log_path"].open("a") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        for item in records:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
         if session.get("_durable_capture"):
             f.flush()
             os.fsync(f.fileno())
@@ -3006,6 +3026,9 @@ class Session(TypedDict):
     _event_handlers: NotRequired[dict[str, list[EventCallback]]]
     _content_was_streamed: NotRequired[bool]
     _durable_capture: NotRequired[bool]
+    # lifecycle log records held back until the session logs real content
+    # (None once flushed; absent means write-through)
+    _log_pending: NotRequired["list[dict[str, Any]] | None"]
     # hooks runtime state: turn id (prompt_id), stop_hook_active guard,
     # pending additionalContext, and results of async hooks.
     _hook_state: NotRequired[dict[str, Any]]
@@ -3259,6 +3282,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         restored["_durable_capture"] = bool(restored.get("session_dir") or restored.get("durable_sink"))
         restored["log_path"] = _open_log(model, restored.get("session_id") or uuid.uuid4().hex[:12],
                                            restored.get("session_dir"))
+        restored["_log_pending"] = []
         # Reset compaction state so the new session starts fresh.
         restored["compaction_last_prompt_tokens"] = 0
         # Old snapshots predate token awareness: backfill defaults so the
@@ -3545,6 +3569,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                                  if schema.get(k) is not None}),
         "session_dir":     Path(session_dir) if session_dir is not None else None,
         "log_path":        log_path,
+        "_log_pending":    [],
         "non_interactive": non_interactive,
         "usage_totals":    {"prompt": 0, "completion": 0, "total": 0,
                             "cached": 0, "cache_write": 0},

@@ -3697,6 +3697,10 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     for _ctx in (_ss_ctx, _async_ctx):
         if _ctx:
             session["messages"][0]["content"] += "\n\n" + _ctx
+    if _ss_ctx:  # in the system prompt now: not a second time on the next tool result
+        _pending = (session.get("_hook_state") or {}).get("pending_context") or []
+        if _ss_ctx in _pending:
+            _pending.remove(_ss_ctx)
     if resumed_from:
         flatten_resume = bool(behaviour.get("resume_rejects_stale_tool_call_ids"))
         if session_dir is not None:
@@ -3814,6 +3818,10 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                         ),
                         "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
                     })
+    if _ss_ctx and _ss_ctx not in str(session["messages"][0].get("content", "")):
+        # Resumed: the snapshot's system message replaced the one carrying the
+        # SessionStart context, so it rides on the next prompt instead.
+        session.setdefault("_hook_state", {}).setdefault("pending_context", []).append(_ss_ctx)
     if control_socket:
         session["_control_inbox"] = queue.Queue()
         control_path = _control_socket_path(model, session_id, session_dir)
@@ -5047,6 +5055,15 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
         ground = _ground_moved_preamble(session)
         if ground:
             preamble = f"{preamble}\n{ground}" if preamble else ground
+        # Hook context queued since the last tool result (UserPromptSubmit's
+        # additionalContext, a resumed session's SessionStart) rides on this
+        # prompt, as in Claude Code; it would otherwise wait for a tool result
+        # that a reply without tool calls never produces.
+        hook_ctx = [c for c in [_drain_pending_hook_context(session),
+                                *(hook_state.pop("pending_context", None) or [])] if c]
+        if hook_ctx:
+            joined = "\n".join(hook_ctx)
+            preamble = f"{preamble}\n\n{joined}" if preamble else joined
         if preamble:
             submitted = f"{task}\n\n{preamble}" if task else preamble
         header = sender_header(who)

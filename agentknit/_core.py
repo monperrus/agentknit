@@ -2474,6 +2474,7 @@ def _normalise_for_resume(
             new = m.get("content", "")
             normalised[-1]["content"] = f"{old}\n\n{new}" if old else new
             normalised[-1]["ts"] = m.get("ts")
+            _merge_sender(normalised[-1], m.get("sender"))
         else:
             normalised.append(dict(m))
     if flatten:
@@ -3890,6 +3891,10 @@ def _complete(client: openai.OpenAI | SubprocessOpenAI, session: Session, **kwar
     # temperature=1) win over whatever the caller passed.
     kwargs.update(session.get("request_params") or {})
     kwargs["user"] = session["cache_key"]
+    # A message's sender is agentknit's own record; the model reads it from
+    # the header in the content, and strict providers reject unknown keys.
+    if any("sender" in m for m in kwargs.get("messages") or []):
+        kwargs["messages"] = [{k: v for k, v in m.items() if k != "sender"} for m in kwargs["messages"]]
     if session.get("max_output_tokens"):
         kwargs.setdefault("max_tokens", session["max_output_tokens"])
 
@@ -4751,15 +4756,39 @@ class _InputCollector:
 SENDER_KINDS = ("human", "supervisor", "launcher", "peer", "hook")
 
 
-def _sender_header(sender: "dict[str, str] | None") -> str | None:
-    """The line heading a turn not typed by the operator, for the model."""
+def _merge_sender(msg: dict[str, Any], new: "dict[str, str] | list[dict[str, str]] | None") -> None:
+    """Two user messages merged into one keep every sender, in order.
+
+    ``sender`` stays a dict when one party wrote the message, and becomes a
+    list when several did (a human prompt after a supervisor's that was never
+    answered).  An unmarked message counts as the human's.
+    """
+    def as_list(s: Any) -> list[dict[str, str]]:
+        return list(s) if isinstance(s, list) else [s or {"kind": "human"}]
+    if "sender" not in msg and not new:
+        return
+    merged = as_list(msg.get("sender"))
+    for s in as_list(new):
+        if s != merged[-1]:
+            merged.append(s)
+    msg["sender"] = merged[0] if len(merged) == 1 else merged
+
+
+def sender_header(sender: "dict[str, str] | None") -> str:
+    """The line the model reads above a message that is not the operator's own words.
+
+    ``sender`` is ``{"kind": one of SENDER_KINDS, "name": str}``; the human (or
+    no sender) gets no header, so an operator's prompt reaches the model as typed.
+    """
     if not sender or sender.get("kind", "human") == "human":
-        return None
-    name = sender.get("name") or "an unnamed sender"
-    who = {"supervisor": f"the supervisor {name}",
-           "launcher": f"the launcher {name}",
-           "peer": f"agent session {name}"}.get(sender["kind"], f"an automated message from {name}")
-    return f"[This turn is from {who}, not typed by the operator.]"
+        return ""
+    kind, name = sender["kind"], sender.get("name") or "unnamed"
+    if kind not in SENDER_KINDS:
+        raise ValueError(f"unknown sender kind {kind!r}; one of {SENDER_KINDS}")
+    return {"supervisor": f"[supervisor {name}, answering in the operator's place; not typed by the operator]",
+            "launcher": f"[launcher {name}; not typed by the operator]",
+            "peer": f"[agent session {name}; not typed by the operator]",
+            "hook": f"[{name}, automated; not typed by the operator]"}[kind]
 
 
 def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Session, task: str | None,
@@ -4782,17 +4811,14 @@ def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Sess
     :class:`TimeoutError` is raised when execution next reaches a cancellation
     boundary.
 
-    ``sender`` (``{"kind", "name"}``, kind one of :data:`SENDER_KINDS`) says
-    who wrote ``task`` when it may not be the operator, e.g. a supervisor or
-    an inbox message.  Unless the kind is ``human``, the model reads a line
-    naming the sender above the task.  The sender is also recorded in the
-    UserPromptSubmit hook payload, the journal's ``turn_start`` and the
-    log's ``user`` record.  Omitted, the turn is the operator's, as before.
+    ``sender`` says who wrote ``task`` (``{"kind": "supervisor", "name": "kimi-k3"}``);
+    ``None`` is the human operator.  It is kept on the message, the journal's
+    ``turn_start`` and the UserPromptSubmit payload, and a non-human sender's
+    task reaches the model under :func:`sender_header`.
     """
     if timeout is not None and timeout < 0:
         raise ValueError("timeout must be non-negative or None")
-    if sender is not None and sender.get("kind", "human") not in SENDER_KINDS:
-        raise ValueError(f"sender kind must be one of {SENDER_KINDS}")
+    sender_header(sender)  # validate before the turn starts
 
     active_cancel = cancel or CancelToken()
     timeout_expired: threading.Event | None = None
@@ -4959,8 +4985,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
               timeout_expired: threading.Event | None = None,
               sender: "dict[str, str] | None" = None) -> SessionResult:
     messages   = session["messages"]
-    # Who wrote the task, when the caller says: records carry it only then.
-    with_sender: dict[str, Any] = {"sender": sender} if sender else {}
+    who = dict(sender) if sender else None  # recorded when given; a header only for non-humans
     tools      = session["tools"]
     structured = session["structured"]
     journal    = session.get("_journal")
@@ -4987,7 +5012,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
     # Fires before the task message is appended; block rejects the prompt
     # (nothing is sent to the model) and the reason becomes final_reply.
     if task is not None:
-        ups = _fire_hooks(session, "UserPromptSubmit", prompt=task, **with_sender)
+        ups = _fire_hooks(session, "UserPromptSubmit", prompt=task, sender=who or {"kind": "human"})
         if ups.block or ups.stop:
             reason = (ups.stop_reason or ups.reason
                       or "prompt blocked by UserPromptSubmit hook")
@@ -4999,7 +5024,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             return _session_result_with_reply(session, notice)
 
     if journal is not None:
-        _write_journal_record(session, {"type": "turn_start", "task": task, **with_sender})
+        _write_journal_record(session, {"type": "turn_start", "task": task, **({"sender": who} if who else {})})
 
     def _append_message(msg: dict[str, Any]) -> None:
         """Append a message to the history and durably journal it."""
@@ -5024,9 +5049,9 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             preamble = f"{preamble}\n{ground}" if preamble else ground
         if preamble:
             submitted = f"{task}\n\n{preamble}" if task else preamble
-        header = _sender_header(sender)
+        header = sender_header(who)
         if header:
-            submitted = f"{header}\n\n{submitted}" if submitted else header
+            submitted = f"{header}\n{submitted}"
     if task is None:
         # The prior user message was already journaled before the failed
         # request.  Send that exact transcript again rather than turning a
@@ -5038,15 +5063,16 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
         old = messages[-1]["content"]
         messages[-1]["content"] = f"{old}\n\n{submitted}" if old else submitted
         messages[-1]["ts"] = now_ts
+        _merge_sender(messages[-1], who)
         if journal is not None:
             # A merge replaces prior history; replay it as a replacement,
             # rather than inventing a second submitted user message.
             _write_journal_record(session, {"type": "reset_messages", "reason": "user_merge",
                                             "messages": list(messages)})
     else:
-        _append_message({"role": "user", "content": submitted, "ts": now_ts})
+        _append_message({"role": "user", "content": submitted, "ts": now_ts, **({"sender": who} if who else {})})
     if task is not None:
-        _log(session, {"type": "user", "content": task, "ts": now_ts, **with_sender})
+        _log(session, {"type": "user", "content": task, "ts": now_ts, **({"sender": who} if who else {})})
 
     total_tokens = 0
     max_tokens   = DEFAULT_MAX_TOKENS

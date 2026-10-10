@@ -104,6 +104,17 @@ def test_z_ai_delay_none_when_reset_is_too_far_away():
     assert _retry_delay_for_z_ai(_ZAI_BODY + _reset_at_in(7 * 86400) + '"}}') is None
 
 
+def test_z_ai_delay_waits_through_a_weekly_limit():
+    # dedaub 2026-10-10 06:43: code 1310, reset 34h out; the 6h cap dropped
+    # three turns instead of waiting for the reset.
+    body = ('{"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted. '
+            'Your limit will reset at ')
+    delay = _retry_delay_for_z_ai(body + _reset_at_in(34 * 3600) + '"}}')
+    assert delay is not None and abs(delay - 34 * 3600) <= 10
+    # boundary: still fails closed past a month
+    assert _retry_delay_for_z_ai(body + _reset_at_in(40 * 86400) + '"}}') is None
+
+
 def test_z_ai_delay_zero_when_reset_time_already_passed():
     assert _retry_delay_for_z_ai(_ZAI_BODY + _reset_at_in(-30) + '"}}') == 0.0
 

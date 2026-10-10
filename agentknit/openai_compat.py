@@ -48,9 +48,13 @@ _BEIJING_TZ = _dt.timezone(_dt.timedelta(hours=8))  # no DST in China
 _RESET_AT_RE = re.compile(
     r"reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", re.IGNORECASE
 )
-# Zhipu's longest quota window is 5 hours; anything beyond this margin means
-# the body parse (or its timezone assumption) went wrong.
+# A reset further away than its quota window means the body parse (or its
+# timezone assumption) went wrong. The default window is 5 hours (code 1308);
+# code 1310 is "Weekly/Monthly Limit Exhausted", reset up to a month out
+# (seen 2026-10-10: "reset at 2026-10-12 00:27:25", 34h away).
 _MAX_AUTO_RETRY_SECONDS = 6 * 3600
+_LONG_WINDOW_RE = re.compile(r"\b(weekly|monthly)\b", re.IGNORECASE)
+_MAX_LONG_WINDOW_RETRY_SECONDS = 32 * 86400
 # Transient read timeouts are common on long-running inference proxies. Retry
 # five times after the initial attempt, waiting 1, 2, 4, 8, then 16 minutes.
 _MAX_READ_TIMEOUT_RETRIES = 5
@@ -130,7 +134,9 @@ def _retry_delay_for_z_ai(text: str) -> float | None:
         return None
     reset = reset.replace(tzinfo=_BEIJING_TZ)
     delay = (reset - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
-    if delay > _MAX_AUTO_RETRY_SECONDS:
+    cap = (_MAX_LONG_WINDOW_RETRY_SECONDS if _LONG_WINDOW_RE.search(text)
+           else _MAX_AUTO_RETRY_SECONDS)
+    if delay > cap:
         return None
     return max(0.0, delay)
 

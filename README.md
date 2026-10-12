@@ -86,6 +86,23 @@ agentknit.run_repl(load_specification("run://grammar"), client=client)
 The same client can be reused for `init_session` + `run_turn` one-shot calls
 in the same script — no monkey-patching of `create_client`.
 
+### Turns not typed by the operator
+
+When a turn comes from a supervisor, a launcher, another agent session or an
+automated producer (cron, inbox, wake-up), say so with `sender`:
+
+```python
+run_turn(client, model, session, "Go on with step 3.",
+         sender={"kind": "supervisor", "name": "kimi-k3"})
+```
+
+`kind` is one of `SENDER_KINDS` (`human`, `supervisor`, `launcher`, `peer`,
+`hook`). Unless it is `human`, the model reads
+`[This turn is from the supervisor kimi-k3, not typed by the operator.]` above
+the task. The sender is recorded in the `UserPromptSubmit` hook payload, the
+journal's `turn_start` and the log's `user` record. No `sender` means the
+operator, as before.
+
 
 ## Strict Cache Proof
 

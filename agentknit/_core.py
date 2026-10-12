@@ -4748,10 +4748,25 @@ class _InputCollector:
                 sys.stdout.flush()
 
 
+SENDER_KINDS = ("human", "supervisor", "launcher", "peer", "hook")
+
+
+def _sender_header(sender: "dict[str, str] | None") -> str | None:
+    """The line heading a turn not typed by the operator, for the model."""
+    if not sender or sender.get("kind", "human") == "human":
+        return None
+    name = sender.get("name") or "an unnamed sender"
+    who = {"supervisor": f"the supervisor {name}",
+           "launcher": f"the launcher {name}",
+           "peer": f"agent session {name}"}.get(sender["kind"], f"an automated message from {name}")
+    return f"[This turn is from {who}, not typed by the operator.]"
+
+
 def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Session, task: str | None,
              *, cancel: CancelToken | None = None,
              timeout: float | None = None,
-             tool_executor: "ToolExecutor | None" = None) -> SessionResult:
+             tool_executor: "ToolExecutor | None" = None,
+             sender: "dict[str, str] | None" = None) -> SessionResult:
     """Run one agent turn and return a :class:`SessionResult`.
 
     The result reflects the session state at the end of the turn.
@@ -4766,9 +4781,18 @@ def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Sess
     seconds.  It does not interrupt an in-flight LLM request or tool call; a
     :class:`TimeoutError` is raised when execution next reaches a cancellation
     boundary.
+
+    ``sender`` (``{"kind", "name"}``, kind one of :data:`SENDER_KINDS`) says
+    who wrote ``task`` when it may not be the operator, e.g. a supervisor or
+    an inbox message.  Unless the kind is ``human``, the model reads a line
+    naming the sender above the task.  The sender is also recorded in the
+    UserPromptSubmit hook payload, the journal's ``turn_start`` and the
+    log's ``user`` record.  Omitted, the turn is the operator's, as before.
     """
     if timeout is not None and timeout < 0:
         raise ValueError("timeout must be non-negative or None")
+    if sender is not None and sender.get("kind", "human") not in SENDER_KINDS:
+        raise ValueError(f"sender kind must be one of {SENDER_KINDS}")
 
     active_cancel = cancel or CancelToken()
     timeout_expired: threading.Event | None = None
@@ -4793,7 +4817,7 @@ def run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Sess
         if timer is not None:
             timer.start()
         return _run_turn(client, model, session, task, cancel=active_cancel,
-                         timeout_expired=timeout_expired)
+                         timeout_expired=timeout_expired, sender=sender)
     finally:
         if timer is not None:
             timer.cancel()
@@ -4932,8 +4956,11 @@ def side_query(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Se
 
 def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Session, task: str | None,
               cancel: CancelToken | None = None,
-              timeout_expired: threading.Event | None = None) -> SessionResult:
+              timeout_expired: threading.Event | None = None,
+              sender: "dict[str, str] | None" = None) -> SessionResult:
     messages   = session["messages"]
+    # Who wrote the task, when the caller says: records carry it only then.
+    with_sender: dict[str, Any] = {"sender": sender} if sender else {}
     tools      = session["tools"]
     structured = session["structured"]
     journal    = session.get("_journal")
@@ -4960,7 +4987,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
     # Fires before the task message is appended; block rejects the prompt
     # (nothing is sent to the model) and the reason becomes final_reply.
     if task is not None:
-        ups = _fire_hooks(session, "UserPromptSubmit", prompt=task)
+        ups = _fire_hooks(session, "UserPromptSubmit", prompt=task, **with_sender)
         if ups.block or ups.stop:
             reason = (ups.stop_reason or ups.reason
                       or "prompt blocked by UserPromptSubmit hook")
@@ -4972,7 +4999,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             return _session_result_with_reply(session, notice)
 
     if journal is not None:
-        _write_journal_record(session, {"type": "turn_start", "task": task})
+        _write_journal_record(session, {"type": "turn_start", "task": task, **with_sender})
 
     def _append_message(msg: dict[str, Any]) -> None:
         """Append a message to the history and durably journal it."""
@@ -4997,6 +5024,9 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             preamble = f"{preamble}\n{ground}" if preamble else ground
         if preamble:
             submitted = f"{task}\n\n{preamble}" if task else preamble
+        header = _sender_header(sender)
+        if header:
+            submitted = f"{header}\n\n{submitted}" if submitted else header
     if task is None:
         # The prior user message was already journaled before the failed
         # request.  Send that exact transcript again rather than turning a
@@ -5016,7 +5046,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
     else:
         _append_message({"role": "user", "content": submitted, "ts": now_ts})
     if task is not None:
-        _log(session, {"type": "user", "content": task, "ts": now_ts})
+        _log(session, {"type": "user", "content": task, "ts": now_ts, **with_sender})
 
     total_tokens = 0
     max_tokens   = DEFAULT_MAX_TOKENS

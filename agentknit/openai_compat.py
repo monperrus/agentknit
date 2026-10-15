@@ -821,6 +821,11 @@ class _SubprocessCompletions:
                 f"{proc.stderr}"
             )
         data = json.loads(proc.stdout)
+        # The parsed response drops fields it does not know; a subprocess
+        # backend may stamp provenance on the payload (best-effort-completions
+        # adds `best_effort: {tier, backend, model}`), and the session journal
+        # needs the raw dict to record which model actually answered.
+        self._client._last_raw = data
         if on_raw_response is not None:
             on_raw_response({"kind": "subprocess", "stdout": proc.stdout,
                              "stderr": proc.stderr})
@@ -856,6 +861,11 @@ class SubprocessOpenAI:
         )
         # Kept for backward compatibility: callers and tests read _binary_path.
         self._binary_path = self._command[0]
+        # The last raw payload the child produced. _parse_response drops fields
+        # it does not know, and a backend's provenance stamp
+        # (best-effort-completions adds `best_effort`) is exactly such a field,
+        # so the journal reads it from here.
+        self._last_raw: dict[str, Any] | None = None
         self._env = dict(env) if env else None
         self._timeout = timeout
         self.base_url = _BaseURL("")   # empty host → no openrouter-specific headers

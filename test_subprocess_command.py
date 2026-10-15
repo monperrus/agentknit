@@ -86,3 +86,50 @@ def test_command_timeout_defaults_and_overrides(tmp_path):
         "model": str(shim), "endpoint": f"run://{shim}", "command_timeout": 900,
     })
     assert slow._timeout == 900
+
+
+def _provenance_shim(tmp_path):
+    """A shim that stamps its response the way best-effort-completions.py does."""
+    path = tmp_path / "provenance_shim.py"
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "json.load(sys.stdin)\n"
+        "print(json.dumps({'choices': [{'index': 0, 'message': "
+        "{'role': 'assistant', 'content': 'ok'}, 'finish_reason': 'stop'}], "
+        "'model': 'deepseek-flash', "
+        "'best_effort': {'tier': 'medium', 'backend': 'deepseek-v4-flash', "
+        "'model': 'deepseek-flash'}, "
+        "'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2}}))\n"
+    )
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return path
+
+
+def test_backend_provenance_lands_on_the_usage_records(tmp_path, monkeypatch):
+    """The transcript records which model answered, not just which tier was asked for.
+
+    A tier run through best-effort-completions is labelled by tier
+    (`best-effort-medium`), so without the backend stamp there is no way to do
+    quality stats per model afterwards. The subprocess client keeps the raw
+    payload, and the usage record (one per model call) carries its
+    `best_effort` block.
+    """
+    shim = _provenance_shim(tmp_path)
+    schema = agentknit.load_specification("best-effort-medium", f"run://{shim}")
+    schema["command"] = [sys.executable, str(shim)]
+    schema["command_timeout"] = 60
+    # LOG_BASE is module-level; point the transcript at tmp_path directly.
+    monkeypatch.setattr("agentknit._core.LOG_BASE", tmp_path / "logs")
+    result = agentknit.run_task(schema, "say ok", non_interactive=True,
+                                strict_cache_proof=False)
+    assert result.final_reply
+    logs = list((tmp_path / "logs").rglob("*.jsonl"))
+    assert logs, "no transcript written"
+    records = [json.loads(x) for f in logs
+               for x in f.read_text().splitlines() if x.strip()]
+    usage_records = [r for r in records if r.get("type") == "usage"]
+    assert usage_records, "no usage records in the transcript"
+    backends = [r.get("backend") for r in usage_records]
+    assert any(b and b.get("backend") == "deepseek-v4-flash" for b in backends), \
+        f"backend provenance missing from usage records: {backends}"

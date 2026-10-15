@@ -3894,6 +3894,28 @@ def _emit_and_log_error(
     _log(session, record)
 
 
+def _backend_stamp(client: "openai.OpenAI | SubprocessOpenAI") -> "dict[str, Any] | None":
+    """The serving backend's self-declaration, if the client knows one.
+
+    Subprocess backends answer over a channel with no HTTP headers, so the only
+    place provenance can live is the payload. best-effort-completions stamps
+    `best_effort: {tier, backend, model}` on every response; anything else that
+    sets a plain `model` field gets that much. HTTP responses carry provider
+    info elsewhere and are out of scope here.
+    """
+    if not isinstance(client, SubprocessOpenAI):
+        return None
+    raw = getattr(client, "_last_raw", None) or {}
+    if not isinstance(raw, dict):
+        return None
+    served = raw.get("best_effort")
+    if isinstance(served, dict):
+        return {"backend": served}
+    if raw.get("model"):
+        return {"backend": {"model": raw["model"]}}
+    return None
+
+
 def _complete(client: openai.OpenAI | SubprocessOpenAI, session: Session, **kwargs: Any) -> Any:
     # Endpoint-declared body fields (e.g. a model that only accepts
     # temperature=1) win over whatever the caller passed.
@@ -5257,6 +5279,14 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                       fmt=f"{DIM}{MAG}[tokens] "
                           f"{fmt_usage(usage, compaction_trigger=trigger, prompt_tokens_known=session.get('reports_prompt_tokens', True))}{RESET}")
                 _log(session, {"type": "usage",
+                               # Which backend actually answered. For a tier
+                               # run through best-effort-completions the
+                               # session label names the tier
+                               # ("best-effort-medium"), so without this stamp
+                               # per-model quality stats are impossible: the
+                               # tier walks its backends and only the response
+                               # payload knows which one served.
+                               **(_backend_stamp(client) or {}),
                                "prompt_tokens":      getattr(usage, "prompt_tokens", 0) or 0,
                                "completion_tokens":  getattr(usage, "completion_tokens", 0) or 0,
                                "total_tokens":       getattr(usage, "total_tokens", 0) or 0,

@@ -540,7 +540,13 @@ class _Completions:
                           on_rate_limit_wait: "Callable[..., None] | None" = None,
                           on_raw_response: "Callable[[Any], None] | None" = None,
                           on_request_attempt: "Callable[[Any], None] | None" = None) -> _Response:
-        payload = {**payload, "stream": True}
+        payload = {**payload, "stream": True,
+                   # Chat-completions servers only attach usage to a stream
+                   # when asked; without it the final chunk carries no usage
+                   # and cache accounting looks permanently absent (observed
+                   # on Kimi k3: cached_tokens is top-level and nested in the
+                   # non-streaming body, missing entirely from SSE chunks).
+                   "stream_options": {"include_usage": True}}
         assembled_content = ""
         assembled_reasoning = ""
         assembled_tool_calls: dict[int, dict[str, Any]] = {}

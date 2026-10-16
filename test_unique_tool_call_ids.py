@@ -41,6 +41,25 @@ def test_unique_ids_are_left_alone(monkeypatch) -> None:
 
 def test_duplicate_within_one_batch_and_empty_ids() -> None:
     history = [{"role": "assistant", "tool_calls": [{"id": "x"}, {"id": "x-2"}]}]
-    calls = [_call("x", "t"), _call("x", "t"), _call("", "t"), _call("", "t")]
+    calls = [_call("x", "t"), _call("x", "t", '{"a": 1}'), _call("", "t"), _call("", "t")]
     _unique_tool_call_ids(history, calls)
     assert [c.id for c in calls] == ["x-3", "x-4", "call", "call-2"]
+
+
+def test_an_exact_repeat_in_one_message_runs_once(monkeypatch) -> None:
+    """The same call sent twice in one message must not run twice: its side effects would."""
+    runs: list[int] = []
+
+    def post():
+        runs.append(1)
+        return "posted", {"result": "posted"}
+
+    schema = _schema([Tool("post", "P", post)])
+    session = _run_scripted(monkeypatch, schema, [
+        _tools_msg(_call("call_e853", "post"), _call("call_e853", "post"),
+                   _call("call_e853", "post")),
+        _done_msg(),
+    ])
+    assert len(runs) == 1
+    assert _ids(session) == ["call_e853"]
+    assert [m["tool_call_id"] for m in _tool_msgs(session)] == ["call_e853"]

@@ -2816,7 +2816,20 @@ def _unique_tool_call_ids(messages: "list[dict[str, Any]]", tool_calls: "list[An
     the history is invalid for every backend (Kimi: "tool call id ... is duplicated",
     Anthropic: "`tool_use` ids must be unique"), so each later request of the turn fails.
     The id is the framework's to pair a call with its result, so renaming it is safe.
+
+    An exact repeat inside one message (same id, tool and arguments) is dropped instead: a
+    provider sent one call two and four times in a single message, and running it again
+    re-ran side effects (an adctx pass posted the same reply until the poster's own
+    duplicate guard refused it).
     """
+    unique, keys = [], set()
+    for tc in tool_calls:
+        key = (tc.id, tc.function.name, tc.function.arguments)
+        if tc.id and key in keys:
+            continue
+        keys.add(key)
+        unique.append(tc)
+    tool_calls[:] = unique
     seen = {str(tc.get("id"))
             for m in messages if m.get("role") == "assistant"
             for tc in (m.get("tool_calls") or [])}

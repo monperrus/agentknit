@@ -76,13 +76,20 @@ def test_completion_is_drained_into_a_notice(tmp_path) -> None:
     with open(gate, "w") as fh:     # blocks until the command opens it
         fh.write("go\n")
 
-    # Blocking get; the timeout only guards against a hang.
-    completions = [at.async_completion_queue.get(timeout=30)]
+    # The queue is process-wide by design: executions started by earlier tests
+    # (a killed `sleep 30`, a leftover bounded by `timeout`) land in it whenever
+    # they end, so a foreign completion may arrive before ours.  Block until
+    # ours arrives (the timeout only guards against a hang), then check that
+    # it was queued once and that draining consumed it.
+    completions = []
+    while exec_id not in [c["tool_exec_id"] for c in completions]:
+        completions.append(at.async_completion_queue.get(timeout=30))
     completions += at.drain_completions()
-    assert [c["tool_exec_id"] for c in completions] == [exec_id]
-    assert at.drain_completions() == []          # drained exactly once
+    mine = [c for c in completions if c["tool_exec_id"] == exec_id]
+    assert len(mine) == 1
+    assert exec_id not in [c["tool_exec_id"] for c in at.drain_completions()]
 
-    notice = at.completion_notice(completions)
+    notice = at.completion_notice(mine)
     assert exec_id in notice
     assert "returncode=0" in notice
     assert "echo hi" in notice

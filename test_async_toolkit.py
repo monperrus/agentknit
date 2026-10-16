@@ -195,9 +195,9 @@ def _drain_queue() -> None:
 def test_nohup_wait_reports_completions() -> None:
     """nohup_wait sleeps until the exec finishes, then reports it inline."""
     _drain_queue()
+    t0 = time.monotonic()   # before t_nohup: the sleep starts inside it
     result, _ = t_nohup("echo wait-for-test && sleep 1")
     d = json.loads(result)
-    t0 = time.monotonic()
     out = json.loads(t_nohup_wait(d["tool_exec_id"], 5, "s")[0])
     elapsed = time.monotonic() - t0
     assert out["tool_exec_id"] == d["tool_exec_id"]
@@ -231,7 +231,11 @@ def test_nohup_wait_reports_not_completed_with_activity() -> None:
     assert out["tool_exec_id"] == d["tool_exec_id"]
     assert out["completed"] is False
     assert 0.9 <= elapsed < 3
-    assert out["waited_seconds"] == 1
+    # waited_seconds is the time actually waited (since fbe8396, so an
+    # interrupted wait can report less than its budget), measured inside the
+    # call: the full budget, plus whatever the scheduler overshot it by
+    # (+0.0005: the value is rounded to the millisecond).
+    assert 1 <= out["waited_seconds"] <= elapsed + 0.0005
     assert "not completed" in out["hint"]
     activity = out["activity"]
     assert set(activity["io_bytes"]) == {"rchar", "wchar", "read_bytes", "write_bytes"}
@@ -281,8 +285,11 @@ def test_nohup_wait_unknown_id() -> None:
 def test_nohup_wait_no_howmuch() -> None:
     """Without howmuch there is no budget: wait ends on completion."""
     _drain_queue()
-    d = json.loads(t_nohup("sleep 1")[0])
+    # The clock starts before t_nohup: the command is already sleeping while
+    # t_nohup returns, which takes a noticeable share of the second on a
+    # loaded machine.  Started earlier, the >= 0.9 s lower bound always holds.
     t0 = time.monotonic()
+    d = json.loads(t_nohup("sleep 1")[0])
     out = json.loads(t_nohup_wait(d["tool_exec_id"])[0])
     assert out["completed"] is True
     assert out["returncode"] == 0

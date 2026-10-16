@@ -2808,6 +2808,28 @@ def _port_snapshot_to_model(
 
 # ── agent loop ────────────────────────────────────────────────────────────────
 
+def _unique_tool_call_ids(messages: "list[dict[str, Any]]", tool_calls: "list[Any]") -> None:
+    """Rename, in place, any call id already used in ``messages`` or earlier in the batch.
+
+    Some providers mint ids that are not unique over a session: Kimi names a call
+    ``<tool>:<n>`` and can reuse ``exec_shell:7`` turns later. Once two calls share an id
+    the history is invalid for every backend (Kimi: "tool call id ... is duplicated",
+    Anthropic: "`tool_use` ids must be unique"), so each later request of the turn fails.
+    The id is the framework's to pair a call with its result, so renaming it is safe.
+    """
+    seen = {str(tc.get("id"))
+            for m in messages if m.get("role") == "assistant"
+            for tc in (m.get("tool_calls") or [])}
+    for tc in tool_calls:
+        base = tc.id or "call"
+        new_id, k = base, 1
+        while new_id in seen:
+            k += 1
+            new_id = f"{base}-{k}"
+        tc.id = new_id
+        seen.add(new_id)
+
+
 def _tool_call_history_item(tc: Any) -> "dict[str, Any]":
     """Serialize a tool call for the assistant history message.
 
@@ -5351,6 +5373,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
             if structured and msg.tool_calls:
                 step_start = len(messages)
                 now_ts = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+                _unique_tool_call_ids(messages, msg.tool_calls)
                 _append_message({
                     "role": "assistant",
                     "tool_calls": [

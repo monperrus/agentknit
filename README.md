@@ -46,7 +46,9 @@ schema = load_specification(
 
 For small agents, use `run_agent()` to provide the model connection and
 `Tool` definitions directly. It builds the internal schema and registers the
-tool callables for you:
+tool callables for you. Each call dispatches to its own callables, so
+concurrent `run_agent` calls may pass tools whose functions share a name
+(e.g. closures bound to different directories):
 
 ```python
 from pathlib import Path

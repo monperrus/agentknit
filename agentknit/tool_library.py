@@ -472,7 +472,7 @@ def t_run(command: str) -> tuple[str, dict[str, object]]:
         out = "".join(stdout_lines)
         err = "".join(stderr_lines)
         _exec_async_available = any(
-            e.get("python_function") == "t_execute_async"
+            _pf_name(e) == "t_execute_async"
             for e in getattr(_tool_context, "tool_dispatch", {}).values()
         )
         hint = (
@@ -725,6 +725,12 @@ def t_glob(pattern: str) -> tuple[str, dict[str, object]]:
 
 # Functions that interactively ask the user something — excluded in --non-interactive mode.
 _ASK_USER_FNS = {"t_ask_user", "t_ask_user_question"}
+
+
+def _pf_name(entry: dict[str, object]) -> str:
+    """Function name of a dispatch entry whose python_function is a name or a callable."""
+    pf = entry.get("python_function")
+    return str(getattr(pf, "__name__", pf))
 
 # Registry: function name (str) → callable.
 if TYPE_CHECKING:

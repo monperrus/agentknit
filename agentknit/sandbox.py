@@ -73,7 +73,8 @@ class BubblewrapToolExecutor:
 
     def execute(self, tool_name: str, args: dict[str, object], dispatch_entry: dict[str, object], *,
                 session: ToolSessionContext) -> tuple[str, dict[str, object]]:
-        fn = dispatch_entry.get("python_function")
+        pf = dispatch_entry.get("python_function")
+        fn = getattr(pf, "__name__", pf)
         if fn in self._FILE_TOOLS:
             return self._file_tool(str(fn), args, dispatch_entry)
         if fn in self._SHELL_TOOLS:

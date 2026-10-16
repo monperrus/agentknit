@@ -52,10 +52,27 @@ def test_run_agent_builds_schema_registers_tools_and_delegates(monkeypatch) -> N
             },
         }],
         "tool_dispatch": {
-            "echo": {"python_function": "t_echo", "param_map": {"value": "value"}},
+            "echo": {"python_function": t_echo, "param_map": {"value": "value"}},
         },
     }
     assert captured["kwargs"]["strict_cache_proof"] is False
+
+
+def test_run_agent_binds_its_own_callables_despite_name_clash(monkeypatch) -> None:
+    """Two run_agent calls with same-named closures each dispatch to their own tool."""
+    dispatches = []
+    monkeypatch.setattr(core, "run_task",
+                        lambda schema, task, **kw: dispatches.append(schema["tool_dispatch"]))
+
+    def make(label: str):
+        def where() -> tuple[str, dict]:
+            return label, {"result": "ok"}
+        return where
+
+    for label in ("a", "b"):
+        agentknit.run_agent(task="t", model="m", endpoint="e",
+                            tools=[agentknit.Tool("where", "Where", make(label))])
+    assert [core.dispatch("where", {}, d)[0] for d in dispatches] == ["a", "b"]
 
 
 def test_run_agent_omits_auth_when_not_given(monkeypatch) -> None:

@@ -419,11 +419,11 @@ def _handle_tool(session: Session, client: Any, model: str, args: str) -> None:
         # replacement is the real candidate — and so is plumbing already
         # dispatched under another name (t_execute_async/t_query_exec behind
         # an active nohup trio): listing them would be pure duplication.
-        from .tool_library import _ASK_USER_FNS, SUPERSEDED_TOOLS
+        from .tool_library import _ASK_USER_FNS, SUPERSEDED_TOOLS, _pf_name
         lib = _library_tool_specs()
         by_fn = {str(s.get("_function_name")): s for s in lib.values()}
         known = set(active) | set(inactive)
-        dispatched = {str(e.get("python_function"))
+        dispatched = {_pf_name(e)
                       for e in (session.get("tool_dispatch") or {}).values()}
         candidates: list[str] = []
         for fn_name in TOOL_LIBRARY:

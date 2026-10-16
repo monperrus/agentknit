@@ -126,7 +126,7 @@ from .openai_compat import SubprocessOpenAI
 
 from . import async_toolkit as _async_module
 from . import tool_library as _tool_module
-from .tool_library import TOOL_LIBRARY, _ASK_USER_FNS
+from .tool_library import TOOL_LIBRARY, _ASK_USER_FNS, _pf_name
 from .tool import Tool, build_tool_spec, register_tools_in_library
 from . import _deferred_tools as _deferred
 from .exceptions import (
@@ -3296,7 +3296,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         # Remove tools whose dispatch entry maps to t_ask_user.
         ask_tool_names = {
             tn for tn, e in tool_dispatch.items()
-            if e.get("python_function") in _ASK_USER_FNS
+            if _pf_name(e) in _ASK_USER_FNS
         }
         tools = [t for t in tools
                  if ((t.get("function") or t).get("name")) not in ask_tool_names]
@@ -4454,7 +4454,7 @@ def _handle_tool_call(
     call_id = call_id or new_call_id()
 
     entry = tool_dispatch.get(name) or {}
-    is_ask = entry.get("python_function") in _ASK_USER_FNS
+    is_ask = _pf_name(entry) in _ASK_USER_FNS
 
     # ── PreToolUse hooks ───────────────────────────────────────────────
     # Fired *before* the journal write-ahead so a rewritten updatedInput is
@@ -6202,9 +6202,16 @@ def run_agent(
     and registers each :class:`~agentknit.Tool` callable before delegating to
     :func:`run_task`.  Use :func:`run_task` when a checked-in or probed schema
     is already available.
+
+    The dispatch entries hold the callables themselves, so concurrent calls
+    whose tools share a function name (e.g. closures bound to different
+    working directories) each dispatch to their own tools; the global
+    ``TOOL_LIBRARY`` registration is only kept for name-based lookups.
     """
     tool_schema, tool_dispatch = build_tool_spec(tools)
     register_tools_in_library(tools)
+    for tool in tools:
+        tool_dispatch[tool.name]["python_function"] = tool.fn
     schema = {
         "model": model,
         "endpoint": endpoint,

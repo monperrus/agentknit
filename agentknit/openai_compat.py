@@ -59,6 +59,18 @@ _MAX_LONG_WINDOW_RETRY_SECONDS = 32 * 86400
 # five times after the initial attempt, waiting 1, 2, 4, 8, then 16 minutes.
 _MAX_READ_TIMEOUT_RETRIES = 5
 _READ_TIMEOUT_INITIAL_DELAY_SECONDS = 60
+# A streaming response that delivers no SSE line at all for this long is a
+# stalled connection, not a thinking model: the server has gone quiet
+# mid-stream (dead proxy hop, half-open socket after suspend/resume) and
+# would otherwise hang iter_lines() until the flat client read timeout (and
+# its retry loop) burned 30+ minutes without a word to the operator. The
+# stall watchdog below closes the response after this idle bound, surfacing
+# as a ReadTimeout that the existing retry path handles — with one retry
+# budget shared by pre-response and mid-stream stalls alike. Must stay well
+# above the slowest observed time-between-chunks (long thinking pauses on
+# Kimi k3 measure ~60 s).
+_STREAM_STALL_TIMEOUT_SECONDS = 180.0
+_STALL_WATCHDOG_POLL_SECONDS = 1.0
 # 5xx answers (502 Bad Gateway, 503 overloaded, …) are usually a proxy hiccup
 # that clears in seconds: retry five times after the initial attempt, waiting
 # 5, 10, 20, 40, then 80 seconds (or the server's Retry-After when given).
@@ -77,6 +89,82 @@ _MAX_QUOTA_RETRIES = 2
 _QUOTA_DENIAL_RE = re.compile(
     r"quota|rate.?limit|exceed|usage limit|too many requests|out of credit"
     r"|insufficient", re.IGNORECASE)
+
+
+class StreamStallError(httpx.ReadTimeout):
+    """A streaming response went silent mid-body longer than the stall bound.
+
+    Raised by the watchdog path in ``_create_streaming``; a subclass of
+    :class:`httpx.ReadTimeout` so ``_retry_post``'s existing read-timeout
+    retry handles it exactly like a pre-response timeout. Carries the
+    assembled prefix so a final (unretryable) stall can still say how much
+    of the reply had already arrived when the connection died.
+    """
+
+    def __init__(self, stall_seconds: float, received: str) -> None:
+        preview = " ".join(received.split())[:200]
+        detail = f" after {len(received)} chars ({preview!r}…)" if preview else ""
+        super().__init__(
+            f"stream stalled: no SSE line for {stall_seconds:.0f}s{detail} — "
+            "treating the connection as dead")
+        self.received = received
+
+
+class _StallWatchdog:
+    """Close a streaming response that goes silent mid-stream.
+
+    httpx applies its read timeout per socket read; a connection that
+    delivered a few SSE lines and then goes quiet (dead proxy hop, half-open
+    socket after suspend/resume) can sit inside ``iter_lines()`` for the
+    whole flat timeout, five minutes of silence with no signal that anything
+    is wrong. The watchdog thread closes the response after
+    *stall_timeout* seconds without a line, which makes ``iter_lines()``
+    return on the consumer thread; :meth:`_create_streaming` turns that
+    early return into :class:`StreamStallError` so the retry loop in
+    :meth:`_retry_post` handles it.
+    """
+
+    def __init__(self, resp: httpx.Response,
+                 stall_timeout: float | None = None) -> None:
+        self._resp = resp
+        # Read at construction, not as a default argument: the default would
+        # freeze the module constant's value at import time.
+        self._stall_timeout = (stall_timeout if stall_timeout is not None
+                               else _STREAM_STALL_TIMEOUT_SECONDS)
+        self._last_activity = time.monotonic()
+        self._done = threading.Event()
+        self._fired = False
+        self._thread = threading.Thread(
+            target=self._watch, name="sse-stall-watchdog", daemon=True)
+
+    @property
+    def stall_timeout(self) -> float:
+        return self._stall_timeout
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def beat(self) -> None:
+        """Record stream activity (any SSE line received)."""
+        self._last_activity = time.monotonic()
+
+    def stop(self) -> None:
+        self._done.set()
+        self._thread.join(timeout=_STALL_WATCHDOG_POLL_SECONDS * 2 + 1)
+
+    def fired(self) -> bool:
+        """Whether the watchdog closed the response (vs. a clean stream end)."""
+        return self._fired
+
+    def _watch(self) -> None:
+        while not self._done.wait(_STALL_WATCHDOG_POLL_SECONDS):
+            if time.monotonic() - self._last_activity >= self._stall_timeout:
+                self._fired = True
+                try:
+                    self._resp.close()
+                except Exception:  # noqa: BLE001 — best effort
+                    pass
+                return
 
 
 # ── rate limiter (token-bucket) ───────────────────────────────────────────────
@@ -380,8 +468,8 @@ class _Completions:
 
     def _retry_post(self, url: str, headers: dict[str, str], payload: dict[str, Any],
                     stream: bool = False, on_rate_limit_wait: "Callable[..., None] | None" = None,
-                    on_request_attempt: "Callable[[Any], None] | None" = None) -> httpx.Response:
-        read_timeout_retries = 0
+                    on_request_attempt: "Callable[[Any], None] | None" = None,
+                    read_timeout_retries: int = 0) -> httpx.Response:
         server_error_retries = 0
         quota_retries = 0
         while True:
@@ -399,12 +487,13 @@ class _Completions:
                     # for iter_lines().
                     resp.read()
             except httpx.ReadTimeout:
-                if read_timeout_retries >= _MAX_READ_TIMEOUT_RETRIES:
+                retry = self._should_retry_read_timeout(read_timeout_retries)
+                if retry is None:
                     raise
-                delay = _READ_TIMEOUT_INITIAL_DELAY_SECONDS * (2 ** read_timeout_retries)
-                read_timeout_retries += 1
+                read_timeout_retries, delay = retry
                 print(
-                    f"  [read-timeout] request timed out — retry "
+                    f"  [read-timeout] request/stream timed out (no response or "
+                    f"no SSE line for too long) — retry "
                     f"{read_timeout_retries}/{_MAX_READ_TIMEOUT_RETRIES} in {delay // 60}m …",
                     flush=True,
                 )
@@ -415,8 +504,9 @@ class _Completions:
                     print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
                     raise _http_error(resp)
                 server_error_retries += 1
-                delay = (_retry_delay_seconds(resp.headers)
-                         or _SERVER_ERROR_INITIAL_DELAY_SECONDS * (2 ** (server_error_retries - 1)))
+                server_delay: float | None = _retry_delay_seconds(resp.headers)
+                delay = (server_delay if server_delay is not None
+                         else _SERVER_ERROR_INITIAL_DELAY_SECONDS * (2 ** (server_error_retries - 1)))
                 print(
                     f"  [HTTP {resp.status_code}] transient server error — retry "
                     f"{server_error_retries}/{_MAX_SERVER_ERROR_RETRIES} in {delay:.0f}s …",
@@ -429,10 +519,10 @@ class _Completions:
                 # Reading the body consumes the stream — only do it for the
                 # one provider family known to hide the reset time there.
                 is_z_ai = any(h in host for h in _ZHIPU_HOSTS)
-                delay = _retry_delay_seconds(resp.headers)
-                if delay is None and is_z_ai:
-                    delay = _retry_delay_for_z_ai(resp.text)
-                if delay is None:
+                retry_429: float | None = _retry_delay_seconds(resp.headers)
+                if retry_429 is None and is_z_ai:
+                    retry_429 = _retry_delay_for_z_ai(resp.text)
+                if retry_429 is None:
                     # No header or body told us when it's safe to retry —
                     # guessing a delay risks looping forever against a hard
                     # block. Surface a typed error instead so the caller
@@ -450,7 +540,7 @@ class _Completions:
                         error_code=error_code,
                         error_message=error_message,
                     )
-                self._sleep_until_reset(delay, on_rate_limit_wait)
+                self._sleep_until_reset(retry_429, on_rate_limit_wait)
                 continue
             if resp.status_code == 403:
                 # A 403 is normally "not allowed", but Kimi's Coding Plan
@@ -459,17 +549,18 @@ class _Completions:
                 # provider when the window resets; wait only if it says one
                 # is actually exhausted, and never blindly.
                 host = (self._client.base_url.host or "").lower()
-                delay = _retry_delay_seconds(resp.headers)
-                if delay is None and any(h in host for h in _KIMI_HOSTS):
-                    delay = _kimi_quota_reset_delay(self._client._http,
-                                                    self._client._base_url, headers)
-                if delay is not None and quota_retries < _MAX_QUOTA_RETRIES:
+                retry_403: float | None = _retry_delay_seconds(resp.headers)
+                if retry_403 is None and any(h in host for h in _KIMI_HOSTS):
+                    retry_403 = _kimi_quota_reset_delay(self._client._http,
+                                                        self._client._base_url, headers)
+                if retry_403 is not None and quota_retries < _MAX_QUOTA_RETRIES:
                     quota_retries += 1
-                    self._sleep_until_reset(delay, on_rate_limit_wait,
-                                            label="quota exhausted (HTTP 403)")
+                    self._sleep_until_reset(retry_403, on_rate_limit_wait,
+                                            label="quota exhausted (HTTP 403)",
+                                            body=resp.text)
                     continue
                 body = (resp.text or "").strip()
-                if delay is not None or _QUOTA_DENIAL_RE.search(body):
+                if retry_403 is not None or _QUOTA_DENIAL_RE.search(body):
                     raise RateLimitError(
                         "Quota exhausted (HTTP 403) and the window did not "
                         "reopen in time — stopping instead of retrying "
@@ -482,13 +573,31 @@ class _Completions:
             return resp
 
     @staticmethod
+    def _should_retry_read_timeout(retries: int) -> "tuple[int, float] | None":
+        """Return ``(new_retry_count, delay)`` for one more read-timeout
+        retry, or ``None`` when the budget is exhausted."""
+        if retries >= _MAX_READ_TIMEOUT_RETRIES:
+            return None
+        return retries + 1, _READ_TIMEOUT_INITIAL_DELAY_SECONDS * (2 ** retries)
+
+    @staticmethod
     def _sleep_until_reset(delay: float,
                            on_rate_limit_wait: "Callable[..., None] | None",
-                           label: str = "rate-limited") -> None:
-        """Announce a provider-dictated wait, then sleep through it."""
+                           label: str = "rate-limited",
+                           body: str | None = None) -> None:
+        """Announce a provider-dictated wait, then sleep through it.
+
+        When the provider pins the reset time it also shows its own reason
+        (the first 200 chars of the error body): an empty wait line is the
+        one pause the operator cannot tell apart from a stalled stream.
+        """
         resume_at = _dt.datetime.now().astimezone() + _dt.timedelta(seconds=delay)
         fmt = (f"  [{label}] waiting {delay:.1f}s "
                f"(resuming at {resume_at.strftime('%H:%M:%S %Z')}) …")
+        if body:
+            reason = " ".join((body or "").split())[:200]
+            if reason:
+                fmt += f" — {reason}"
         if on_rate_limit_wait is not None:
             on_rate_limit_wait(delay, resume_at, fmt)
         print(fmt, flush=True)
@@ -547,84 +656,115 @@ class _Completions:
                    # on Kimi k3: cached_tokens is top-level and nested in the
                    # non-streaming body, missing entirely from SSE chunks).
                    "stream_options": {"include_usage": True}}
-        assembled_content = ""
-        assembled_reasoning = ""
-        assembled_tool_calls: dict[int, dict[str, Any]] = {}
-        usage_data: dict[str, Any] = {}
+        read_timeout_retries = 0
 
-        # _retry_post loops internally while a retryable 429 is seen, and
-        # raises RateLimitError for a non-retryable one — it never returns
-        # a 429 response here.
-        resp = self._retry_post(url, headers, payload, stream=True,
-                                on_rate_limit_wait=on_rate_limit_wait,
-                                on_request_attempt=on_request_attempt)
-        if resp.status_code >= 400:
-            print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
-            raise _http_error(resp)
+        while True:
+            assembled_content = ""
+            assembled_reasoning = ""
+            assembled_tool_calls: dict[int, dict[str, Any]] = {}
+            usage_data: dict[str, Any] = {}
 
-        try:
-            for raw_line in resp.iter_lines():
-                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-                if on_raw_response is not None:
-                    on_raw_response({"kind": "sse", "line": line})
-                if not line:
-                    continue
-                if line == "data: [DONE]":
-                    break
-                if not line.startswith("data: "):
-                    continue
+            # _retry_post loops internally while a retryable 429 is seen, and
+            # raises RateLimitError for a non-retryable one — it never returns
+            # a 429 response here.
+            resp = self._retry_post(url, headers, payload, stream=True,
+                                    on_rate_limit_wait=on_rate_limit_wait,
+                                    on_request_attempt=on_request_attempt,
+                                    read_timeout_retries=read_timeout_retries)
+            if resp.status_code >= 400:
+                print(f"  [HTTP {resp.status_code}] {resp.text[:2000]}", flush=True)
+                raise _http_error(resp)
+
+            try:
+                watchdog = _StallWatchdog(resp)
+                watchdog.start()
                 try:
-                    chunk = json.loads(line[6:])
-                except json.JSONDecodeError:
-                    continue
-
-                if chunk.get("usage"):
-                    usage_data = chunk["usage"]
-
-                for choice in chunk.get("choices") or []:
-                    delta = choice.get("delta") or {}
-
-                    # reasoning_content (nvidia/stepfun) or reasoning (OpenRouter)
-                    reasoning_piece = (delta.get("reasoning_content")
-                                       or delta.get("reasoning") or "")
-                    if reasoning_piece and on_reasoning_delta:
-                        assembled_reasoning += reasoning_piece
-                        on_reasoning_delta(reasoning_piece)
-
-                    content_piece = delta.get("content") or ""
-                    if content_piece:
-                        assembled_content += content_piece
-                        if on_content_delta:
-                            on_content_delta(content_piece)
-
-                    for tc_delta in delta.get("tool_calls") or []:
-                        idx = tc_delta.get("index", 0)
-                        if idx not in assembled_tool_calls:
-                            assembled_tool_calls[idx] = {
-                                "id": "", "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        entry = assembled_tool_calls[idx]
-                        if tc_delta.get("id"):
-                            entry["id"] += tc_delta["id"]
-                        custom_delta = tc_delta.get("custom") or {}
-                        if custom_delta:
-                            # Custom tool call streamed as deltas: input
-                            # fragments arrive under custom.input.
-                            entry["type"] = "custom"
-                            entry.setdefault("custom", {"name": "", "input": ""})
-                            if custom_delta.get("name"):
-                                entry["custom"]["name"] += custom_delta["name"]
-                            if custom_delta.get("input"):
-                                entry["custom"]["input"] += custom_delta["input"]
+                    for raw_line in resp.iter_lines():
+                        watchdog.beat()
+                        line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                        if on_raw_response is not None:
+                            on_raw_response({"kind": "sse", "line": line})
+                        if not line:
                             continue
-                        fn = tc_delta.get("function") or {}
-                        if fn.get("name"):
-                            entry["function"]["name"] += fn["name"]
-                        if fn.get("arguments"):
-                            entry["function"]["arguments"] += fn["arguments"]
-        finally:
-            resp.close()
+                        if line == "data: [DONE]":
+                            break
+                        if not line.startswith("data: "):
+                            continue
+                        try:
+                            chunk = json.loads(line[6:])
+                        except json.JSONDecodeError:
+                            continue
+
+                        if chunk.get("usage"):
+                            usage_data = chunk["usage"]
+
+                        for choice in chunk.get("choices") or []:
+                            delta = choice.get("delta") or {}
+
+                            # reasoning_content (nvidia/stepfun) or reasoning (OpenRouter)
+                            reasoning_piece = (delta.get("reasoning_content")
+                                               or delta.get("reasoning") or "")
+                            if reasoning_piece and on_reasoning_delta:
+                                assembled_reasoning += reasoning_piece
+                                on_reasoning_delta(reasoning_piece)
+
+                            content_piece = delta.get("content") or ""
+                            if content_piece:
+                                assembled_content += content_piece
+                                if on_content_delta:
+                                    on_content_delta(content_piece)
+
+                            for tc_delta in delta.get("tool_calls") or []:
+                                idx = tc_delta.get("index", 0)
+                                if idx not in assembled_tool_calls:
+                                    assembled_tool_calls[idx] = {
+                                        "id": "", "type": "function",
+                                        "function": {"name": "", "arguments": ""},
+                                    }
+                                entry = assembled_tool_calls[idx]
+                                if tc_delta.get("id"):
+                                    entry["id"] += tc_delta["id"]
+                                custom_delta = tc_delta.get("custom") or {}
+                                if custom_delta:
+                                    # Custom tool call streamed as deltas: input
+                                    # fragments arrive under custom.input.
+                                    entry["type"] = "custom"
+                                    entry.setdefault("custom", {"name": "", "input": ""})
+                                    if custom_delta.get("name"):
+                                        entry["custom"]["name"] += custom_delta["name"]
+                                    if custom_delta.get("input"):
+                                        entry["custom"]["input"] += custom_delta["input"]
+                                    continue
+                                fn = tc_delta.get("function") or {}
+                                if fn.get("name"):
+                                    entry["function"]["name"] += fn["name"]
+                                if fn.get("arguments"):
+                                    entry["function"]["arguments"] += fn["arguments"]
+                finally:
+                    watchdog.stop()
+            finally:
+                resp.close()
+
+            if not watchdog.fired():
+                break
+
+            # The stream stalled mid-response: retry it like a pre-response
+            # read timeout, sharing the same budget. The retry starts a fresh
+            # request, so the assembled_* state from the dead attempt is
+            # discarded — the model regenerates from scratch.
+            retry = self._should_retry_read_timeout(read_timeout_retries)
+            if retry is None:
+                raise StreamStallError(
+                    watchdog.stall_timeout,
+                    assembled_reasoning + assembled_content) from None
+            read_timeout_retries, delay = retry
+            print(
+                f"  [read-timeout] stream stalled (no SSE line for "
+                f"{watchdog.stall_timeout:.0f}s) — retry "
+                f"{read_timeout_retries}/{_MAX_READ_TIMEOUT_RETRIES} in {delay // 60}m …",
+                flush=True,
+            )
+            time.sleep(delay)
 
         tool_calls_list = [assembled_tool_calls[i]
                            for i in sorted(assembled_tool_calls)] or None

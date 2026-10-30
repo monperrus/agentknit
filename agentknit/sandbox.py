@@ -98,6 +98,9 @@ class BubblewrapToolExecutor:
         return candidate
 
     def _file_tool(self, fn: str, args: dict[str, object], entry: dict[str, object]) -> tuple[str, dict[str, object]]:
+        # Same read-before-write contract as the in-controller tools.
+        from .tool_library import _read_files_lock, _read_guard, _record_read
+
         raw_pm = entry.get("param_map")
         param_map: dict[str, object] = raw_pm if isinstance(raw_pm, dict) else {}
         mapped = {param_map.get(k, k): v for k, v in args.items()}
@@ -105,6 +108,7 @@ class BubblewrapToolExecutor:
         if fn == "t_read":
             try:
                 text = path.read_text()
+                _record_read(str(path), text)
                 offset, limit = mapped.get("offset"), mapped.get("limit")
                 off = offset if isinstance(offset, int) else 0
                 lim = limit if isinstance(limit, int) else None
@@ -116,18 +120,40 @@ class BubblewrapToolExecutor:
                 result = f"ERROR: {exc}"
                 return result, {"result": result}
         if fn == "t_write":
-            path.parent.mkdir(parents=True, exist_ok=True)
             content = str(mapped.get("content", ""))
-            path.write_text(content)
+            with _read_files_lock:
+                current = path.read_text() if path.exists() else None
+                refused = _read_guard(str(path), current)
+                if refused is not None:
+                    return refused
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+                _record_read(str(path), content)
             result = f"wrote {len(content)} bytes"
             return result, {"result": result}
         old, new = str(mapped.get("old", "")), str(mapped.get("new", ""))
-        text = path.read_text()
-        if old not in text:
-            result = "ERROR: old text not found"
-            return result, {"result": result}
-        path.write_text(text.replace(old, new))
-        result = f"OK: replaced {text.count(old)} occurrence(s) in {mapped.get('path')}"
+        if not path.exists():
+            result = f"ERROR: file not found: {mapped.get('path')}. Use write_file to create it."
+            return result, {"result": result, "ok": False, "error": result}
+        with _read_files_lock:
+            text = path.read_text()
+            refused = _read_guard(str(path), text)
+            if refused is not None:
+                return refused
+            if old not in text:
+                result = "ERROR: old text not found"
+                return result, {"result": result, "ok": False, "error": result}
+            n = text.count(old)
+            replace_all = bool(mapped.get("replace_all"))
+            if n > 1 and not replace_all:
+                result = (f"ERROR: old string matches {n} times in {mapped.get('path')}. "
+                          f"Pass replace_all=True to replace every occurrence, or "
+                          f"use a longer old string that matches exactly once.")
+                return result, {"result": result, "ok": False, "error": result}
+            new_text = text.replace(old, new) if replace_all else text.replace(old, new, 1)
+            path.write_text(new_text)
+            _record_read(str(path), new_text)
+        result = f"OK: replaced {n if replace_all else 1} occurrence(s) in {mapped.get('path')}"
         return result, {"result": result}
 
     def _bwrap_command(self, command: str) -> list[str]:

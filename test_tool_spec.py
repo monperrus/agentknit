@@ -294,6 +294,7 @@ def test_specs_alone_yield_a_working_dispatch_table(tmp_path):
 
     target = tmp_path / "f.txt"
     target.write_text("hello")
+    dispatch("read_file", {"path": str(target)}, tool_dispatch)
     dispatch(
         "str_replace",
         {"path": str(target), "old_str": "hello", "new_str": "bye"},

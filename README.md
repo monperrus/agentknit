@@ -252,8 +252,10 @@ tools = [
 
 The framework ships with a built-in set of tools (`read_file`, `write_file`,
 `str_replace`, `exec_shell`). The previous name `execute_shell_command` is
-still accepted as an alias. `str_replace` replaces the first occurrence of
-`old_str` by default; pass `replace_all: true` to replace every occurrence.
+still accepted as an alias. `str_replace` requires the file to have been read
+first and unchanged since that read. By default `old_str` must match exactly
+once (an ambiguous edit is refused); pass `replace_all: true` to replace every
+occurrence.
 
 `tool_library` also carries `list_dir`, `glob` and `search_files`, plus a few
 older functions kept for compatibility. `CANONICAL_TOOLS` maps each tool name

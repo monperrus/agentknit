@@ -472,10 +472,11 @@ def test_dispatch_coerces_non_str_tool_result():
 def test_str_replace_accepts_bool_old_str(tmp_path):
     """A model sending a boolean where the schema says string is coerced to
     str instead of crashing with AttributeError."""
-    from agentknit.tool_library import t_update
+    from agentknit.tool_library import t_read, t_update
 
     f = tmp_path / "f.txt"
     f.write_text("hello")
+    t_read(path=str(f))
     result, _ = t_update(path=str(f), old=True, new="x")  # type: ignore[arg-type]
     assert result.startswith("ERROR: old string not found")
 

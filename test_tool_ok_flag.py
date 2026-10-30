@@ -34,6 +34,7 @@ def test_a_missing_file_is_flagged(tool_dispatch: dict, tmp_path: Path) -> None:
 def test_a_refused_edit_is_flagged(tool_dispatch: dict, tmp_path: Path) -> None:
     target = tmp_path / "f.txt"
     target.write_text("hello\n")
+    dispatch("read_file", {"path": str(target)}, tool_dispatch)
 
     _, meta = dispatch(
         "str_replace",

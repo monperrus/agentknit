@@ -260,6 +260,8 @@ def test_tool_result_includes_files_on_update():
 
         path = str(Path(tmp) / "test.txt")
         Path(path).write_text("line1\nline2\nline3\n")
+        _handle_tool_call("read_file", {"path": path}, session)
+        received.clear()
         _handle_tool_call("str_replace", {"path": path,
                                           "old_str": "line2",
                                           "new_str": "line2_modified\nline2b"}, session)

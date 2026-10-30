@@ -8,6 +8,7 @@ here too (appended via _register_generated).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -135,6 +136,56 @@ def _emit(text: str) -> None:
         pass
 
 
+# ── read-before-write tracking ─────────────────────────────────────────────────
+# t_write and t_update refuse to touch a file the agent has not read in this
+# process, or that changed on disk since it was read.  The record keeps a
+# digest of the file's *full* content, so a partial read (offset/limit) still
+# registers the file, and a linter rewriting it invalidates the record.
+
+_read_files: dict[str, tuple[int, str]] = {}
+_read_files_lock = threading.RLock()
+
+
+def _file_key(path: str) -> str:
+    """Identity of a file across path spellings (relative, ``~``, symlinks)."""
+    return os.path.realpath(os.path.expanduser(path))
+
+
+def _content_signature(content: str) -> tuple[int, str]:
+    data = content.encode()
+    return len(data), hashlib.sha256(data).hexdigest()
+
+
+def _record_read(path: str, content: str) -> None:
+    """Remember *content* as what the agent saw for *path*."""
+    with _read_files_lock:
+        _read_files[_file_key(path)] = _content_signature(content)
+
+
+def _read_guard(path: str, current: str | None) -> tuple[str, dict[str, object]] | None:
+    """Check that writing *path* is safe; return a failure envelope if not.
+
+    *current* is the file's content when it exists, ``None`` when it does not.
+    Creating a new file needs no prior read; overwriting or editing an existing
+    one does, and the content must still be the one that was read.
+    """
+    with _read_files_lock:
+        recorded = _read_files.get(_file_key(path))
+    if recorded is None:
+        if current is None:
+            return None
+        return _tool_failure(
+            f"ERROR: File has not been read yet. "
+            f"Read it first before writing to it: {path}"
+        )
+    if current is None or _content_signature(current) != recorded:
+        return _tool_failure(
+            f"ERROR: File has been modified since read, either by the user "
+            f"or by a linter. Read it again before writing to it: {path}"
+        )
+    return None
+
+
 def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tuple[str, dict[str, object]]:
     """Read and return the contents of a file at the specified path.
 
@@ -160,10 +211,10 @@ def t_read(path: str, offset: int | None = None, limit: int | None = None) -> tu
     #   tool-call log, an auditor can verify exactly what content was read,
     #   even if the file has since changed on disk.  When offset/limit is used
     #   the tag carries those attributes so a partial read is self-describing.
-    import hashlib
     path = _coerce_str(path, "path")
     try:
         content = Path(os.path.expanduser(path)).read_text()
+        _record_read(path, content)
         lines = content.splitlines(keepends=True)
         # Default to partial read (first 100 lines) for files larger than 100 lines.
         # This is essential for token efficiency — reading an entire large file
@@ -233,7 +284,7 @@ def t_write(path: str, content: str) -> tuple[str, dict[str, object]]:
 
     Tool spec:
         name: write_file
-        description: Write (or overwrite) a file at the specified path with the given content.
+        description: Write (or overwrite) a file at the specified path with the given content. An existing file must be read first and unchanged since that read; creating a new file needs no read.
         parameters:
             path:
                 type: string
@@ -248,8 +299,14 @@ def t_write(path: str, content: str) -> tuple[str, dict[str, object]]:
     content = _coerce_str(content, "content")
     try:
         p = Path(os.path.expanduser(path))
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
+        with _read_files_lock:
+            current = p.read_text() if p.exists() else None
+            refused = _read_guard(path, current)
+            if refused is not None:
+                return refused
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+            _record_read(path, content)
         added = len(content.splitlines()) if content else 0
         r = f"OK: wrote {len(content)} bytes to {path}"
         return r, {
@@ -313,7 +370,7 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "",
 
     Tool spec:
         name: str_replace
-        description: Edit an existing file by replacing a specific substring.
+        description: Edit an existing file by replacing a specific substring. The file must be read first and unchanged since that read. By default old_str must match exactly once; pass replace_all=true to replace every occurrence.
         parameters:
             path:
                 type: string
@@ -333,9 +390,11 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "",
                 type: boolean
                 description: Replace every occurrence instead of only the first.
 
-    With *replace_all* False (default) only the first occurrence is replaced;
-    with it True every occurrence is. Either way the exact byte sequence of
-    *old_str* must be present in the file, else the edit is refused.
+    With *replace_all* False (default) exactly one occurrence must match: an
+    *old_str* that appears more than once is refused so the caller has to
+    disambiguate it (or opt into replacing every occurrence with
+    ``replace_all=True``). An *old_str* absent from the file is refused too.
+    The file must have been read first, and must not have changed since.
     """
     path = _coerce_str(path, "path")
     old = _coerce_str(old, "old_str")
@@ -344,16 +403,32 @@ def t_update(path: str = "", old: str = "", new: str = "", patch: str = "",
         return _apply_patch_format(_coerce_str(patch, "patch"))
     try:
         p = Path(os.path.expanduser(path))
-        text = p.read_text()
-        if old not in text:
+        if not p.exists():
             return _tool_failure(
-                f"ERROR: old string not found in {path} "
-                f"({len(old)} chars, starts with {repr(old[:80])}). "
-                f"Re-read the file and copy the exact bytes."
+                f"ERROR: file not found: {path}. Use write_file to create it."
             )
-        n = text.count(old)                      # total matches before the edit
-        done = n if replace_all else min(1, n)
-        p.write_text(text.replace(old, new) if replace_all else text.replace(old, new, 1))
+        with _read_files_lock:
+            text = p.read_text()
+            refused = _read_guard(path, text)
+            if refused is not None:
+                return refused
+            if old not in text:
+                return _tool_failure(
+                    f"ERROR: old string not found in {path} "
+                    f"({len(old)} chars, starts with {repr(old[:80])}). "
+                    f"Re-read the file and copy the exact bytes."
+                )
+            n = text.count(old)                      # total matches before the edit
+            if n > 1 and not replace_all:
+                return _tool_failure(
+                    f"ERROR: old string matches {n} times in {path}. "
+                    f"Pass replace_all=True to replace every occurrence, or "
+                    f"use a longer old_str that matches exactly once."
+                )
+            done = n if replace_all else 1
+            new_text = text.replace(old, new) if replace_all else text.replace(old, new, 1)
+            p.write_text(new_text)
+            _record_read(path, new_text)
         # Count lines and UTF-8 characters in the replaced text
         old_lines = (old.count('\n') + (1 if old else 0)) * done
         old_chars = len(old) * done
@@ -846,11 +921,15 @@ def t_update_file(new_str: str = '', file_path: str = '', old_str: str = '') -> 
     if not file_path:
         return _tool_failure("ERROR: File path is required.")
     try:
-        with Path(os.path.expanduser(file_path)).open('r') as f:
-            content = f.read()
-        new_content = content.replace(old_str, new_str)
-        with Path(os.path.expanduser(file_path)).open('w') as f:
-            f.write(new_content)
+        p = Path(os.path.expanduser(file_path))
+        with _read_files_lock:
+            content = p.read_text()
+            refused = _read_guard(file_path, content)
+            if refused is not None:
+                return refused
+            new_content = content.replace(old_str, new_str)
+            p.write_text(new_content)
+            _record_read(file_path, new_content)
         return ("File updated successfully.", result_dict)
     except Exception as e:
         return _tool_failure(f"ERROR: {str(e)}")

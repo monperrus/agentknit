@@ -658,7 +658,11 @@ _DEFAULT_TOOL_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write (or overwrite) a file at the specified path with the given content.",
+            "description": (
+                "Write (or overwrite) a file at the specified path with the given content. "
+                "An existing file must be read first and unchanged since that read; "
+                "creating a new file needs no read."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -675,7 +679,8 @@ _DEFAULT_TOOL_SCHEMA: list[dict[str, Any]] = [
             "name": "str_replace",
             "description": (
                 "Edit an existing file by replacing a specific substring. "
-                "By default replaces only the first occurrence; pass "
+                "The file must be read first and unchanged since. "
+                "By default old_str must match exactly once; pass "
                 "replace_all=true to replace every occurrence."
             ),
             "parameters": {

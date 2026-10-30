@@ -25,6 +25,35 @@ def test_file_tools_stay_inside_workspace(tmp_path: Path) -> None:
     assert result == "hello"
 
 
+def test_overwriting_an_unread_file_is_refused(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("original")
+    result, meta = executor(tmp_path).execute(
+        "write_file", {"path": "a.txt", "content": "replaced"},
+        {"python_function": "t_write", "param_map": {}}, session={})
+    assert result.startswith("ERROR: File has not been read yet")
+    assert meta["ok"] is False
+    assert (tmp_path / "a.txt").read_text() == "original"
+
+
+def test_editing_an_ambiguous_non_unique_string_is_refused(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("x=1\ny=1\n")
+    e = executor(tmp_path)
+    e.execute("read_file", {"path": "a.txt"},
+              {"python_function": "t_read", "param_map": {}}, session={})
+    entry = {"python_function": "t_update",
+             "param_map": {"old_str": "old", "new_str": "new"}}
+    result, meta = e.execute("str_replace",
+                             {"path": "a.txt", "old_str": "1", "new_str": "2"},
+                             entry, session={})
+    assert result.startswith("ERROR: old string matches 2 times")
+    assert meta["ok"] is False
+    result, _ = e.execute("str_replace",
+                          {"path": "a.txt", "old_str": "1", "new_str": "2",
+                           "replace_all": True}, entry, session={})
+    assert result.startswith("OK: replaced 2 occurrence(s)")
+    assert (tmp_path / "a.txt").read_text() == "x=2\ny=2\n"
+
+
 @pytest.mark.parametrize("path", ["/tmp/x", "../../x"])
 def test_rejects_host_and_traversal_paths(tmp_path: Path, path: str) -> None:
     with pytest.raises(ValueError, match="absolute paths|escapes"):

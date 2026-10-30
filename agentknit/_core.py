@@ -2850,14 +2850,20 @@ def _tool_call_history_item(tc: Any) -> "dict[str, Any]":
     Custom calls are re-emitted in their original shape
     (``{"type": "custom", "custom": {"name", "input"}}``) so grammar-tool
     conversations survive multi-turn replay.
+
+    Provider extras captured on the call (Gemini 3's
+    ``extra_content.google.thought_signature``) are re-emitted as siblings:
+    dropping them makes the very next request -- the one carrying the tool
+    result -- fail with 400 "Function call is missing a thought_signature".
     """
+    extra = dict(getattr(tc, "extra", None) or {})
     if tc.type == "custom":
         raw = tc.custom_input if tc.custom_input is not None else tc.function.arguments
         return {"id": tc.id, "type": "custom",
-                "custom": {"name": tc.function.name, "input": raw}}
+                "custom": {"name": tc.function.name, "input": raw}, **extra}
     return {"id": tc.id, "type": "function",
             "function": {"name": tc.function.name,
-                         "arguments": tc.function.arguments}}
+                         "arguments": tc.function.arguments}, **extra}
 
 
 def _expand_aliases(

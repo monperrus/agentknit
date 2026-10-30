@@ -377,17 +377,27 @@ class _ToolCall:
     for OpenAI custom tool calls (``{"type": "custom", "custom": {...}}``),
     whose raw text input is kept in :data:`custom_input` (and mirrored into
     ``function.arguments`` so legacy readers still see it).
+
+    ``extra`` holds provider-specific sibling fields of the call, which must
+    be echoed back verbatim in the assistant history: Gemini 3 attaches a
+    ``thought_signature`` under ``extra_content`` and rejects (400 "Function
+    call is missing a thought_signature") any request whose history carries a
+    function call without it, which is exactly the follow-up after a tool
+    result.
     """
 
-    __slots__ = ("id", "type", "function", "custom_input")
+    __slots__ = ("id", "type", "function", "custom_input", "extra")
 
     def __init__(self, id: str, function: _Function,
-                 type: str = "function", custom_input: str | None = None) -> None:
+                 type: str = "function", custom_input: str | None = None,
+                 extra: dict[str, Any] | None = None) -> None:
         self.id = id
         self.type = type
         self.function = function
         # Raw text input for custom tool calls; None for function calls.
         self.custom_input = custom_input
+        # Provider-specific fields to replay with the call (e.g. extra_content).
+        self.extra = extra
 
 
 class _Message:
@@ -724,6 +734,12 @@ class _Completions:
                                 entry = assembled_tool_calls[idx]
                                 if tc_delta.get("id"):
                                     entry["id"] += tc_delta["id"]
+                                # Provider extras (Gemini's thought_signature
+                                # under extra_content) arrive as an opaque
+                                # blob in one delta; keep it for the replay.
+                                for key, value in tc_delta.items():
+                                    if key not in _TOOL_CALL_KNOWN_KEYS:
+                                        entry[key] = value
                                 custom_delta = tc_delta.get("custom") or {}
                                 if custom_delta:
                                     # Custom tool call streamed as deltas: input
@@ -783,6 +799,12 @@ class _Completions:
         return parsed
 
 
+# Fields of a chat-completions tool call that agentknit interprets itself.
+# Anything else (Gemini's ``extra_content.google.thought_signature``) belongs
+# to the provider and is carried through to the next request unchanged.
+_TOOL_CALL_KNOWN_KEYS = frozenset({"id", "index", "type", "function", "custom"})
+
+
 def _parse_tool_call(tc: dict[str, Any]) -> _ToolCall:
     """Build a _ToolCall from one raw chat-completions tool_call dict.
 
@@ -795,6 +817,8 @@ def _parse_tool_call(tc: dict[str, Any]) -> _ToolCall:
     into ``function.arguments`` so readers that only look at ``function``
     still see the payload.
     """
+    extra = {key: value for key, value in tc.items()
+             if key not in _TOOL_CALL_KNOWN_KEYS}
     fn = tc.get("function") or {}
     custom = tc.get("custom") or {}
     if custom:
@@ -806,6 +830,7 @@ def _parse_tool_call(tc: dict[str, Any]) -> _ToolCall:
             function=_Function(name=custom.get("name", ""), arguments=raw_input),
             type="custom",
             custom_input=raw_input,
+            extra=extra or None,
         )
     return _ToolCall(
         id=tc.get("id", ""),
@@ -813,6 +838,7 @@ def _parse_tool_call(tc: dict[str, Any]) -> _ToolCall:
             name=fn.get("name", ""),
             arguments=fn.get("arguments", "{}"),
         ),
+        extra=extra or None,
     )
 
 

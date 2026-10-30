@@ -714,8 +714,11 @@ Or in the agent spec JSON:
 ```
 
 The summary message is tagged with `"compacted_summary": true` so consumers
-can distinguish compacted state from raw conversation turns. Compaction events
-are emitted as `"compaction"` events and logged to the session trace.
+can distinguish compacted state from raw conversation turns. It is suffixed
+with a `<post_compaction>` notice telling the model the token countdown has
+reset and it has context headroom again — otherwise it keeps behaving as if
+the window were still nearly full. Compaction events are emitted as
+`"compaction"` events and logged to the session trace.
 
 ### Per-step context policy (`step_reducer`)
 

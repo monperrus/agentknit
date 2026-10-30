@@ -356,6 +356,20 @@ _PRE_COMPACTION_PROMPT = (
     "Anything you do not record now may be lost. Reply briefly once done."
 )
 
+# Suffixed onto the summary message content after a successful compaction:
+# the model must know the countdown has reset, otherwise it keeps behaving
+# as if the context window were still nearly full (rushing, checkpointing,
+# stopping early).  The budget number is the session's token-awareness
+# budget when known.
+_POST_COMPACTION_NOTICE = (
+    "\n\n<post_compaction>\n"
+    "Compaction has just run: the earlier conversation above was replaced "
+    "by this summary, so the token countdown has reset and you have fresh "
+    "context headroom again ({budget}). Keep working normally — no need to "
+    "rush, checkpoint, or stop early.\n"
+    "</post_compaction>"
+)
+
 BOLD = "\033[1m"
 DIM = "\033[2m"
 CYAN = "\033[36m"
@@ -4287,11 +4301,17 @@ def _compact_once(
     if not summary:
         return False
 
-    # Replace the compacted prefix with a single summary message.
+    # Replace the compacted prefix with a single summary message, suffixed
+    # with the post-compaction notice so the model knows it has token
+    # headroom again (otherwise it keeps behaving as if the window were
+    # still nearly full).
     system_msgs = [m for m in prefix if m.get("role") == "system"]
+    budget = session.get("token_awareness_budget_tokens", 0) or 0
+    budget_text = (f"the context window holds {budget} tokens"
+                   if budget > 0 else "the context window is open again")
     summary_msg = {
         "role": "assistant",
-        "content": summary,
+        "content": summary + _POST_COMPACTION_NOTICE.format(budget=budget_text),
         "compacted_summary": True,
         "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
     }

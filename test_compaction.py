@@ -192,7 +192,8 @@ def test_compact_session_keeps_system_and_recent():
     # system + summary + last 2 turns
     assert roles == ["system", "assistant", "user", "assistant"]
     assert msgs[1].get("compacted_summary") is True
-    assert msgs[1]["content"] == "compact summary"
+    assert msgs[1]["content"].startswith("compact summary")
+    assert "<post_compaction>" in msgs[1]["content"]
 
 
 def test_compact_session_keep_zero_turns():
@@ -289,6 +290,38 @@ def test_compact_session_summary_metadata():
     summary_msg = session["messages"][1]
     assert summary_msg.get("compacted_summary") is True
     assert "ts" in summary_msg
+
+
+def test_compact_session_summary_announces_headroom():
+    """The post-compaction summary tells the model it has token headroom again."""
+    session = _make_session(messages=[
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+    ], token_awareness_budget_tokens=100000)
+    client = _make_fake_client("the summary")
+    _compact_session(client, "m", session)
+    summary_msg = session["messages"][1]
+    assert summary_msg["content"].startswith("the summary")
+    assert "<post_compaction>" in summary_msg["content"]
+    assert "100000 tokens" in summary_msg["content"]
+    assert "headroom" in summary_msg["content"]
+
+
+def test_compact_session_summary_announces_headroom_without_budget():
+    """Without a configured budget, the notice still fires (generic wording)."""
+    session = _make_session(messages=[
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+    ], token_awareness_budget_tokens=0)
+    client = _make_fake_client("the summary")
+    _compact_session(client, "m", session)
+    summary_msg = session["messages"][1]
+    assert "<post_compaction>" in summary_msg["content"]
+    assert "headroom" in summary_msg["content"]
 
 
 def test_compact_session_returns_true_on_success_false_on_noop():
@@ -506,7 +539,8 @@ def test_compact_session_pre_compaction_failure_still_summarizes():
     assert result is True
     assert len(client.calls) == 2
     assert session["messages"][1].get("compacted_summary") is True
-    assert session["messages"][1]["content"] == "summary"
+    assert session["messages"][1]["content"].startswith("summary")
+    assert "<post_compaction>" in session["messages"][1]["content"]
 
 
 def test_compact_session_turn_count():

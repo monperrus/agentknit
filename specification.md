@@ -249,7 +249,12 @@ String flags in the `options` array enable provider-specific workarounds:
 
 | Value | Effect |
 |---|---|
-| `"exclude-prompt_cache_key"` | Omits the `prompt_cache_key` field from `extra_body` in every API request.  Required for providers (e.g. NVIDIA NIM) that reject unknown `extra_body` fields. |
+| `"exclude-prompt_cache_key"` | Omits the `prompt_cache_key` field from `extra_body` in every API request.  Required for providers (e.g. NVIDIA NIM, Google's OpenAI-compatible endpoint) that reject unknown `extra_body` fields. |
+
+When the schema names an `inference_db` entry, that entry's own
+`options` array is merged in (the spec's values first, then the entry's not
+already listed): the flag is a property of the endpoint, so it lives in the
+endpoint database rather than in every spec that points at it.
 
 ---
 

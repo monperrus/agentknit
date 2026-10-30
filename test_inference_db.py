@@ -41,6 +41,14 @@ type = "chat-completions"
 auth = "none"
 [[endpoints.free.key]]
 source = "none"
+
+[endpoints.goog]
+name = "Google (rejects unknown body fields)"
+url = "https://goog.example/v1beta/openai"
+type = "chat-completions"
+options = ["exclude-prompt_cache_key"]
+[[endpoints.goog.key]]
+source = "none"
 """
 
 
@@ -81,6 +89,24 @@ def test_tool_loading_from_entry() -> None:
 def test_unknown_entry_is_a_spec_error(db: Path) -> None:
     with pytest.raises(AgentSpecInvalidError, match="no entry 'nope'"):
         load_specification("m", inference_db="nope")
+
+
+def test_entry_options_are_merged(db: Path) -> None:
+    schema = load_specification("k3", inference_db="goog")
+    assert schema["options"] == ["exclude-prompt_cache_key"]
+    # The spec's own flags are kept; the entry's are appended, once.
+    merged = inference_db.apply_entry(
+        {"model": "k3", "options": ["own-flag"]}, inference_db.load_entry("goog"))
+    assert merged["options"] == ["own-flag", "exclude-prompt_cache_key"]
+    # Entries without options leave the spec untouched.
+    assert "options" not in inference_db.apply_entry({"model": "k3"}, {"id": "y", "url": "u"})
+
+
+def test_entry_option_reaches_the_request(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_completions(monkeypatch)
+    client = RecordingOpenAI()
+    run_task(load_specification("k3", inference_db="goog"), "hi", client=client, durable=False)
+    assert "prompt_cache_key" not in client.requests[0]["extra_body"]
 
 
 def test_key_sources_in_order(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:

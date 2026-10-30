@@ -9,8 +9,8 @@ only, so agentknit gains no dependency.
 
 A schema opts in with ``"inference_db": "<entry id>"`` (or ``--inference-db``
 on the CLI); :func:`apply_entry` then fills ``endpoint``, ``auth_header``,
-``extra_headers`` and ``request_params``, and :func:`resolve_key` walks the
-entry's key sources.
+``extra_headers`` and ``request_params``, merges the entry's ``options``,
+and :func:`resolve_key` walks the entry's key sources.
 """
 
 from __future__ import annotations
@@ -95,6 +95,14 @@ def apply_entry(schema: dict[str, Any], entry: dict[str, Any] | None = None) -> 
     mode = tool_loading(entry, model)
     if mode != "none":
         out.setdefault("tool_loading", mode)
+    # Behaviour flags the endpoint requires (e.g. "exclude-prompt_cache_key"
+    # for a provider that rejects unknown body fields).  Request quirks belong
+    # with the endpoint, so they are declared there; the spec's own flags are
+    # kept, the entry's are appended.
+    entry_options = entry.get("options") or []
+    if entry_options:
+        merged = list(schema.get("options") or [])
+        out["options"] = merged + [o for o in entry_options if o not in merged]
     return out
 
 

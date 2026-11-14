@@ -4253,6 +4253,11 @@ def _compact_once(
             temperature=(session.get("request_params") or {}).get("temperature", 0),
             max_tokens=session.get("compaction_target_tokens", DEFAULT_COMPACTION_TARGET_TOKENS),
             on_rate_limit_wait=_rate_limit_wait_callback(session),
+            # Compaction must use the same streaming transport as regular
+            # turns.  Besides token accounting, this enables the SSE stall
+            # watchdog; a silent non-streaming request otherwise sleeps and
+            # retries for tens of minutes with no visible progress.
+            on_content_delta=lambda _piece: None,
         )
         _persist_record(session, {"type": "model_response", "purpose": "pre_compaction",
                                   "response": {"content": pre_resp.choices[0].message.content}})
@@ -4284,6 +4289,7 @@ def _compact_once(
             temperature=(session.get("request_params") or {}).get("temperature", 0),
             max_tokens=session.get("compaction_target_tokens", DEFAULT_COMPACTION_TARGET_TOKENS),
             on_rate_limit_wait=_rate_limit_wait_callback(session),
+            on_content_delta=lambda _piece: None,
         )
     except RateLimitError as exc:
         err = f"Compaction rate limited: {exc}"

@@ -543,6 +543,24 @@ def test_compact_session_pre_compaction_failure_still_summarizes():
     assert "<post_compaction>" in session["messages"][1]["content"]
 
 
+def test_compaction_uses_stall_guarded_streaming():
+    """Both compaction calls stream so silent connections hit the watchdog.
+
+    Regression: a 113k-token resumed session disappeared into non-streaming
+    read-timeout backoff (1m, 2m, ...) while trying to compact itself.
+    """
+    session = _make_session(messages=[
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+    ])
+    client = _make_fake_client("summary")
+    assert compact_session(client, "m", session) is True
+    assert len(client.calls) == 2
+    assert all(callable(call.get("on_content_delta")) for call in client.calls)
+
+
 def test_compact_session_turn_count():
     """Compaction correctly counts compacted turns."""
     session = _make_session(messages=[

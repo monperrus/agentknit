@@ -303,3 +303,43 @@ def test_run_task_resumes_on_recorded_endpoint(monkeypatch, tmp_path):
     run_task(schema, "continue", session_id="s2", strict_cache_proof=False)
     assert captured["schema"]["endpoint"] == Z_AI
     assert captured["schema"]["key_env"] == "ZAI_API_KEY"
+
+
+def test_resume_reapplies_recorded_inference_db_params(monkeypatch, tmp_path):
+    """The generic CLI starts without entry params; binding must restore them.
+
+    create_client applies inference-db only to its private schema copy. If the
+    bound session schema stays bare, the turn still sends temperature=0 and
+    Kimi rejects the resumed request even though the key source was restored.
+    """
+    from agentknit import inference_db, run_task
+    from test_injected_client import RecordingOpenAI, _stub_completions
+
+    monkeypatch.setattr(core, "LOG_BASE", tmp_path)
+    _write_snapshot(tmp_path, "k3.1-pro", "s-kimi",
+                    endpoint="https://api.kimi.com/coding/v1",
+                    auth={"inference_db": "kimi-coding"})
+    entry = {
+        "id": "kimi-coding",
+        "url": "https://api.kimi.com/coding/v1",
+        "params": {"temperature": 1},
+    }
+    monkeypatch.setattr(inference_db, "load_entry", lambda entry_id: entry)
+    schema = load_specification("k3.1-pro", DEFAULT_ENDPOINT)
+    _stub_completions(monkeypatch)
+    client = RecordingOpenAI()
+    run_task(schema, "continue", session_id="s-kimi", client=client,
+             strict_cache_proof=False, durable=False)
+    assert client.requests[0]["temperature"] == 1
+
+
+def test_port_preserves_inference_db_for_later_resume(monkeypatch, tmp_path):
+    """A ported session still needs the new endpoint's forced request params."""
+    monkeypatch.setattr(core, "LOG_BASE", tmp_path)
+    _write_snapshot(tmp_path, "other/model", "s-port", endpoint=Z_AI)
+    path = _port_snapshot_to_model(
+        {"model": "k3.1-pro", "endpoint": "https://api.kimi.com/coding/v1",
+         "inference_db": "kimi-coding"}, "s-port")
+    assert path is not None
+    data = json.loads(path.read_text())
+    assert data["metadata"]["auth"]["inference_db"] == "kimi-coding"

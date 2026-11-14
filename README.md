@@ -899,8 +899,12 @@ recovered from the session's append-only logs (the earliest `session_start`
 record), which also protects against a snapshot overwritten by an earlier
 resume against a different provider. The recorded key source
 (`keyring_service`+`keyring_username` or `key_env`) is restored with it, and
-key sources the resumed session never used are dropped. When the resolved
-endpoint differs from the requested one, a one-line notice is printed.
+key sources the resumed session never used are dropped. Endpoint request quirks
+(`params`/`model_params`, options and deferred-tool mode) are reapplied from a
+recorded inference-db entry too: the generic CLI's initial schema does not carry
+them, and restoring only the key would still send an invalid temperature. When
+the resolved endpoint differs from the requested one, a one-line notice is
+printed.
 
 ### Resuming with another provider/model
 

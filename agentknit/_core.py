@@ -2756,6 +2756,13 @@ def _bind_schema_to_resumed_session(
             elif bound.get(key) is not None:
                 changes.append(f"{key} dropped")
                 del bound[key]
+        # A generic-CLI resume starts without the entry's request quirks, and
+        # create_client applies them only to its own private schema copy.  Apply
+        # the entry to the session schema too, or the restored Kimi session still
+        # sends temperature=0 and fails on its first request.
+        if auth.get("inference_db"):
+            from . import inference_db
+            bound = inference_db.apply_entry(bound)
     if changes:
         print(f"{YEL}Resuming session {session_id} on its original "
               f"endpoint {endpoint!r} ({'; '.join(changes)}){RESET}")
@@ -2804,7 +2811,7 @@ def _port_snapshot_to_model(
     src_meta: "dict[str, Any]" = (
         data["metadata"] if isinstance(data.get("metadata"), dict) else {})
     auth = {k: schema[k] for k in
-            ("auth", "keyring_service", "keyring_username", "key_env")
+            ("auth", "inference_db", "keyring_service", "keyring_username", "key_env")
             if schema.get(k) is not None}
     data["metadata"] = {
         "model":        model,

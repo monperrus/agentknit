@@ -15,6 +15,7 @@ from pathlib import Path
 import agentknit._core as _core
 from agentknit import load_specification
 from agentknit._core import AWARENESS_TYPES, parse_args
+from test_injected_client import RecordingOpenAI, _stub_completions, _type_lines
 from test_situational_awareness import (
     ENDPOINT, MODEL, _capture_events, _done, _run_scripted, _tool_call,
 )
@@ -78,3 +79,27 @@ def test_default_is_not_bare(monkeypatch, tmp_path) -> None:
 def test_cli_bare_flag() -> None:
     assert parse_args([MODEL]).bare is False
     assert parse_args([MODEL, "--bare"]).bare is True
+
+
+def test_cli_bare_reaches_interactive_repl(monkeypatch) -> None:
+    """The CLI option must be accepted by run_repl and applied to its session."""
+    _stub_completions(monkeypatch)
+    client = RecordingOpenAI()
+    monkeypatch.setattr(_core, "create_client", lambda schema: client)
+    init_session = _core.init_session
+    bare_calls: list[bool] = []
+
+    def recording_init_session(schema, **kwargs):
+        bare_calls.append(kwargs.get("bare", False))
+        return init_session(schema, **kwargs)
+
+    monkeypatch.setattr(_core, "init_session", recording_init_session)
+    _type_lines(monkeypatch, "exit\n")
+    monkeypatch.setattr(_core.sys.stdin, "isatty", lambda: True)
+
+    with contextlib.redirect_stdout(io.StringIO()), \
+         contextlib.redirect_stderr(io.StringIO()):
+        _core.main([MODEL, "--endpoint", ENDPOINT, "--bare"])
+
+    # The eager header session and the actual REPL session are both bare.
+    assert bare_calls == [True, True]

@@ -6428,6 +6428,7 @@ def _repl_setup(
     schema: "dict[str, Any]",
     *,
     non_interactive: bool = False,
+    bare: bool = False,
     token_awareness_enabled: bool | None = None,
     time_awareness_enabled: bool | None = None,
     time_awareness_tool_timestamps: bool | None = None,
@@ -6466,6 +6467,7 @@ def _repl_setup(
     session = init_session(
         schema,
         non_interactive=non_interactive,
+        bare=bare,
         resumed_from=session_id,
         system_prompt_supplement=system_prompt_supplement,
         cache_key=cache_key,
@@ -6725,6 +6727,7 @@ def run_repl(
     schema: "dict[str, Any]",
     *,
     non_interactive: bool = False,
+    bare: bool = False,
     token_awareness_enabled: bool | None = None,
     time_awareness_enabled: bool | None = None,
     time_awareness_tool_timestamps: bool | None = None,
@@ -6767,6 +6770,9 @@ def run_repl(
     This is the *sync* variant — no background reader thread, so tools that
     call ``input()`` (e.g. ``ask_user_question``) work without stdin races.
 
+    ``bare=True`` has the same prompting and awareness effect as
+    :func:`init_session`'s ``bare`` argument.
+
     ``control_socket=True`` binds a unix-domain-socket control plane (see
     :mod:`agentknit._control`): a message sent with :func:`send_control_message`
     is drained via :func:`poll_control_inbox` before each prompt and run as
@@ -6776,6 +6782,7 @@ def run_repl(
     client, session, model, hist_file = _repl_setup(
         schema,
         non_interactive=non_interactive,
+        bare=bare,
         session_id=session_id,
         cache_key=cache_key,
         system_prompt_supplement=system_prompt_supplement,
@@ -6844,6 +6851,7 @@ def run_async_repl(
     schema: "dict[str, Any]",
     *,
     non_interactive: bool = False,
+    bare: bool = False,
     token_awareness_enabled: bool | None = None,
     time_awareness_enabled: bool | None = None,
     time_awareness_tool_timestamps: bool | None = None,
@@ -6887,6 +6895,7 @@ def run_async_repl(
     client, session, model, hist_file = _repl_setup(
         schema,
         non_interactive=non_interactive,
+        bare=bare,
         session_id=session_id,
         cache_key=cache_key,
         system_prompt_supplement=system_prompt_supplement,

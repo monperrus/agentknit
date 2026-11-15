@@ -2997,6 +2997,7 @@ _REQUIRED_SESSION_KEYS = frozenset({
     "compaction_enabled", "compaction_trigger_tokens", "compaction_target_tokens",
     "compaction_keep_last_turns", "compaction_policy", "compaction_min_chars",
     "compaction_last_prompt_tokens", "min_cacheable_tokens", "cache_ttl_seconds",
+    "loop_detection_enabled", "loop_detection_max_repeats", "loop_detection_window",
 })
 
 
@@ -3104,6 +3105,10 @@ class Session(TypedDict):
     # (mtime_ns, size) per file observed through this session's tools.
     _awareness_git_digest: NotRequired["str | None"]
     _awareness_file_watch: NotRequired["dict[str, 'tuple[int, int] | None']"]
+    # Loop detection is persisted; restored sessions predate it and backfill defaults.
+    loop_detection_enabled: NotRequired[bool]
+    loop_detection_max_repeats: NotRequired[int]
+    loop_detection_window: NotRequired[int]
     # durability
     # NotRequired: sessions saved before the durable-recovery feature lack
     # this key; the restore path defaults it to True.
@@ -3193,6 +3198,9 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
                  step_reducer: "StepReducer | None" = None,
                  control_socket: bool = False,
                  bare: bool = False,
+                 loop_detection_enabled: bool | None = None,
+                 loop_detection_max_repeats: int | None = None,
+                 loop_detection_window: int | None = None,
                  tool_loading: str | None = None,
                  tool_search: "_deferred.ToolSearch | None" = None,
                  ) -> "Session":
@@ -3315,6 +3323,16 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
     tool-call protocol the model needs to call tools at all.  The startup
     awareness checklist is not emitted either.  Default ``False``.
     """
+    loop_detection_enabled = (bool(schema.get("loop_detection_enabled", True))
+                              if loop_detection_enabled is None else loop_detection_enabled)
+    loop_detection_max_repeats = (int(schema.get("loop_detection_max_repeats", 3))
+                                  if loop_detection_max_repeats is None else loop_detection_max_repeats)
+    loop_detection_window = (int(schema.get("loop_detection_window", 8))
+                             if loop_detection_window is None else loop_detection_window)
+    if loop_detection_max_repeats < 2:
+        raise ValueError("loop_detection_max_repeats must be at least 2")
+    if loop_detection_window < 1:
+        raise ValueError("loop_detection_window must be at least 1")
     if bare:
         user_awareness_enabled = system_awareness_enabled = False
         git_awareness_enabled = change_awareness_enabled = False
@@ -3370,6 +3388,9 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         # validation passes and the cold-resume threshold stays as before.
         cast("dict[str, Any]", session).setdefault(
             "cache_ttl_seconds", DEFAULT_CACHE_TTL_SECONDS)
+        cast("dict[str, Any]", session).setdefault("loop_detection_enabled", True)
+        cast("dict[str, Any]", session).setdefault("loop_detection_max_repeats", 3)
+        cast("dict[str, Any]", session).setdefault("loop_detection_window", 8)
         _validate_session_dict(session)
         # Messages, usage totals, call count, session id, cache key, etc.
         # are preserved from the saved session.
@@ -3708,6 +3729,9 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
             else schema.get("compaction_min_chars", 0)
         ),
         "compaction_last_prompt_tokens": 0,
+        "loop_detection_enabled": loop_detection_enabled,
+        "loop_detection_max_repeats": loop_detection_max_repeats,
+        "loop_detection_window": loop_detection_window,
         "min_cacheable_tokens": (
             min_cacheable_tokens if min_cacheable_tokens is not None
             else schema.get("min_cacheable_tokens", DEFAULT_MIN_CACHEABLE_TOKENS)
@@ -5120,6 +5144,41 @@ def side_query(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Se
     return answer
 
 
+def _observe_loop(
+    session: Session,
+    history: list[str],
+    fingerprint: str,
+    tool_names: list[str],
+    append: "Callable[[dict[str, Any]], None]",
+) -> str | None:
+    """Record one executed step and detect a repeated action/observation cycle.
+
+    *append* is the turn's message appender (history + journal), so the
+    diagnostic lands in the transcript exactly like any other message.
+    """
+    history.append(fingerprint)
+    limit = session.get("loop_detection_window", 8)
+    repeats = session.get("loop_detection_max_repeats", 3)
+    del history[:-limit]
+    for period in range(1, len(history) // repeats + 1):
+        block = history[-period:]
+        if history[-period * repeats:] == block * repeats:
+            names = ", ".join(dict.fromkeys(tool_names))
+            message = (f"Loop detected: {repeats} consecutive repetitions of the same "
+                       f"{period}-step tool-call cycle ({names}), with identical arguments "
+                       "and observations. Stopped automatically before another model request. "
+                       "Change strategy, inspect a different source of information, or ask "
+                       "for guidance; do not retry the same calls.")
+            _emit(session, "loop_detected", repetitions=repeats, period=period,
+                  tool_names=tool_names, diagnostic=message,
+                  fmt=f"\n{YEL}{BOLD}⛔ {message}{RESET}\n")
+            append({"role": "assistant", "content": message})
+            _log(session, {"type": "loop_detected", "repetitions": repeats,
+                           "period": period, "tool_names": tool_names})
+            return message
+    return None
+
+
 def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Session, task: str | None,
               cancel: CancelToken | None = None,
               timeout_expired: threading.Event | None = None,
@@ -5129,6 +5188,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
     tools      = session["tools"]
     structured = session["structured"]
     journal    = session.get("_journal")
+    loop_history: list[str] = []
 
     # A turn that died between the model's tool_calls and their results
     # (Ctrl-C, crash, a tool thread killed) leaves an assistant message whose
@@ -5472,6 +5532,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                 # Messages a deferred-tool reveal adds after this step's tool
                 # results (kimi: a system message carrying the tools).
                 step_extra: list[dict[str, Any]] = []
+                loop_calls: dict[str, dict[str, Any]] = {}
 
                 def _search_tools_message(tc: Any, args: dict[str, Any]) -> dict[str, Any]:
                     """Answer the framework's search_tools call (deferred tool loading)."""
@@ -5484,6 +5545,8 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                           streamed=False, call_id=tc.id, fmt=fmt_result(text))
                     _log(session, {"type": "tool_result", "name": tc.function.name,
                                    "args": args, "result": text, "ts": call_ts})
+                    loop_calls[tc.id] = {"name": tc.function.name, "arguments": args,
+                                         "result": text}
                     if isinstance(content, str):
                         content = _with_pending_ta(content)
                     # A glm reference list must stay pure (the server drops
@@ -5535,6 +5598,8 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                                            "name": tc.function.name,
                                            "result": result,
                                            "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
+                            loop_calls[tc.id] = {"name": tc.function.name,
+                                                 "arguments": {}, "result": result}
                             return {"role": "tool", "tool_call_id": tc.id,
                                     "content": _with_pending_ta(result),
                                     "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
@@ -5543,6 +5608,8 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                         return _search_tools_message(tc, args)
                     result = _handle_tool_call(tc.function.name, args, session,
                                                call_id=tc.id)
+                    loop_calls[tc.id] = {"name": tc.function.name, "arguments": args,
+                                         "result": result}
                     return {"role": "tool", "tool_call_id": tc.id,
                             "content": _with_pending_ta(result),
                             "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
@@ -5589,6 +5656,18 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                 for extra_msg in step_extra:
                     _append_message({**extra_msg,
                                      "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
+                if session.get("loop_detection_enabled", True):
+                    loop_step = [loop_calls.get(str(tc.id),
+                                                {"name": tc.function.name, "arguments": {},
+                                                 "result": "ERROR: tool execution failed"})
+                                 for tc in msg.tool_calls]
+                    fingerprint = json.dumps(loop_step, sort_keys=True,
+                                             ensure_ascii=False, separators=(",", ":"))
+                    diagnostic = _observe_loop(session, loop_history, fingerprint,
+                                               [str(call["name"]) for call in loop_step],
+                                               _append_message)
+                    if diagnostic is not None:
+                        return _session_result(session)
                 forced_final = _reduce_step(step_start)
                 if forced_final is None:
                     continue
@@ -5603,12 +5682,27 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                 calls = extract_inline_calls(text)
                 if calls:
                     results = []
+                    raw_results = []
                     for name, args in calls:
                         result = _handle_tool_call(name, args, session)
+                        raw_results.append(result)
                         results.append(f"[{name}] {_with_pending_ta(result)}")
                     _append_message({"role": "user",
                                      "content": "Tool results:\n" + "\n\n".join(results),
                                      "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
+                    if session.get("loop_detection_enabled", True):
+                        # Fingerprint the raw observation, not the decorated
+                        # message: the timing footer and pending awareness text
+                        # differ on every call and would mask a real loop.
+                        loop_step = [{"name": name, "arguments": args, "result": raw}
+                                     for (name, args), raw in zip(calls, raw_results)]
+                        fingerprint = json.dumps(loop_step, sort_keys=True,
+                                                 ensure_ascii=False, separators=(",", ":"))
+                        diagnostic = _observe_loop(session, loop_history, fingerprint,
+                                                   [name for name, _args in calls],
+                                                   _append_message)
+                        if diagnostic is not None:
+                            return _session_result(session)
                     forced_final = _reduce_step(step_start)
                     if forced_final is None:
                         continue

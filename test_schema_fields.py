@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+import agentknit._core as _core
 from agentknit._core import _normalize_schema, validate_schema
 from agentknit.exceptions import AgentSpecInvalidError
 
@@ -57,6 +58,43 @@ def test_normalize_schema_builds_dispatch_from_tools() -> None:
         "python_function": "t_update",
         "param_map": {"old_str": "old", "new_str": "new"},
     }
+
+
+def test_create_client_accepts_initialized_session(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Client construction accepts a live session without making a network request."""
+    from agentknit import Tool, build_tool_spec, init_session, register_tools_in_library
+
+    def t_echo(text: str) -> tuple[str, dict]:
+        return text, {}
+
+    tool_specs, _ = build_tool_spec([Tool("echo", "Echo text.", t_echo)])
+    register_tools_in_library([Tool("echo", "Echo text.", t_echo)])
+    monkeypatch.setattr(_core, "LOG_BASE", tmp_path)
+    monkeypatch.setattr(_core, "_get_key_for_schema", lambda _schema: "offline-key")
+    schema = {
+        "model": "test-model",
+        "endpoint": "http://example.invalid/v1",
+        "key_env": "AGENTKNIT_TEST_SESSION_KEY",
+        "inferred_tool_schema": tool_specs,
+        "provider_api_support": {"streaming": {"supported": True}},
+        "request_params": {"reasoning_effort": "high"},
+    }
+    session = init_session(schema, system_prompt_supplement="", max_output_tokens=200)
+    try:
+        normalized = _core._normalize_schema(session)
+        assert normalized["messages"] is session["messages"]
+        assert normalized["_journal"] is session["_journal"]
+        assert normalized["tools"] is not session["tools"]
+        assert normalized["tool_dispatch"] is not session["tool_dispatch"]
+        assert _core._normalize_schema(schema)["tool_specs"] is not tool_specs
+        client = _core.create_client(session)
+    finally:
+        session["_journal"].close()
+
+    assert client._base_url == "http://example.invalid/v1"
+    assert client._api_key == "offline-key"
 
 
 def test_validate_schema_accepts_tool_specs_name() -> None:

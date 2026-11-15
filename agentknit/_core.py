@@ -1016,18 +1016,49 @@ def _default_dispatch_for_tool_specs(tool_specs: list[dict[str, Any]]) -> dict[s
     return dispatch
 
 
+# A live Session is also accepted wherever create_client needs the original
+# connection settings.  These values are runtime objects, not JSON-like spec
+# data: cloning them would duplicate callbacks or fail on locks held by the
+# journal, a durable sink, a tool executor, or a control server.
+_SCHEMA_RUNTIME_KEYS = frozenset({
+    "messages", "hooks", "on_event", "durable_sink", "tool_executor", "step_reducer",
+})
+
+
+def _copy_schema_value(key: str, value: Any) -> Any:
+    """Copy spec data while passing session/runtime handles through by identity."""
+    if key.startswith("_") or key in _SCHEMA_RUNTIME_KEYS:
+        return value
+    return copy.deepcopy(value)
+
+
 def _normalize_schema(schema: "dict[str, Any]") -> "dict[str, Any]":
-    """Return a schema copy with public tool fields normalized for runtime use."""
-    normalized = copy.deepcopy(schema)
+    """Return a schema copy with public tool fields normalized for runtime use.
+
+    Public spec fields retain deep-copy isolation.  Session state and other
+    runtime objects are shared with the caller rather than recursively copied.
+    """
+    normalized = {key: _copy_schema_value(key, value) for key, value in schema.items()}
     tool_specs = normalized.get("tool_specs")
     if tool_specs is None:
         tool_specs = normalized.get("inferred_tool_schema")
+    # init_session stores advertised specs under ``tools``; a loaded spec
+    # instead uses that key for library function names.  Session identity
+    # fields identify the former shape, including a tool-less session.
+    tools_value = normalized.get("tools")
+    initialized_tools = (
+        "session_id" in normalized
+        and "messages" in normalized
+        and isinstance(tools_value, list)
+        and all(isinstance(tool, dict) for tool in tools_value)
+    )
     if tool_specs is None:
-        tool_specs = []
+        tool_specs = tools_value if initialized_tools else []
+    tool_specs = cast("list[dict[str, Any]]", tool_specs)
     normalized["tool_specs"] = tool_specs
     normalized["inferred_tool_schema"] = tool_specs
 
-    tools = normalized.get("tools")
+    tools = None if initialized_tools else tools_value
     if tools is not None:
         if not isinstance(tools, list) or any(not isinstance(t, str) for t in tools):
             raise AgentSpecInvalidError("'tools' must be a list of TOOL_LIBRARY function names.")

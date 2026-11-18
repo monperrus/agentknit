@@ -37,7 +37,8 @@ _STREAM = (
     b'data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n'
     b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],'
     b'"usage":{"prompt_tokens":100,"completion_tokens":1,"total_tokens":101,'
-    b'"prompt_tokens_details":{"cached_tokens":64}}}\n\n'
+    b'"prompt_tokens_details":{"cached_tokens":64},'
+    b'"completion_tokens_details":{"reasoning_tokens":42}}}\n\n'
     b"data: [DONE]\n\n"
 )
 
@@ -60,3 +61,24 @@ def test_streaming_response_parses_cache_accounting_from_usage_chunk():
     )
     assert resp.usage.cached_tokens == 64
     assert resp.usage.has_cache_proof is True
+    assert resp.usage.reasoning_tokens == 42
+
+
+def test_streaming_response_parses_azure_top_level_reasoning_usage():
+    client, _ = _client_capture_payload(_STREAM.replace(
+        b'"completion_tokens_details":{"reasoning_tokens":42}',
+        b'"reasoning_tokens":33'))
+    resp = client.chat.completions.create(
+        model="m", messages=[], on_content_delta=lambda _: None)
+    assert resp.usage.reasoning_tokens == 33
+    assert resp.usage.completion_tokens == 1
+    assert resp.usage.total_tokens == 101
+
+
+def test_usage_without_reasoning_details_defaults_to_zero():
+    client, _ = _client_capture_payload(_STREAM.replace(
+        b'"completion_tokens_details":{"reasoning_tokens":42}',
+        b'"completion_tokens_details":{}'))
+    resp = client.chat.completions.create(
+        model="m", messages=[], on_content_delta=lambda _: None)
+    assert resp.usage.reasoning_tokens == 0

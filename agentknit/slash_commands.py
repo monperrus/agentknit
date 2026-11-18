@@ -186,7 +186,7 @@ def _handle_clear(session: Session, client: Any, model: str, args: str) -> None:
             sink.append(dict(record))
     # Reset usage totals.
     session["usage_totals"] = {"prompt": 0, "completion": 0, "total": 0,
-                               "cached": 0, "cache_write": 0}
+                               "cached": 0, "cache_write": 0, "reasoning": 0}
     # Reset compaction watermark so the next growth cycle can trigger again.
     session["compaction_last_prompt_tokens"] = 0
     # SessionEnd hooks fire for /clear with reason="clear" (advisory).
@@ -570,6 +570,8 @@ def _handle_usage(session: Session, client: Any, model: str, args: str) -> None:
     else:
         parts.append(f"    └─ cache TTL: {int(ttl):,}s (no cache activity observed yet)")
     parts.append(f"  completion: {completion:>10,} tokens")
+    if reasoning := t.get("reasoning", 0):
+        parts.append(f"    └─ reasoning: {reasoning:>6,}")
     parts.append(f"  {CYAN}total:      {total:>10,} tokens{RESET}")
 
     # Also show message count.

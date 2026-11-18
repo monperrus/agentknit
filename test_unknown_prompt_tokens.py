@@ -68,3 +68,22 @@ def test_session_totals_keep_real_accounting():
     assert "prompt 900" in line
     assert "cached 300" in line
     assert "completion 14" in line
+    assert "reasoning" not in line
+
+
+def test_reasoning_usage_is_displayed_without_changing_completion_totals():
+    class ReasoningUsage(_RealUsage):
+        completion_tokens = 14
+        total_tokens = 1014
+        reasoning_tokens = 9
+
+    assert "reasoning 9" in fmt_usage(ReasoningUsage())
+    assert "reasoning 9" in fmt_session_totals({
+        "prompt": 1000, "completion": 14, "total": 1014,
+        "cached": 400, "cache_write": 0, "reasoning": 9,
+    })
+    # Resumed sessions saved before reasoning accounting have no such key.
+    assert "reasoning" not in fmt_session_totals({
+        "prompt": 1000, "completion": 14, "total": 1014,
+        "cached": 400, "cache_write": 0,
+    })

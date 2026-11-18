@@ -24,7 +24,7 @@ def _tool_resp(path: str) -> Any:
 def _text_resp(text: str) -> Any:
     return NS(choices=[NS(message=NS(content=text, tool_calls=None))],
               usage=NS(prompt_tokens=50, completion_tokens=7, total_tokens=57,
-                       cached_tokens=40, cache_creation_tokens=0))
+                       cached_tokens=40, cache_creation_tokens=0, reasoning_tokens=3))
 
 
 class _Client:
@@ -169,6 +169,19 @@ def test_no_reducer_is_unchanged_behaviour(tmp_path) -> None:
     assert [m["role"] for m in session["messages"][-3:]] == ["assistant", "tool", "assistant"]
 
 
+def test_reasoning_usage_is_a_completion_subset(tmp_path) -> None:
+    session = _session(tmp_path, None)
+    usage: list[dict[str, Any]] = []
+    agentknit.subscribe(session, "usage", lambda _t, d: usage.append(d))
+    run_turn(_Client([_text_resp("done")]), "m", session, "think")
+    assert usage[0]["reasoning"] == 3
+    assert usage[0]["completion"] == 7
+    assert usage[0]["total"] == 57
+    assert session["usage_totals"]["reasoning"] == 3
+    assert session["usage_totals"]["completion"] == 7
+    assert session["usage_totals"]["total"] == 57
+
+
 def test_side_query_count_usage(tmp_path) -> None:
     session = _session(tmp_path, None)
     usage: list[dict[str, Any]] = []
@@ -181,6 +194,8 @@ def test_side_query_count_usage(tmp_path) -> None:
     assert session["usage_totals"]["prompt"] == 50
     assert session["usage_totals"]["cached"] == 40
     assert usage[-1]["purpose"] == "side_query"
+    assert usage[-1]["reasoning"] == 3
+    assert session["usage_totals"]["reasoning"] == 3
 
 
 def test_execute_tool_call_runs_full_runtime(tmp_path) -> None:

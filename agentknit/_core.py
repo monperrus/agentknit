@@ -55,10 +55,11 @@ Event types
     End of a streaming reasoning sequence.  Data: ``no_newline``, ``fmt``.
 ``usage``
     Per-turn token usage report.  Data: ``prompt``, ``completion``, ``total``,
-    ``cached``, ``cache_write``, ``fmt``.
+    ``cached``, ``cache_write``, ``reasoning``, ``fmt``.
 ``session_usage``
     Cumulative session usage emitted alongside the final answer.  Data:
-    ``prompt``, ``completion``, ``total``, ``cached``, ``cache_write``, ``fmt``.
+    ``prompt``, ``completion``, ``total``, ``cached``, ``cache_write``,
+    ``reasoning``, ``fmt``.
 ``error``
     API or dispatch error.  Data: ``text``, ``error_class``, ``http_status``,
     ``error_code``, ``error_message``, ``elapsed_s``, ``adapter``, ``fmt``.
@@ -1245,6 +1246,7 @@ def fmt_usage(usage: object, *, compaction_trigger: int | None = None,
     total       = getattr(usage, "total_tokens", 0) or 0
     cached      = getattr(usage, "cached_tokens", 0) or 0
     cache_write = getattr(usage, "cache_creation_tokens", 0) or 0
+    reasoning = getattr(usage, "reasoning_tokens", 0) or 0
 
     prompt_part = "prompt ?" if not prompt_tokens_known else f"prompt {prompt:,}"
     if cached and prompt_tokens_known:
@@ -1257,6 +1259,8 @@ def fmt_usage(usage: object, *, compaction_trigger: int | None = None,
         compact_pct = (prompt / compaction_trigger * 100) if compaction_trigger else 0
         parts.append(f"compact {compact_pct:.0f}%")
     parts.append(f"completion {completion:,}")
+    if reasoning:
+        parts.append(f"reasoning {reasoning:,}")
     parts.append(f"total {total:,}")
     return "  |  ".join(parts)
 
@@ -1274,7 +1278,9 @@ def fmt_session_totals(totals: "dict[str, int]", *,
     cached = totals.get("cached", 0)
     if cached and prompt_tokens_known:
         prompt_part += f"  |  cached {cached:,}"
-    return f"{prompt_part}  |  completion {totals['completion']:,}"
+    reasoning = totals.get("reasoning", 0)
+    reasoning_part = f"  |  reasoning {reasoning:,}" if reasoning else ""
+    return f"{prompt_part}  |  completion {totals['completion']:,}{reasoning_part}"
 
 
 def _last_message_age_seconds(session: Session) -> float | None:
@@ -3038,7 +3044,9 @@ class Session(TypedDict):
     endpoint: str                    # base URL or run:// URI ("" if unknown)
     non_interactive: bool
     # accounting
-    usage_totals: dict[str, int]               # {prompt, completion, total, cached, cache_write}
+    # {prompt, completion, total, cached, cache_write, reasoning};
+    # old snapshots may lack reasoning and are backfilled during accumulation.
+    usage_totals: dict[str, int]
     llm_call_count: int
     session_start_ts: str            # ISO timestamp
     # provider & limits
@@ -3692,7 +3700,7 @@ def init_session(schema: "dict[str, Any]", non_interactive: bool = False,
         "_log_pending":    [],
         "non_interactive": non_interactive,
         "usage_totals":    {"prompt": 0, "completion": 0, "total": 0,
-                            "cached": 0, "cache_write": 0},
+                            "cached": 0, "cache_write": 0, "reasoning": 0},
         "provider":        schema.get("provider"),
         "max_output_tokens": max_output_tokens or schema.get("max_output_tokens"),
         "strict_cache_proof": strict_cache_proof,
@@ -5129,7 +5137,7 @@ def side_query(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Se
     if usage is not None:
         record["usage"] = {k: getattr(usage, k, 0) or 0 for k in
                            ("prompt_tokens", "completion_tokens", "total_tokens",
-                            "cached_tokens", "cache_creation_tokens")}
+                            "cached_tokens", "cache_creation_tokens", "reasoning_tokens")}
     _log(session, record)
     if count_usage and usage is not None:
         u = record["usage"]
@@ -5139,10 +5147,11 @@ def side_query(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Se
         totals["total"] += u["total_tokens"]
         totals["cached"] += u["cached_tokens"]
         totals["cache_write"] += u["cache_creation_tokens"]
+        totals["reasoning"] = totals.get("reasoning", 0) + u["reasoning_tokens"]
         _emit(session, "usage", purpose="side_query",
               prompt=u["prompt_tokens"], completion=u["completion_tokens"],
               total=u["total_tokens"], cached=u["cached_tokens"],
-              cache_write=u["cache_creation_tokens"],
+              cache_write=u["cache_creation_tokens"], reasoning=u["reasoning_tokens"],
               fmt=f"{DIM}{MAG}[tokens · side query] "
                   f"{fmt_usage(usage, prompt_tokens_known=session.get('reports_prompt_tokens', True))}{RESET}")
     return answer
@@ -5428,6 +5437,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                 completion_tok = getattr(usage, "completion_tokens", 0) or 0
                 cached_tok     = getattr(usage, "cached_tokens", 0) or 0
                 cache_creat    = getattr(usage, "cache_creation_tokens", 0) or 0
+                reasoning_tok  = getattr(usage, "reasoning_tokens", 0) or 0
                 # Only count effective (non-cached) tokens toward the budget —
                 # cached tokens were served from a prefix cache and weren't
                 # actually generated/processed, so they shouldn't deplete the
@@ -5440,6 +5450,9 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                 totals["total"]       += getattr(usage, "total_tokens", 0) or 0
                 totals["cached"]      += cached_tok
                 totals["cache_write"] += cache_creat
+                # reasoning_tokens is a subset of completion_tokens; it is
+                # accumulated for display only and never added to the total.
+                totals["reasoning"] = totals.get("reasoning", 0) + reasoning_tok
                 trigger = session.get("compaction_trigger_tokens", DEFAULT_COMPACTION_TRIGGER_TOKENS)
                 _emit(session, "usage",
                       prompt=getattr(usage, "prompt_tokens", 0) or 0,
@@ -5447,6 +5460,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                       total=getattr(usage, "total_tokens", 0) or 0,
                       cached=getattr(usage, "cached_tokens", 0) or 0,
                       cache_write=getattr(usage, "cache_creation_tokens", 0) or 0,
+                      reasoning=reasoning_tok,
                       cache_ttl=_cache_ttl_seconds(session),
                       **({"cache_expires_in": warmth["expires_in"]}
                          if (warmth := _cache_warmth(session)) is not None else {}),
@@ -5466,6 +5480,7 @@ def _run_turn(client: openai.OpenAI | SubprocessOpenAI, model: str, session: Ses
                                "total_tokens":       getattr(usage, "total_tokens", 0) or 0,
                                "cached_tokens":      getattr(usage, "cached_tokens", 0) or 0,
                                "cache_creation_tokens": getattr(usage, "cache_creation_tokens", 0) or 0,
+                               "reasoning_tokens":   reasoning_tok,
                                **({"token_budget_remaining":
                                    max(0, (session.get("token_awareness_budget_tokens", 0) or 0)
                                        - (getattr(usage, "prompt_tokens", 0) or 0))}

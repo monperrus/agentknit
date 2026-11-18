@@ -419,15 +419,19 @@ class _Choice:
 
 class _Usage:
     __slots__ = ("total_tokens", "prompt_tokens", "completion_tokens",
-                 "cached_tokens", "cache_creation_tokens", "has_cache_proof")
+                 "cached_tokens", "cache_creation_tokens", "has_cache_proof",
+                 "reasoning_tokens")
 
     def __init__(self, total_tokens: int = 0, prompt_tokens: int = 0,
                  completion_tokens: int = 0, cached_tokens: int = 0,
                  cache_creation_tokens: int = 0,
-                 has_cache_proof: bool = False) -> None:
+                 has_cache_proof: bool = False, reasoning_tokens: int = 0) -> None:
         self.total_tokens = total_tokens
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
+        # OpenAI nests this under completion_tokens_details; Azure may report
+        # it directly in usage. It is a completion subset, never extra total.
+        self.reasoning_tokens = reasoning_tokens
         # cached_tokens = portion of prompt_tokens served from a prefix cache
         # (OpenAI: usage.prompt_tokens_details.cached_tokens; Anthropic cache reads).
         self.cached_tokens = cached_tokens
@@ -858,6 +862,7 @@ def _parse_response(data: dict[str, Any]) -> _Response:
         )))
     u = data.get("usage") or {}
     details = u.get("prompt_tokens_details") or {}
+    completion_details = u.get("completion_tokens_details") or {}
     cached_candidates = [
         details.get("cached_tokens"),
         u.get("cache_read_input_tokens"),
@@ -878,6 +883,8 @@ def _parse_response(data: dict[str, Any]) -> _Response:
         total_tokens=u.get("total_tokens", 0) or 0,
         prompt_tokens=u.get("prompt_tokens", 0) or 0,
         completion_tokens=u.get("completion_tokens", 0) or 0,
+        reasoning_tokens=int(completion_details.get("reasoning_tokens")
+                             or u.get("reasoning_tokens") or 0),
         cached_tokens=cached_tokens,
         cache_creation_tokens=cache_creation,
         has_cache_proof=has_cache_proof,

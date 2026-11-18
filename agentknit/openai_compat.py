@@ -77,6 +77,12 @@ _STALL_WATCHDOG_POLL_SECONDS = 1.0
 _MAX_SERVER_ERROR_RETRIES = 5
 _SERVER_ERROR_INITIAL_DELAY_SECONDS = 5
 _RETRYABLE_STATUS_CODES = frozenset({500, 502, 503, 504, 529})
+# A connection that cannot be opened (host network down, DNS failure, connect
+# timeout) means the request never reached the server, so retrying cannot
+# duplicate work. Outages last minutes (Wi-Fi drop, suspend/resume): retry six
+# times after the initial attempt, waiting 10, 20, 40, 80, 160, then 320 s.
+_MAX_CONNECT_ERROR_RETRIES = 6
+_CONNECT_ERROR_INITIAL_DELAY_SECONDS = 10
 # Kimi's Coding Plan endpoint answers an exhausted quota window with HTTP 403
 # (not 429) and no Retry-After header; the reset time lives on a side
 # endpoint, ``GET <base>/usages``, so a 403 there is resolved by asking it.
@@ -485,6 +491,7 @@ class _Completions:
                     on_request_attempt: "Callable[[Any], None] | None" = None,
                     read_timeout_retries: int = 0) -> httpx.Response:
         server_error_retries = 0
+        connect_error_retries = 0
         quota_retries = 0
         while True:
             self._client._rate_limiter.acquire()
@@ -509,6 +516,18 @@ class _Completions:
                     f"  [read-timeout] request/stream timed out (no response or "
                     f"no SSE line for too long) — retry "
                     f"{read_timeout_retries}/{_MAX_READ_TIMEOUT_RETRIES} in {delay // 60}m …",
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                if connect_error_retries >= _MAX_CONNECT_ERROR_RETRIES:
+                    raise
+                connect_error_retries += 1
+                delay = _CONNECT_ERROR_INITIAL_DELAY_SECONDS * (2 ** (connect_error_retries - 1))
+                print(
+                    f"  [connect-error] {type(exc).__name__}: {exc} — retry "
+                    f"{connect_error_retries}/{_MAX_CONNECT_ERROR_RETRIES} in {delay}s …",
                     flush=True,
                 )
                 time.sleep(delay)

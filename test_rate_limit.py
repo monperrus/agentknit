@@ -198,6 +198,33 @@ def test_retry_post_reraises_after_five_read_timeout_retries():
     assert [call.args[0] for call in sleep.call_args_list] == [60, 120, 240, 480, 960]
 
 
+@pytest.mark.parametrize("error", [httpx.ConnectError("[Errno 101] Network is unreachable"),
+                                   httpx.ConnectTimeout("connect timed out")])
+def test_retry_post_retries_connection_errors_with_exponential_backoff(error):
+    """No connection means the request was never sent: retrying is safe (host network outage)."""
+    client = _client()
+    resp_ok = _FakeResponse(200, {}, {"choices": []})
+
+    with patch("agentknit.openai_compat.httpx.Client.send", side_effect=[error] * 6 + [resp_ok]):
+        with patch("agentknit.openai_compat.time.sleep") as sleep:
+            resp = client.chat.completions._retry_post("https://x", {}, {})
+
+    assert resp is resp_ok
+    assert [call.args[0] for call in sleep.call_args_list] == [10, 20, 40, 80, 160, 320]
+
+
+def test_retry_post_reraises_after_six_connection_error_retries():
+    client = _client()
+    error = httpx.ConnectError("[Errno 101] Network is unreachable")
+
+    with patch("agentknit.openai_compat.httpx.Client.send", side_effect=[error] * 7):
+        with patch("agentknit.openai_compat.time.sleep") as sleep:
+            with pytest.raises(httpx.ConnectError):
+                client.chat.completions._retry_post("https://x", {}, {})
+
+    assert len(sleep.call_args_list) == 6
+
+
 def test_retry_post_parses_z_ai_body_and_retries():
     client = _client("https://api.z.ai/api/coding/paas/v4")
     resp_429 = _FakeResponse(429, {}, text=_ZAI_BODY + _reset_at_in(0) + '"}}')

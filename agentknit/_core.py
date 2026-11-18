@@ -4039,9 +4039,12 @@ def _backend_stamp(client: "openai.OpenAI | SubprocessOpenAI") -> "dict[str, Any
 
 
 def _complete(client: openai.OpenAI | SubprocessOpenAI, session: Session, **kwargs: Any) -> Any:
-    # Endpoint-declared body fields (e.g. a model that only accepts
-    # temperature=1) win over whatever the caller passed.
-    kwargs.update(session.get("request_params") or {})
+    # Endpoint-declared fields win over caller arguments. Only temperature has
+    # a named client argument; all other fields (seed, reasoning_effort, ...)
+    # travel in extra_body so the HTTP client can serialize them verbatim.
+    request_params = session.get("request_params") or {}
+    if "temperature" in request_params:
+        kwargs["temperature"] = request_params["temperature"]
     kwargs["user"] = session["cache_key"]
     # A message's sender is agentknit's own record; the model reads it from
     # the header in the content, and strict providers reject unknown keys.
@@ -4051,6 +4054,7 @@ def _complete(client: openai.OpenAI | SubprocessOpenAI, session: Session, **kwar
         kwargs.setdefault("max_tokens", session["max_output_tokens"])
 
     extra = kwargs.pop("extra_body", None) or {}
+    extra.update({key: value for key, value in request_params.items() if key != "temperature"})
 
     # Some providers (e.g. NVIDIA NIM) reject unknown extra_body fields.
     # The agent spec can list "exclude-prompt_cache_key" in its "options" array

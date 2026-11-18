@@ -158,10 +158,43 @@ def test_auth_none(db: Path) -> None:
 def test_request_params_reach_the_request(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_completions(monkeypatch)
     schema = load_specification("k3", inference_db="az")
+    schema["request_params"]["reasoning_effort"] = "high"
     client = RecordingOpenAI()
     run_task(schema, "hi", client=client, durable=False)
     assert client.requests[0]["temperature"] == 1
-    assert client.requests[0]["seed"] == 7
+    assert client.requests[0]["extra_body"]["seed"] == 7
+    assert client.requests[0]["extra_body"]["reasoning_effort"] == "high"
+
+
+def test_request_params_reach_http_payload(db: Path) -> None:
+    """Custom endpoint fields use extra_body, not unsupported Python kwargs."""
+    from agentknit.openai_compat import OpenAI
+
+    schema = load_specification("k3", inference_db="az")
+    schema["request_params"]["reasoning_effort"] = "high"
+    session = _core.init_session(schema, durable=False, bare=True)
+    client = OpenAI(api_key="test", base_url="https://az.example/v1")
+    requests: list[dict] = []
+
+    class Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2,
+                              "prompt_tokens_details": {"cached_tokens": 1}}}
+
+    def send(request, *, stream=False):
+        requests.append(json.loads(request.content))
+        return Response()
+
+    client._http.send = send
+    response = _core._complete(client, session, model="k3",
+                               messages=[{"role": "user", "content": "hi"}])
+    assert response.choices[0].message.content == "ok"
+    assert requests[0]["temperature"] == 1
+    assert requests[0]["seed"] == 7
+    assert requests[0]["reasoning_effort"] == "high"
 
 
 def test_session_records_entry_for_resume(db: Path) -> None:
